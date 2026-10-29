@@ -589,6 +589,15 @@ must instead prove retained history, project/thread views, settings, opt-out,
 local refresh, clean quit and cold restart, bound to the successor's exact
 ASAR, executable, source metadata and native closure.
 
+The qualification reader selects the model-performance contract from those
+authenticated release identities. The pinned 0.1.26/0.1.28 predecessors and
+historical 0.1.27/0.1.28 successors require schema 5 without a time-zone field;
+both 0.1.29 successor launches require schema 6 with UTC. Every route still
+requires measured speed and first-token latency, complete source coverage, and
+ready, non-stale evidence. The ordinary current-candidate lane remains strict
+schema 6/UTC. Never infer compatibility from the returned payload or rebuild a
+frozen installer to repair the separately selected qualification runner.
+
 Retain `frozen-reference.json`, `frozen-predecessor-reference.json` and
 `windows-final-upgrade.json`. Success requires the owned successor uninstall,
 registry absence, app-process quiescence, firewall removal and profile cleanup.

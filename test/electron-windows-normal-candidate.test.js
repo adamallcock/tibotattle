@@ -85,6 +85,7 @@ import {
   verifyWindowsNormalCandidateOptOut,
   verifyWindowsNormalCandidateSmokePackage,
   WINDOWS_NORMAL_CANDIDATE_FIREWALL_TIMEOUT_MS,
+  WINDOWS_NORMAL_CANDIDATE_PERFORMANCE_CONTRACTS as performanceContracts,
 } from "../scripts/smoke-electron-windows-normal-candidate.mjs";
 
 const SOURCE_REVISION = "0123456789abcdef0123456789abcdef01234567";
@@ -124,12 +125,16 @@ test("disposable Windows source is created with current-user owner and fixed err
     /synthetic_owner_create_invalid_path/u);
 });
 
-test("packaged Windows timing smoke requires a complete ready source scan", () => {
-  const ready = { schemaVersion: 6, method: 5, timeZone: "UTC", speedMode: "standard", excludedUnknownTurns: 0,
+function modelPerformanceFixture() {
+  return { schemaVersion: 6, method: 5, timeZone: "UTC", speedMode: "standard", excludedUnknownTurns: 0,
     status: "ready", collecting: false,
     stale: false, period: "all", models: [{ id: "gpt-5.6-sol", turns: 1,
       speed: [{ points: [{ median: 13.3 }] }], ttft: [{ median: 1 }] }],
     historyProgress: { checked: 1, total: 1 } };
+}
+
+test("packaged Windows timing smoke requires a complete ready source scan", () => {
+  const ready = modelPerformanceFixture();
   assert.equal(verifyWindowsNormalCandidateModelPerformance(ready), true);
   for (const value of [null, { ...ready, schemaVersion: 2 }, { ...ready, schemaVersion: 4 }, { ...ready, schemaVersion: 5 }, { ...ready, method: 3 },
     { ...ready, timeZone: undefined }, { ...ready, timeZone: "Asia/Shanghai" },
@@ -150,6 +155,65 @@ test("packaged Windows timing smoke requires a complete ready source scan", () =
   assert.equal(classifyWindowsNormalCandidateModelPerformance({ status: "loading" }), "LOADING");
   assert.equal(classifyWindowsNormalCandidateModelPerformance({ status: "ready" }), "INCOMPLETE");
   assert.equal(classifyWindowsNormalCandidateModelPerformance({ status: "unexpected" }), "INVALID");
+});
+
+test("Windows timing contracts are explicit and preserve every measurement and progress requirement", () => {
+  const current = modelPerformanceFixture();
+  const historical = { ...current, schemaVersion: 5 };
+  delete historical.timeZone;
+  assert.equal(verifyWindowsNormalCandidateModelPerformance(historical, performanceContracts.historical), true);
+  assert.equal(verifyWindowsNormalCandidateModelPerformance(current, performanceContracts.current), true);
+  assert.equal(verifyWindowsNormalCandidateModelPerformance(historical), false);
+  assert.equal(verifyWindowsNormalCandidateModelPerformance(historical, performanceContracts.current), false);
+  assert.equal(verifyWindowsNormalCandidateModelPerformance(current, performanceContracts.historical), false);
+  for (const timeZone of [undefined, null, "UTC", "Asia/Shanghai"]) {
+    assert.equal(verifyWindowsNormalCandidateModelPerformance({ ...historical, timeZone }, performanceContracts.historical), false);
+  }
+  for (const contract of [null, "", "v5", "toString", 5, {}, [performanceContracts.historical]]) {
+    assert.equal(verifyWindowsNormalCandidateModelPerformance(historical, contract), false);
+    assert.equal(verifyWindowsNormalCandidateModelPerformance(current, contract), false);
+  }
+  for (const [ready, contract] of [[historical, performanceContracts.historical], [current, performanceContracts.current]]) {
+    for (const mutate of [
+      value => { value.schemaVersion = 4; },
+      value => { value.method = 4; },
+      value => { value.speedMode = "fast"; },
+      value => { value.excludedUnknownTurns = 1; },
+      value => { delete value.excludedUnknownTurns; },
+      value => { value.status = "unavailable"; },
+      value => { value.status = "loading"; },
+      value => { value.collecting = true; },
+      value => { value.stale = true; },
+      value => { value.period = "7"; },
+      value => { value.historyProgress.checked = 0; },
+      value => { value.historyProgress = { checked: 0, total: 0 }; },
+      value => { value.historyProgress = null; },
+      value => { value.models = []; },
+      value => { value.models[0].id = "gpt-6.1-terra"; },
+      value => { value.models[0].turns = 0; },
+      value => { value.models[0].turns = 2; },
+      value => { value.models[0].speed = []; },
+      value => { value.models[0].speed[0].points[0].median = 0; },
+      value => { value.models[0].speed[0].points[0].median = Infinity; },
+      value => { value.models[0].ttft = []; },
+      value => { value.models[0].ttft[0].median = 0; },
+      value => { value.models[0].ttft[0].median = NaN; },
+    ]) {
+      const value = structuredClone(ready);
+      mutate(value);
+      assert.equal(verifyWindowsNormalCandidateModelPerformance(value, contract), false);
+    }
+  }
+});
+
+test("normal launch refuses an unknown timing contract before allocating a port or spawning", async () => {
+  for (const performanceContract of [null, "", "v5", "toString", 5, {}, [performanceContracts.historical]]) {
+    let allocated = false;
+    await assert.rejects(launchAndRenderCandidate({ performanceContract,
+      freePort: async () => { allocated = true; throw new Error("must not allocate"); },
+    }), /ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_ARGUMENT_INVALID/u);
+    assert.equal(allocated, false);
+  }
 });
 
 function performanceRendererFixture() {
@@ -1389,6 +1453,90 @@ function syntheticIngestion({
     expectedRefreshId: refreshId,
   };
 }
+
+test("normal launch propagates the selected timing contract through the real dashboard assertion", async t => {
+  const root = await mkdtemp(join(process.cwd(), ".tibotattle-performance-contract-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const appPath = join(root, "TiboTattle.exe");
+  const profile = await prepareWindowsDevelopmentProfile({ appPath, profilePath: join(root, "profile") });
+  // Synthetic CDP replies settle immediately. Its losing timeout promises must
+  // not keep this transport-only test alive after the assertions have finished.
+  const setTimeoutImpl = globalThis.setTimeout;
+  t.mock.method(globalThis, "setTimeout", (callback, ms, ...args) => setTimeoutImpl(callback, ms, ...args).unref());
+  let now = 0;
+  t.mock.method(Date, "now", () => now);
+  for (const [contract, schemaVersion, accepted] of [
+    [undefined, 6, true],
+    [undefined, 5, false],
+    [performanceContracts.historical, 5, true],
+    [performanceContracts.historical, 6, false],
+  ]) {
+    now = 0;
+    const dashboard = "http://127.0.0.1:43123/";
+    let refreshCount = 0, timingReads = 0, performanceNavigation = 0;
+    const performance = modelPerformanceFixture();
+    performance.schemaVersion = schemaVersion;
+    if (schemaVersion === 5) delete performance.timeZone;
+    const child = new EventEmitter();
+    Object.assign(child, { pid: 8125, exitCode: null, signalCode: null, connected: true,
+      stdout: new EventEmitter(), stderr: new EventEmitter(), send: (_message, callback) => callback?.() });
+    class SyntheticSocket extends EventTarget {
+      constructor() { super(); queueMicrotask(() => this.dispatchEvent(new Event("open"))); }
+      receive(value) { this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify(value) })); }
+      refresh() {
+        refreshCount += 1;
+        this.receive({ method: "Network.requestWillBeSent", params: {
+          request: { url: `${dashboard}api/local/refresh`, method: "POST" },
+        } });
+      }
+      send(bytes) {
+        const { id, method, params } = JSON.parse(bytes);
+        let value = null;
+        if (method === "Runtime.evaluate") {
+          if (params.expression.includes("__TIBOTATTLE_ELECTRON_WINDOWS_SMOKE__")) {
+            this.refresh(); value = "released";
+          } else if (params.expression.includes("title: document.title")) {
+            value = { ready: true, title: "TiboTattle", heading: "Overview", location: dashboard };
+          } else if (params.expression.includes('button.click()')) {
+            this.refresh(); value = true;
+          } else if (params.expression.includes("link.click()")) {
+            // Stop at the next independent boundary, after timing validation.
+            performanceNavigation += 1; value = false;
+          }
+        }
+        queueMicrotask(() => this.receive({ id, result: { result: { value } } }));
+      }
+      close() {}
+    }
+    await assert.rejects(launchAndRenderCandidate({ appPath, profile, environment: { PATH: "/safe/bin" },
+      changeSettings: true, candidateState: { quiescent: false },
+      ...(contract === undefined ? {} : { performanceContract: contract }),
+      freePort: async () => 9224, spawnApplication: () => child, WebSocketConstructor: SyntheticSocket,
+      processAbsence: async () => true,
+      stopChild: async () => { child.exitCode = 0; return true; },
+      fetchImpl: async url => {
+        const parsed = new URL(url), ingestion = syntheticIngestion();
+        let value;
+        if (parsed.pathname === "/json/version") value = { Browser: "Electron" };
+        else if (parsed.pathname === "/json") value = [{ type: "page", url: dashboard,
+          webSocketDebuggerUrl: "ws://127.0.0.1:9224/devtools/page/dashboard" }];
+        else if (parsed.pathname === "/api/local/health") value = { status: "ready" };
+        else if (parsed.pathname === "/api/local/refresh") value = {
+          refresh: { ...ingestion.refresh, refreshId: `synthetic-refresh-${refreshCount}` },
+        };
+        else if (parsed.pathname === "/api/local/overview") value = ingestion.overview;
+        else if (parsed.pathname === "/api/local/model-performance") {
+          assert.equal(parsed.search, "?period=all");
+          timingReads += 1; now += 60_000; value = performance;
+        } else assert.fail("unexpected synthetic request");
+        return { ok: true, redirected: false, json: async () => value };
+      },
+    }), { code: `ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_LOCAL_MODEL_PERFORMANCE_${accepted ? "PAGE_UNAVAILABLE" : "INCOMPLETE"}` });
+    assert.equal(timingReads, 1);
+    assert.equal(performanceNavigation, accepted ? 1 : 0);
+    assert.equal(refreshCount, 2);
+  }
+});
 
 test("normal candidate synthetic ingestion proof requires exact unified totals and no restart duplicate", () => {
   assert.equal(verifyWindowsNormalCandidateSyntheticIngestion(syntheticIngestion()), true);

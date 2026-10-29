@@ -16,7 +16,7 @@ import {
   assertCandidateProcessAbsence, installOutboundFirewallBlock, removeOutboundFirewallBlock,
   launchAndRenderCandidate, prepareWindowsNormalCandidateProfile,
   seedWindowsNormalCandidateCodexFixture, verifyWindowsNormalCandidateOptOut,
-  verifyWindowsNormalCandidateSmokePackage,
+  verifyWindowsNormalCandidateSmokePackage, WINDOWS_NORMAL_CANDIDATE_PERFORMANCE_CONTRACTS,
 } from './smoke-electron-windows-normal-candidate.mjs';
 import {
   prepareWindowsDevelopmentProfile, WINDOWS_ELECTRON_BINDING_RELATIVE_PATH,
@@ -66,6 +66,14 @@ const FINAL_SUCCESSORS = Object.freeze({
     receiptSchema: 'tibotattle-windows-final-upgrade-v2' }),
   '0.1.29': Object.freeze({ version: '0.1.29', buildNumber: '2026102601',
     receiptSchema: 'tibotattle-windows-final-upgrade-v3' }),
+});
+// Select the response grammar from authenticated release identity, never from
+// whatever the running application happens to return. New releases need review.
+const PERFORMANCE_CONTRACTS = Object.freeze({
+  '0.1.26': WINDOWS_NORMAL_CANDIDATE_PERFORMANCE_CONTRACTS.historical,
+  '0.1.27': WINDOWS_NORMAL_CANDIDATE_PERFORMANCE_CONTRACTS.historical,
+  '0.1.28': WINDOWS_NORMAL_CANDIDATE_PERFORMANCE_CONTRACTS.historical,
+  '0.1.29': WINDOWS_NORMAL_CANDIDATE_PERFORMANCE_CONTRACTS.current,
 });
 export function resolveWindowsFinalUpgradeSuccessor({ version, buildNumber } = {}) {
   const successor = typeof version === 'string' && Object.hasOwn(FINAL_SUCCESSORS, version)
@@ -195,15 +203,22 @@ export async function snapshotWindowsFinalUpgradeProfile(root, {
 
 /** The synthetic injection boundary tests ordering/refusal; native callers use
  * these defaults. Replacing files precedes successor runtime, with no reseeding. */
-export async function runWindowsFinalUpgradeContinuity({ previous, candidate, appPath,
+export async function runWindowsFinalUpgradeContinuity({ previous, candidate, predecessorIntake, appPath,
   profile, seed, environment, candidateState, replaceInstaller }, {
   verifyPackage = verifyWindowsNormalCandidateSmokePackage,
   launchJourney = launchAndRenderCandidate, verifyOptOut = verifyWindowsNormalCandidateOptOut,
   processAbsence = assertCandidateProcessAbsence, snapshotProfile = snapshotWindowsFinalUpgradeProfile,
 } = {}) {
+  const intake = validateWindowsFinalUpgradePredecessor(predecessorIntake);
+  const successor = validateWindowsFinalUpgradePair(intake, candidate);
+  if (previous?.version !== intake.version || previous.sourceRevision !== intake.sourceRevision
+      || previous.installerSha256 !== intake.installerSha256
+      || !Object.hasOwn(PERFORMANCE_CONTRACTS, intake.version)
+      || !Object.hasOwn(PERFORMANCE_CONTRACTS, successor.version)) fail('PAIR_INVALID');
   const oldOptions = normalOptions(previous, appPath), newOptions = normalOptions(candidate, appPath);
   const oldIdentity = validateIdentity(await verifyPackage(oldOptions), previous);
-  const first = await launchJourney({ appPath, profile, environment, changeSettings: true, candidateState });
+  const first = await launchJourney({ appPath, profile, environment, changeSettings: true, candidateState,
+    performanceContract: PERFORMANCE_CONTRACTS[intake.version] });
   validateJourney(first, candidateState);
   // The launch helper retains PID + creation identity for the main process and
   // every observed companion/renderer descendant, including reparented ones.
@@ -219,7 +234,8 @@ export async function runWindowsFinalUpgradeContinuity({ previous, candidate, ap
   // Runtime may migrate schemas/caches. Its observed totals/settings/opt-out,
   // rather than byte equality after launch, establish semantic continuity.
   for (let index = 0; index < 2; index += 1) {
-    const journey = await launchJourney({ appPath, profile, environment, changeSettings: false, candidateState });
+    const journey = await launchJourney({ appPath, profile, environment, changeSettings: false, candidateState,
+      performanceContract: PERFORMANCE_CONTRACTS[successor.version] });
     validateJourney(journey, candidateState);
     await processAbsence({ appPath, environment, tracked: candidateState.tracked });
     if (await verifyOptOut(seed) !== true) fail('OPT_OUT_UNPROVEN');
@@ -333,7 +349,7 @@ export async function runWindowsFinalUpgrade(options, {
     const seed = await prepareWindowsNormalCandidateProfile({ profile, stagedAppPath: options.predecessor.stagedAppPath });
     firewallName = await installOutboundFirewallBlock({ appPath, environment });
     receipt.continuity = await runWindowsFinalUpgradeContinuity({ previous: options.predecessor,
-      candidate: options.candidate, appPath, profile, seed, environment, candidateState,
+      candidate: options.candidate, predecessorIntake: intake, appPath, profile, seed, environment, candidateState,
       replaceInstaller: async () => {
         if (candidateState.quiescent !== true) fail('PREDECESSOR_PROCESS_REMAINS');
         if (await registry(installRoot, environment, runProgram) !== 'expected-v1') fail('UPGRADE_OWNERSHIP_UNPROVEN');

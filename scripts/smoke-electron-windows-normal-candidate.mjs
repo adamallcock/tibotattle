@@ -2898,7 +2898,20 @@ export function verifyWindowsNormalCandidateSyntheticIngestion({
 // The fixture has one timed, content-free turn. Require its measured speed and
 // first-token latency, not merely an empty ready page. The smoke records only
 // this boolean, never model or source data.
-export function verifyWindowsNormalCandidateModelPerformance(value) {
+export const WINDOWS_NORMAL_CANDIDATE_PERFORMANCE_CONTRACTS = Object.freeze({
+  historical: 'historical-v5',
+  current: 'local-v6-utc',
+});
+function validPerformanceContract(value) {
+  return value === WINDOWS_NORMAL_CANDIDATE_PERFORMANCE_CONTRACTS.historical
+    || value === WINDOWS_NORMAL_CANDIDATE_PERFORMANCE_CONTRACTS.current;
+}
+export function verifyWindowsNormalCandidateModelPerformance(value,
+  performanceContract = WINDOWS_NORMAL_CANDIDATE_PERFORMANCE_CONTRACTS.current) {
+  if (!validPerformanceContract(performanceContract)) return false;
+  const schemaMatches = performanceContract === WINDOWS_NORMAL_CANDIDATE_PERFORMANCE_CONTRACTS.historical
+    ? value?.schemaVersion === 5 && !Object.hasOwn(value, 'timeZone')
+    : value?.schemaVersion === 6 && value.timeZone === 'UTC';
   const progress = value?.historyProgress;
   const measured = value?.models?.some((model) => model?.id === 'gpt-5.6-sol'
     && model.turns === 1
@@ -2907,7 +2920,7 @@ export function verifyWindowsNormalCandidateModelPerformance(value) {
       && series.points.some((point) => Number.isFinite(point?.median) && point.median > 0))
     && Array.isArray(model.ttft)
     && model.ttft.some((point) => Number.isFinite(point?.median) && point.median > 0));
-  return value?.schemaVersion === 6 && value.method === 5 && value.timeZone === 'UTC'
+  return schemaMatches && value.method === 5
     && value.speedMode === 'standard' && value.excludedUnknownTurns === 0
     && value.status === 'ready' && value.collecting === false && value.stale === false
     && value.period === 'all' && measured === true
@@ -3044,7 +3057,7 @@ export function classifyWindowsNormalCandidateModelPerformance(value) {
   return 'INVALID';
 }
 
-async function assertDashboard({ cdp, target, fetchImpl, launch, onPhase = () => {} }) {
+async function assertDashboard({ cdp, target, fetchImpl, launch, performanceContract, onPhase = () => {} }) {
   const dashboard = exactLoopbackRootPage(target.url);
   if (dashboard === null) fail("DASHBOARD_INVALID");
   const observer = localNetworkObserver(cdp, dashboard.origin);
@@ -3180,7 +3193,7 @@ async function assertDashboard({ cdp, target, fetchImpl, launch, onPhase = () =>
     const timing = await waitFor(async () => {
       const value = await jsonFetch(new URL("/api/local/model-performance?period=all", dashboard), { fetchImpl });
       timingState = classifyWindowsNormalCandidateModelPerformance(value);
-      return verifyWindowsNormalCandidateModelPerformance(value);
+      return verifyWindowsNormalCandidateModelPerformance(value, performanceContract);
     }, OPERATION_TIMEOUT_MS);
     if (timing !== true) fail(`LOCAL_MODEL_PERFORMANCE_${timingState}`);
     const openedPerformance = await cdp.evaluate(`(() => {
@@ -3402,6 +3415,7 @@ export async function launchAndRenderCandidate({
   profile,
   environment,
   changeSettings,
+  performanceContract = WINDOWS_NORMAL_CANDIDATE_PERFORMANCE_CONTRACTS.current,
   candidateState = null,
   spawnApplication = spawn,
   fetchImpl = fetch,
@@ -3414,6 +3428,7 @@ export async function launchAndRenderCandidate({
   inspectStartupNativeDiagnostic = inspectWindowsNormalCandidateStartupNativeDiagnostic,
   createQuitProtocol = createWindowsNormalCandidateQuitProtocol,
 } = {}) {
+  if (!validPerformanceContract(performanceContract)) fail("ARGUMENT_INVALID");
   if (candidateState !== null && (typeof candidateState !== "object" || Array.isArray(candidateState))) {
     fail("PROCESS_PROOF_UNAVAILABLE");
   }
@@ -3504,7 +3519,7 @@ export async function launchAndRenderCandidate({
     }
     cdp = connected.cdp;
     const dashboard = await assertDashboard({ cdp, target: connected.target, fetchImpl,
-      launch: changeSettings ? "first" : "restart", onPhase });
+      launch: changeSettings ? "first" : "restart", performanceContract, onPhase });
     observer = dashboard.observer;
     // Preserve only completed, closed dashboard proof before the separate
     // Settings journey. A later Settings failure must not erase evidence that
