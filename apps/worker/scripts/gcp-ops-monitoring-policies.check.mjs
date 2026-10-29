@@ -257,8 +257,12 @@ function evaluateFiveXx(promql, { fiveXx, requests, excluded }) {
     .replaceAll(/sum\(increase\(run_googleapis_com:request_count\{[^}]*,response_code_class="5xx"\}\[10m\]\)\)/gu, " F ")
     .replaceAll(/sum\(increase\(run_googleapis_com:request_count\{[^}]*\}\[10m\]\)\)/gu, " R ")
     .replaceAll(/sum\(increase\(logging_googleapis_com:user_[a-z_]+_origin_request_failure\{[^}]*\}\[10m\]\)\)/gu, " E ");
-  const tokens = text.match(/vector\(0\)|on\(\)|unless|and|or|>=|<=|[<>()+\-/]|[FRE]\b|\d+(?:\.\d+)?|\S+/gu);
-  const values = { F: fiveXx, R: requests, E: excluded };
+  return evaluateLabelFreePromql(text, { F: fiveXx, R: requests, E: excluded });
+}
+
+/** The same closed, label-free expression grammar also evaluates the headroom predicate. */
+function evaluateLabelFreePromql(text, values) {
+  const tokens = text.match(/vector\(0\)|on\(\)|unless|and|or|>=|<=|[<>()+\-/]|[A-Z]\b|\d+(?:\.\d+)?|\S+/gu);
   let position = 0;
   const peek = () => tokens[position];
   const take = (expected) => {
@@ -554,16 +558,18 @@ test("refresh-output-headroom: the receipt's account against its effective budge
   const headroom = policy(daily, "refresh-output-headroom");
   assert.equal(headroom.severity, "ticket");
   assert.equal(headroom.deferred, undefined);
-  assert.equal(headroom.body.conditions.length, 2);
+  assert.equal(headroom.body.conditions.length, 1);
   const job = 'job_name="tibotattle-staging-analytics-refresh"';
   const metric = (part) => `logging_googleapis_com:user_tibotattle_staging_analytics_refresh_output_${part}_sum`
     + `{monitored_resource="cloud_run_job",${job}}`;
-  assert.equal(query(daily, "refresh-output-headroom", 0),
-    `sum(increase(${metric("account")}[25h])) / sum(increase(${metric("budget")}[25h])) > 0.8`);
-  assert.equal(query(daily, "refresh-output-headroom", 1), "sum(increase(logging_googleapis_com:user_"
+  const nearBudget = `sum(increase(${metric("account")}[25h])) / sum(increase(${metric("budget")}[25h])) > 0.8`;
+  const exceeded = "sum(increase(logging_googleapis_com:user_"
     + `tibotattle_staging_analytics_refresh_outcome{monitored_resource="cloud_run_job",${job},`
-    + 'code="ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED"}[1h])) > 0');
-  assert.match(query(monitoring.renderMonitoring(resumed("*/30 * * * *")), "refresh-output-headroom", 0), /\[90m\]\)\) > 0\.8$/u);
+    + 'code="ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED"}[1h])) > 0';
+  assert.deepEqual(headroom.body.conditions[0].conditionPrometheusQueryLanguage,
+    { query: `(${nearBudget}) or (${exceeded})`, duration: "0s", evaluationInterval: "60s" });
+  assert.equal(query(monitoring.renderMonitoring(resumed("*/30 * * * *")), "refresh-output-headroom"),
+    `(${nearBudget.replaceAll("[25h]", "[90m]")}) or (${exceeded})`);
   // It waits with the refresh trigger, like refresh-not-completed.
   assert.equal(policy(monitoring.renderMonitoring(STAGING), "refresh-output-headroom").deferred, "SCHEDULER_CADENCE_UNSET");
   const paused = staging((value) => { value.scheduler["analytics-refresh"].schedule = "15 3 * * *"; });
@@ -640,6 +646,76 @@ test("scheduler-quiet defers per trigger: one deferred trigger never silences an
   // A resumed refresh trigger alerts on its own; the paused maintenance trigger drops only its condition.
   assert.deepEqual(policy(monitoring.renderMonitoring(resumed("15 3 * * *")), "scheduler-quiet").deferredConditions,
     [{ job: "maintenance", deferred: "TRIGGER_COMMITTED_PAUSED" }]);
+});
+
+test("PromQL policies use exactly one API condition, including both active scheduler triggers", () => {
+  const both = staging((value) => {
+    value.scheduler["analytics-refresh"].schedule = "15 3 * * *";
+    value.scheduler["analytics-refresh"].state = "ENABLED";
+    value.scheduler.maintenance.state = "ENABLED";
+  });
+  for (const desired of [STAGING, resumed("15 3 * * *"), both]) {
+    for (const entry of monitoring.renderMonitoring(desired, { notificationChannel: CHANNEL }).policies) {
+      if (entry.body.conditions.some((condition) => condition.conditionPrometheusQueryLanguage !== undefined)) {
+        assert.equal(entry.body.conditions.length, 1, entry.id);
+      }
+    }
+  }
+});
+
+test("headroom OR preserves filtered comparisons and missing-series behavior", () => {
+  const promql = query(monitoring.renderMonitoring(resumed("15 3 * * *")), "refresh-output-headroom");
+  const text = promql
+    .replaceAll(/sum\(increase\(logging_googleapis_com:user_[a-z_]+_analytics_refresh_output_account_sum\{[^}]*\}\[25h\]\)\)/gu, " A ")
+    .replaceAll(/sum\(increase\(logging_googleapis_com:user_[a-z_]+_analytics_refresh_output_budget_sum\{[^}]*\}\[25h\]\)\)/gu, " B ")
+    .replaceAll(/sum\(increase\(logging_googleapis_com:user_[a-z_]+_analytics_refresh_outcome\{[^}]*\}\[1h\]\)\)/gu, " E ");
+  for (const [account, budget, exceeded, expected] of [
+    [80, 100, 0, null], [81, 100, 0, 0.81], [20, 100, 1, 1], [81, 100, 2, 0.81],
+    [null, null, 1, 1], [90, 100, null, 0.9], [null, 100, 0, null],
+    [10, null, null, null], [null, null, null, null], [0, 0, 0, null], [1, 0, null, Infinity],
+  ]) {
+    assert.equal(evaluateLabelFreePromql(text, { A: account, B: budget, E: exceeded }), expected,
+      JSON.stringify({ account, budget, exceeded }));
+  }
+});
+
+test("scheduler OR keeps independent cadence windows, trigger labels and per-trigger deferrals", () => {
+  const branch = (job, hours) => "absent_over_time(logging_googleapis_com:user_tibotattle_staging_scheduler_attempt"
+    + `{monitored_resource="cloud_scheduler_job",job_id="tibotattle-staging-${job}-trigger"}[${hours}h])`;
+  for (const [refreshEnabled, maintenanceEnabled] of [[true, true], [true, false], [false, true], [false, false]]) {
+    const desired = staging((value) => {
+      value.scheduler["analytics-refresh"].schedule = "15 3 * * *";
+      value.scheduler["analytics-refresh"].state = refreshEnabled ? "ENABLED" : "PAUSED";
+      value.scheduler.maintenance.state = maintenanceEnabled ? "ENABLED" : "PAUSED";
+    });
+    const entry = policy(monitoring.renderMonitoring(desired, { notificationChannel: CHANNEL }), "scheduler-quiet");
+    assert.equal(entry.body.conditions.length, 1);
+    const condition = entry.body.conditions[0].conditionPrometheusQueryLanguage;
+    assert.equal(condition.duration, "0s"); assert.equal(condition.evaluationInterval, "60s");
+    if (!refreshEnabled && !maintenanceEnabled) {
+      assert.equal(entry.deferred, "TRIGGER_COMMITTED_PAUSED");
+      continue;
+    }
+    assert.equal(entry.deferred, undefined);
+    const terms = [refreshEnabled ? branch("analytics-refresh", 25) : null,
+      maintenanceEnabled ? branch("maintenance", 6) : null].filter(Boolean);
+    assert.equal(condition.query, terms.length === 1 ? terms[0] : terms.map((term) => `(${term})`).join(" or "));
+    const deferred = [!refreshEnabled ? { job: "analytics-refresh", deferred: "TRIGGER_COMMITTED_PAUSED" } : null,
+      !maintenanceEnabled ? { job: "maintenance", deferred: "TRIGGER_COMMITTED_PAUSED" } : null].filter(Boolean);
+    assert.deepEqual(entry.deferredConditions ?? [], deferred);
+    // Evaluate only the rendered absence terms; an OR union preserves each returned job_id.
+    const selectors = [...condition.query.matchAll(/job_id="(tibotattle-staging-(analytics-refresh|maintenance)-trigger)"\}\[(\d+)h\]/gu)];
+    assert.equal(selectors.length, terms.length);
+    for (const [refreshPresent, maintenancePresent] of [[true, true], [true, false], [false, true], [false, false]]) {
+      const ages = { "analytics-refresh": refreshPresent ? [1] : [], maintenance: maintenancePresent ? [1] : [] };
+      const series = selectors.filter(([, , job, hours]) => !ages[job].some((age) => age < Number(hours) * 60))
+        .map(([, id]) => ({ monitored_resource: "cloud_scheduler_job", job_id: id }));
+      const expectedJobs = [refreshEnabled && !refreshPresent ? "analytics-refresh" : null,
+        maintenanceEnabled && !maintenancePresent ? "maintenance" : null].filter(Boolean);
+      assert.deepEqual(series, expectedJobs.map((job) => ({ monitored_resource: "cloud_scheduler_job",
+        job_id: `tibotattle-staging-${job}-trigger` })));
+    }
+  }
 });
 
 test("cron gaps follow the validator's grammar in UTC", () => {

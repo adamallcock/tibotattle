@@ -176,11 +176,12 @@ exists:
 | `PRODUCER_NOT_IN_MANIFEST:<job>` | No manifest job emits the signal yet (D-OPS4 adds the jobs and probes) |
 | `PUBLIC_ORIGIN_UNASSIGNED` | A staging plane has no staging edge (`stagingOrigin`) yet, so edge-health has no public host to probe |
 
-A policy with one condition per trigger (scheduler-quiet) defers per
-trigger instead. A trigger with no usable cadence, or one committed
-`PAUSED`, drops only its own condition, and the policy lists it in
+The scheduler-quiet policy defers per trigger. Its single PromQL condition
+combines the eligible triggers' absence expressions with `or`, retaining each
+trigger's labels and cadence window. A trigger with no usable cadence, or one
+committed `PAUSED`, drops only its own expression, and the policy lists it in
 `deferredConditions` (the plan repeats that list). The policy waits as a
-whole only when every trigger's condition does.
+whole only when every trigger is deferred.
 
 ## origin-5xx-ratio
 
@@ -344,8 +345,13 @@ run.
 
 ## refresh-output-headroom
 
-**Ticket.** One policy, two conditions, read from what the refresh already
-logs (C-REFRESH, `cloud-run/analytics-refresh.mjs`):
+**Ticket.** One policy with one PromQL condition combines these two expressions
+with `or`, read from what the refresh already logs (C-REFRESH,
+`cloud-run/analytics-refresh.mjs`). Google requires a
+[single condition in a PromQL alerting policy](https://docs.cloud.google.com/monitoring/promql/create-promql-alerts).
+The union preserves either expression's alerting result, including when the
+other has no series; thresholds, windows and the 60-second evaluation interval
+remain unchanged:
 
 - **Near budget.** Over the trigger's longest cadence gap plus 60 minutes,
   the completed receipts' output account (`memory.accountMiB`) exceeds 80 %

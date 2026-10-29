@@ -505,6 +505,9 @@ function mutableMonitoring(seed = {}, { beforeRead = () => {}, failWrite = null,
     if (writes === failWrite) throw new Error("PRIVATE_WRITE_MARKER");
     const body = structuredClone(request.body), type = request.url.includes("/metrics") ? "metrics" : request.url.includes("/uptimeCheckConfigs") ? "uptime" : "policies";
     if (type !== "metrics" && request.method === "POST") body.name = `projects/${PROJECT}/${type === "uptime" ? "uptimeCheckConfigs" : "alertPolicies"}/${writes}`;
+    // The real API rejects any policy with multiple conditions when one uses PromQL.
+    if (type === "policies" && body.conditions.some((c) => c.conditionPrometheusQueryLanguage !== undefined)
+        && body.conditions.length !== 1) throw new Error("SYNTHETIC_PROMQL_SINGLE_CONDITION_REQUIRED");
     if (type === "policies") body.conditions = body.conditions.map((c, index) => ({ ...c, name: c.name ?? `${body.name}/conditions/${index}` }));
     if (request.method === "POST") state[type].push(body);
     else { const index = state[type].findIndex((e) => e.name === body.name); assert.ok(index >= 0); state[type][index] = body; }
@@ -545,6 +548,43 @@ test("eligible creates converge; all thirteen deferred policies and channel crea
   assert.equal(fake.calls.some(c=>c.argv.includes("channels")),false);assert.equal(fake.requests.some(r=>r.method==="DELETE"),false);
   assert.equal(result.readback.plan.summary.unchanged,8);assert.equal(result.readback.plan.summary.deferred,13);
   const again=await execute(fake);assert.equal(again.completed.length,0);assert.equal(fake.requests.length,8,"converged execution makes no extra write");
+});
+
+test("the fake provider rejects the real API's multi-condition PromQL failure before changing state", async () => {
+  const fake = mutableMonitoring();
+  const entry = renderMonitoring(STAGING, { notificationChannel: CHANNEL }).policies.find(({ id }) => id === "refresh-lock-held");
+  const body = structuredClone(entry.body);
+  body.conditions.push({ ...structuredClone(body.conditions[0]), displayName: "another PromQL condition" });
+  await assert.rejects(fake.transport({ method: "POST", url: `https://monitoring.googleapis.com/v3/projects/${PROJECT}/alertPolicies`, body }),
+    /SYNTHETIC_PROMQL_SINGLE_CONDITION_REQUIRED/u);
+  assert.deepEqual(fake.state.policies, []);
+});
+
+test("the reviewed three-policy plan applies with the provider's single-PromQL-condition rule", async () => {
+  const desired = structuredClone(STAGING);
+  desired.scheduler["analytics-refresh"].schedule = "15 3 * * *";
+  desired.scheduler["analytics-refresh"].state = "ENABLED";
+  desired.scheduler.maintenance.state = "ENABLED";
+  const rendered = renderMonitoring(desired, { notificationChannel: CHANNEL });
+  const eligible = { ...rendered, policies: rendered.policies.filter((entry) => entry.deferred === undefined) };
+  const seed = liveFrom(eligible);
+  seed.policies = seed.policies.filter((entry) => !["refresh-output-headroom", "scheduler-quiet"]
+    .some((id) => entry.displayName.endsWith(`-${id}`)));
+  seed.policies.find((entry) => entry.displayName.endsWith("-edge-health")).enabled = false;
+  const fake = mutableMonitoring(seed);
+  const plan = planMonitoring(rendered, readbackMonitoring(desired, { runner: fake.runner }));
+  assert.deepEqual(plan.summary, { create: 2, update: 1, unchanged: 16, deferred: 2, refused: 0 });
+  const result = await applyMonitoring(desired, { notificationChannel: CHANNEL, execute: true,
+    authorize: plan.planDigest, runner: fake.runner, transport: fake.transport,
+    committedDesired: () => desired, reloadDesired: () => desired });
+  assert.equal(result.status, "applied"); assert.equal(result.failed, null); assert.deepEqual(result.unattempted, []);
+  assert.deepEqual(result.completed, ["alert-policy:create:refresh-output-headroom", "alert-policy:create:scheduler-quiet",
+    "alert-policy:update:edge-health"]);
+  assert.equal(fake.requests.length, 3);
+  assert.ok(fake.requests.every((request) => request.url.includes("/alertPolicies")));
+  assert.deepEqual(fake.state.metrics, seed.metrics); assert.deepEqual(fake.state.uptime, seed.uptime);
+  assert.deepEqual(result.readback.plan.summary, { create: 0, update: 0, unchanged: 19, deferred: 2, refused: 0 });
+  assert.equal(fake.calls.some(({ argv }) => argv.slice(0, 4).join(" ") === "beta monitoring channels create"), false);
 });
 
 test("managed updates preserve resource IDs/condition IDs and use exact narrow patch masks", async () => {
