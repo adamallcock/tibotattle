@@ -592,7 +592,7 @@ function modelDefinitions(modelConfig, currentMetadata = false) {
       return { tier: published ? 0 : 1, definition: {
         key: modelId, label, view: "models", ...allowanceModelPresentation(modelId, index, family),
         order: published ? order : index, pinned: pinned === true
-          || (currentMetadata && published && modelId === "gpt-6.1-sol"),
+          || (currentMetadata && published && pinned === false),
       } };
     }).sort((left, right) => left.tier - right.tier || left.definition.order - right.definition.order)
     .map(({ definition }) => definition);
@@ -628,8 +628,8 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
       // keep their gate.
       key, label, view: "plans", className: `allowance-series-${color}`, pinned: presentation.current,
     })),
-    // Current v1.4/v1.5 metadata can name GPT-6.1 Sol before a fit is published.
-    // Keep its card honest with the existing empty-estimate state; legacy
+    // Current v1.4/v1.5 metadata can name held-back roster models before a fit
+    // is published. Keep their cards honest with the empty-estimate state; legacy
     // metadata and models without current catalog authority retain their gate.
     ...modelDefinitions(series.breakdowns.modelConfig,
       presentation.current && series.breakdowns.modelMetadata === "applied"),

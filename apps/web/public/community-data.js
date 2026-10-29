@@ -326,22 +326,22 @@ const PUBLIC_ALLOWANCE_ROSTER = Object.freeze([
   ["gpt-6.1-sol", "GPT-6.1 Sol"],
   ["gpt-6-sol", "GPT-6 Sol"],
   ["gpt-6-luna", "GPT-6 Luna"],
+  ["gpt-6.1-terra", "GPT-6.1 Terra"],
   ["gpt-5.6-terra", "GPT-5.6 Terra"],
   ["gpt-5.6-sol", "GPT-5.6 Sol"],
   ["gpt-5.6-luna", "GPT-5.6 Luna"],
 ]);
 const PUBLIC_ALLOWANCE_ROSTER_IDS = new Set(PUBLIC_ALLOWANCE_ROSTER.map(([modelId]) => modelId));
 // Roster models with no card until a served publication carries an estimate
-// for them (owner rounds 5 and 11). GPT-6.1 Sol is on the OpenAI release-line
-// catalog only, and the page must not name it before the served catalog adds
-// it. On v1.3 the `modelConfig` block is the served catalog's public roster and
-// the only authority that can name it (owner round 12, W-WEB-HIDE2): unless a
-// valid block names it, its tuples are skipped and counted like a newer model's,
-// and a rejected block names nothing. A block that names it places it at the
-// block's order. v1.0 and v1.1 cannot carry a block, so there it keeps its
-// roster slot (second) and stays known: a producer publishes tuples only for
-// models in its own reviewed catalog.
-const PUBLIC_ALLOWANCE_ROSTER_UNTIL_PUBLISHED = new Set(["gpt-6.1-sol"]);
+// for them (owner rounds 5 and 11). New release-line models must not be named
+// before the served catalog adds them. On v1.3 the `modelConfig` block is the
+// served catalog's public roster and the only authority that can name them
+// (owner round 12, W-WEB-HIDE2). Tuples for a model absent from a valid block
+// are skipped and counted like a newer model's; a rejected block names nothing.
+// A named model follows the block's order. v1.0 and v1.1 cannot carry a block,
+// so held-back models keep their roster slots and stay known: a producer
+// publishes tuples only for models in its own reviewed catalog.
+const PUBLIC_ALLOWANCE_ROSTER_UNTIL_PUBLISHED = new Set(["gpt-6.1-sol", "gpt-6.1-terra"]);
 // The owner chose a selected comparison, not the whole historical vocabulary
 // (2d6cfbc8, "six requested public allowance models"): older generations stay
 // off the page. That choice is this explicit list, taken from the OpenAI
