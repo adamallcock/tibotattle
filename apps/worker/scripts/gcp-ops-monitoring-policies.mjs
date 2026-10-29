@@ -589,6 +589,11 @@ function promCondition(displayName_, query, { duration = "0s" } = {}) {
   return { displayName: displayName_, conditionPrometheusQueryLanguage: { query, duration, evaluationInterval: "60s" } };
 }
 
+/** Cloud Monitoring permits only one condition in a PromQL policy; preserve OR as a vector union. */
+function promOrCondition(displayName_, queries) {
+  return promCondition(displayName_, queries.length === 1 ? queries[0] : queries.map((query) => `(${query})`).join(" or "));
+}
+
 function thresholdCondition(displayName_, { filter, threshold, minutes }) {
   return {
     displayName: displayName_,
@@ -617,11 +622,11 @@ function triggerCadence(desired, job) {
 }
 
 /**
- * scheduler-quiet's conditions, one per trigger ([{ job, cadence }]). A
+ * scheduler-quiet's predicate inputs, one per trigger ([{ job, cadence }]). A
  * trigger with no usable cadence, or committed PAUSED, drops only its own
- * condition (listed in deferredConditions), so one deferred trigger never
+ * expression (listed in deferredConditions), so one deferred trigger never
  * silences another's. The policy is deferred, with the first trigger's
- * reason, only when every condition is.
+ * reason, only when every expression is deferred.
  */
 export function schedulerQuietConditions(quiet) {
   if (!Array.isArray(quiet) || quiet.length === 0) fail("MONITORING_POLICY_INVALID");
@@ -737,25 +742,23 @@ export function renderMonitoring(desired, { notificationChannel = null } = {}) {
     severity: "ticket",
     summary: `An analytics-refresh run used over ${t.refreshOutputHeadroomShare * 100} % of its effective output `
       + "budget, or refused with ANALYTICS_V2_OUTPUT_BUDGET_EXCEEDED and published nothing.",
-    conditions: [
-      promCondition("refresh output account near budget",
-        `sum(increase(${refreshSum("account")}[${refreshWindow}])) / sum(increase(${refreshSum("budget")}`
-        + `[${refreshWindow}])) > ${t.refreshOutputHeadroomShare}`),
-      promCondition("refresh output budget exceeded",
-        `sum(increase(${metricName("analytics-refresh-outcome")}{monitored_resource="cloud_run_job",`
+    conditions: [promOrCondition("refresh output headroom or budget exceeded", [
+      `sum(increase(${refreshSum("account")}[${refreshWindow}])) / sum(increase(${refreshSum("budget")}`
+        + `[${refreshWindow}])) > ${t.refreshOutputHeadroomShare}`,
+      `sum(increase(${metricName("analytics-refresh-outcome")}{monitored_resource="cloud_run_job",`
         + `job_name=${quote(refreshJob)},code=${quote(REFRESH_OUTPUT_HEADROOM_CONTRACT.exceededCode)}}`
-        + `[${windowText(t.refreshOutputExceededWindowMinutes)}])) > 0`),
-    ],
+        + `[${windowText(t.refreshOutputExceededWindowMinutes)}])) > 0`,
+    ])],
   }, refreshCadence.deferred ?? null);
   const quiet = schedulerQuietConditions(SCHEDULED_JOB_NAMES.map((job) => ({ job, cadence: triggerCadence(desired, job) })));
   add("scheduler-quiet", {
     severity: "ticket",
     summary: `A trigger committed ENABLED made no attempt within max(${t.schedulerQuietMinimumHours} h, cadence `
       + "plus slack): paused too long, or broken. Confirm with `gcp-infra.mjs scheduler-probe`.",
-    conditions: quiet.conditions.map(({ job, cadence }) => promCondition(`${job} trigger quiet`,
+    conditions: [promOrCondition("scheduler trigger quiet", quiet.conditions.map(({ job, cadence }) =>
       `absent_over_time(${metricName("scheduler-attempt")}{monitored_resource="cloud_scheduler_job",`
       + `job_id=${quote(desired.scheduler[job].name)}}[${windowText(Math.max(t.schedulerQuietMinimumHours * 60,
-        (cadence.gapMinutes ?? 0) + t.cadenceSlackMinutes))}])`)),
+        (cadence.gapMinutes ?? 0) + t.cadenceSlackMinutes))}])`))],
   }, quiet.deferred, quiet.deferredConditions);
   add("origin-lock", {
     severity: "page",
