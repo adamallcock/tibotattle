@@ -413,8 +413,10 @@ export async function stopVerifiedMacTransitionProcesses({ appPath, knownProcess
     phase: 'inspect_application', refusalCode: null, pollRefusals: { term: null, kill: null },
     observations: { initial: null, term: null, kill: null } };
   const currentApplication = () => selectMacTransitionApplicationProcess(readProcesses(), executable);
-  const capture = (verifiedPid, slot) => {
-    const unresolvedPids = new Set();
+  // Unproven descendants remain pending through orphaning or PID reuse until
+  // a fresh inventory proves absence or independently establishes ownership.
+  const unresolvedPids = new Set();
+  const observe = (verifiedPid, slot) => {
     let observation;
     try { observation = observeMacTransitionProcesses(appPath, verifiedPid, knownProcesses, { readProcesses, unresolvedPids }); }
     catch (error) {
@@ -422,6 +424,10 @@ export async function stopVerifiedMacTransitionProcesses({ appPath, knownProcess
       throw error;
     }
     diagnostic.observations[slot] = cleanupObservation(appPath, observation, unresolvedPids);
+    return observation;
+  };
+  const capture = (verifiedPid, slot) => {
+    const observation = observe(verifiedPid, slot);
     if (observation.pending) fail('process_identity');
     return observation.owned;
   };
@@ -443,12 +449,27 @@ export async function stopVerifiedMacTransitionProcesses({ appPath, knownProcess
         try { signal(row.pid, name); } catch (error) { if (error.code !== 'ESRCH') throw error; }
       }
       diagnostic.phase = 'wait_' + slot;
-      try { await until(() => capture(null, slot).length === 0, 10000, 'owned_processes_remaining', { now, wait }); break; }
+      let pendingIdentity = false;
+      try {
+        await until(() => {
+          // A post-signal identity transition is not absence. Reobserve within
+          // the existing deadline without granting any new signal authority.
+          const observation = observe(null, slot);
+          pendingIdentity = observation.pending;
+          return !pendingIdentity && observation.owned.length === 0;
+        }, 10000, 'owned_processes_remaining', { now, wait });
+        break;
+      }
       catch (error) {
-        diagnostic.pollRefusals[slot] = cleanupRefusal(error);
-        // Preserve the actual refusal. Identity/inventory failures must not be
-        // relabeled as an exhausted deadline; escalation and limits stay intact.
-        if (name === 'SIGKILL') throw error;
+        const identityDeadline = pendingIdentity && error?.transitionStage === 'owned_processes_remaining';
+        diagnostic.pollRefusals[slot] = identityDeadline ? 'process_identity' : cleanupRefusal(error);
+        // Unavailable inventory is never a pending or empty observation. A
+        // persistent identity refusal retains its reason at the fixed deadline.
+        if (error?.transitionStage === 'process_inventory') throw error;
+        if (name === 'SIGKILL') {
+          if (identityDeadline) fail('process_identity');
+          throw error;
+        }
       }
     }
     diagnostic.phase = 'verify_absence';

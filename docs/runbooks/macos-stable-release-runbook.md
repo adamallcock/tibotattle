@@ -157,7 +157,15 @@ live identity fails closed and cannot overwrite a previously verified identity.
 After Install, unresolved process observations stay pending within the existing
 fixed deadline. Newly unresolved descendants remain pending through orphaning
 until absence or proven ownership; uncertainty cannot establish exit or admit
-a successor. Malformed inventory and cleanup identity failures remain fatal.
+a successor. Malformed inventory remains fatal. Cleanup requires a proven
+identity at initial capture and immediately before every signal. Only during
+the existing ten-second post-signal poll may an observed unresolved identity
+remain pending for reobservation; it never grants signal authority or counts
+as absence. Unresolved descendants remain pending through orphaning and PID
+reuse. Cleanup succeeds only after a fresh inventory proves absence and the
+final application/helper absence checks pass. Persistent uncertainty at the
+deadline, unavailable inventory, and initial or pre-signal identity failures
+remain fatal.
 Retain the separate
 `tibotattle-signed-macos-production-update-v4` receipt for each architecture.
 It keeps `existingCredentialFixture: false`: the signed credential fixture is
