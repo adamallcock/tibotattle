@@ -311,6 +311,42 @@ test("every matrix message reaches the browser translator in all supported local
   }
 });
 
+test("real translations label split hour buckets in visible, keyboard and accessible details", () => {
+  const labels = {
+    "en-US": ["1–2 hours", "2–6 hours"],
+    "zh-Hans": ["1–2 小时", "2–6 小时"],
+    es: ["1–2 horas", "2–6 horas"],
+  };
+  const keys = ["oneToTwoHours", "twoToSixHours"]
+    .map((name) => `accounting.cacheContinuity.outcome.bucket.${name}`);
+  for (const locale of SUPPORTED_LOCALES) for (const width of [390, 850]) {
+    const t = (key, values) => translate(key, values, locale);
+    const ui = mount({ width, t });
+    const evidence = impact([[], [], [], [], [], [], [20, 10], [40, 10]]);
+    const before = structuredClone(evidence);
+    ui.matrix.render({ impact: evidence });
+    const buttons = ui.all("cache-matrix-hit");
+    for (const [offset, key] of keys.entries()) {
+      assert.equal(CATALOGS[locale][key], labels[locale][offset], `${locale}: canonical full label`);
+      assert.equal(t(key), labels[locale][offset], `${locale}: browser bridge`);
+      const button = buttons[6 + offset];
+      assert.equal(button.getAttribute("aria-label"), t("accounting.cacheContinuity.matrix.groupLabel", {
+        gap: labels[locale][offset], percent: offset === 0 ? "50.0%" : "25.0%",
+        count: offset === 0 ? "20" : "40",
+      }), `${locale}: full accessible label`);
+    }
+    buttons[6].focus();
+    assert.equal(ui.find("cache-matrix-detail-identity").children[0].textContent, labels[locale][0]);
+    assert.equal(ui.find("cache-matrix-sr").textContent, buttons[6].getAttribute("aria-label"));
+    buttons[6].dispatch("keydown", { key: "ArrowRight", preventDefault() {} });
+    assert.equal(ui.document.activeElement, buttons[7]);
+    assert.equal(ui.find("cache-matrix-detail-identity").children[0].textContent, labels[locale][1]);
+    assert.equal(ui.find("cache-matrix-sr").textContent, buttons[7].getAttribute("aria-label"));
+    assert.doesNotMatch(ui.container.textContent, /accounting\.cacheContinuity|\{(?:gap|count|total|percent)\}/u);
+    assert.deepEqual(evidence, before, "translation and keyboard inspection preserve measured evidence");
+  }
+});
+
 test("model details inherit availability so their ordering coverage remains visible", () => {
   const model = { ...impact([[10, 5]]), model: "gpt-6-astra", orderingCoverageGaps: 2, coverageStatus: "incomplete" };
   delete model.status;

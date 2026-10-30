@@ -1803,6 +1803,12 @@ test("published spend pricing provenance preserves original totals, dates and ve
     pricingMethodVersion: "server-api-price-equivalent-v0.6",
     registrySha256: "d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d",
   };
+  const terraRegistry = {
+    ...current,
+    // Canonical accounting registry app-official-api-prices-v0.10, reviewed
+    // with the server's unchanged v0.6 pricing method.
+    registrySha256: "206544769b43e4b9645284258edd38f7c07a226022db10f5ec0181335df236ab",
+  };
   const unknown = { ...current, registrySha256: historical.registrySha256 };
   const unavailable = {
     ...historical, knownCostUsd: null, coverage: "unavailable",
@@ -1815,6 +1821,19 @@ test("published spend pricing provenance preserves original totals, dates and ve
     ["historical", [day("2026-08-06", historical)], "$1.25", "Total published API-equivalent estimates",
       "Published estimates use earlier pricing. Repricing pending."],
     ["current", [day("2026-08-06", current)], "$2.5", "Total API-equivalent spend", ""],
+    ["current Terra registry", [day("2026-08-06", terraRegistry)], "$2.5", "Total API-equivalent spend", ""],
+    ["both recognized v0.6 registries", [day("2026-08-06", current), day("2026-08-07", terraRegistry)], "$5",
+      "Total API-equivalent spend", ""],
+    ["historical and Terra registry", [day("2026-08-06", historical), day("2026-08-07", terraRegistry)], "$3.75",
+      "Total published API-equivalent estimates", "Some published estimates use earlier pricing. Repricing pending."],
+    ["Terra registry with historical method", [day("2026-08-06", { ...terraRegistry, pricingMethodVersion: historical.pricingMethodVersion })],
+      "$2.5", "Total published API-equivalent estimates", "Published estimates include an unrecognized pricing version."],
+    ["earlier v0.6 registry with historical method", [day("2026-08-06", { ...current, pricingMethodVersion: historical.pricingMethodVersion })],
+      "$2.5", "Total published API-equivalent estimates", "Published estimates include an unrecognized pricing version."],
+    ["Terra registry with unknown method", [day("2026-08-06", { ...terraRegistry, pricingMethodVersion: "server-api-price-equivalent-v0.7" })],
+      "$2.5", "Total published API-equivalent estimates", "Published estimates include an unrecognized pricing version."],
+    ["unknown registry", [day("2026-08-06", { ...current, registrySha256: "a".repeat(64) })],
+      "$2.5", "Total published API-equivalent estimates", "Published estimates include an unrecognized pricing version."],
     ["mixed", [day("2026-08-06", historical), day("2026-08-07", current)], "$3.75",
       "Total published API-equivalent estimates", "Some published estimates use earlier pricing. Repricing pending."],
     ["historical and absent", [day("2026-08-06", historical), publishedDailyDay("2026-08-07", 1)], "$1.25",
@@ -1834,6 +1853,8 @@ test("published spend pricing provenance preserves original totals, dates and ve
     assert.equal(card.children[1].textContent, value, label);
     assert.equal(card.children[2].textContent.endsWith(notice), true, label);
     assert.equal(card.children[2].textContent.includes("Repricing pending."), notice.includes("Repricing pending."), label);
+    assert.equal(card.children[2].textContent.includes("unrecognized pricing version"),
+      notice.includes("unrecognized pricing version"), label);
     assert.match(card.children[2].textContent, /not an actual bill/u, label);
     assert.doesNotMatch(container.text, /9,999/u, label);
     const normalized = normalizeCommunityDailySeries(payload);
@@ -1851,6 +1872,21 @@ test("published spend pricing provenance preserves original totals, dates and ve
     assert.deepEqual(restored.apiEquivalentSpend, normalized.days[0].apiEquivalentSpend, label);
     assert.equal(restored.releasedAt, normalized.days[0].releasedAt, label);
     assert.equal(restored.revision, normalized.days[0].revision, label);
+  }
+  for (const [label, overrides] of [
+    ["malformed registry", { registrySha256: `${terraRegistry.registrySha256} ` }],
+    ["non-string registry", { registrySha256: null }],
+    ["malformed method", { pricingMethodVersion: "server-api-price-equivalent-v0.6 " }],
+  ]) {
+    const malformed = publishedDailySeries({ days: [day("2026-08-06", { ...terraRegistry, ...overrides })] });
+    const before = structuredClone(malformed);
+    const documentRef = fakeDocument(), container = documentRef.createElement("div");
+    renderCommunityDailySeries({ documentRef, container, payload: malformed });
+    const card = container.descendants().find(element => element.className === "snapshot-quality-grid").children[1];
+    assert.equal(card.children[1].textContent, "—", label);
+    assert.equal(card.children[2].textContent, "API-equivalent spend unavailable; not an actual bill", label);
+    assert.equal(normalizeCommunityDailySeries(malformed).days[0].apiEquivalentSpend, null, label);
+    assert.deepEqual(malformed, before, label);
   }
   const invalid = { ...historical, fullyPricedUsageEvents: 119 };
   const payload = publishedDailySeries({ days: [day("2026-08-06", invalid)] });
