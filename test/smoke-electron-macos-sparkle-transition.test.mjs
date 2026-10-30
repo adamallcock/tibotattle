@@ -204,7 +204,7 @@ test('passive uncertainty resolves only through a complete proven identity or ab
 });
 
 function cleanupHarness(rows, { known = new Map(rows.map(row => [row.pid, runner.macTransitionProcessFingerprint(row)])),
-  onRead, onSignal } = {}) {
+  onRead, onSignal, onWait } = {}) {
   const state = { rows, reads: 0, elapsed: 0, signals: [], diagnostics: [], verified: [], ui: [] };
   state.run = () => runner.stopVerifiedMacTransitionProcesses({ appPath: processApp, knownProcesses: known,
     verifyApp: async path => { state.verified.push(path); },
@@ -214,28 +214,119 @@ function cleanupHarness(rows, { known = new Map(rows.map(row => [row.pid, runner
     signal: (pid, name) => { state.signals.push({ pid, name }); if (onSignal) onSignal(state, pid, name); },
     interact: (executable, pid, action) => { state.ui.push({ executable, pid, action }); return 'clicked'; },
     now: () => state.elapsed,
-    wait: async milliseconds => { assert.equal(milliseconds, 500); state.elapsed += milliseconds; },
+    wait: async milliseconds => {
+      assert.equal(milliseconds, 500); state.elapsed += milliseconds;
+      if (onWait) onWait(state);
+    },
   });
   return state;
 }
 
-test('cleanup preserves underlying poll refusals and a later final cleanup cannot overwrite the failed observation', async () => {
+for (const phase of ['SIGTERM', 'SIGKILL']) {
+  for (const reason of ['missing_start', 'changed_command']) {
+    test(`cleanup reobserves transient ${reason} after ${phase} until fresh absence`, async () => {
+      const helper = processRow(31, 1, '/synthetic/helper');
+      const ambiguous = reason === 'missing_start' ? { ...helper, startedAt: null }
+        : { ...helper, command: '/synthetic/changed-command' };
+      const state = cleanupHarness([helper], {
+        onSignal(current, _pid, signal) { if (signal === phase) current.rows = [ambiguous]; },
+        onWait(current) { if (current.signals.at(-1)?.name === phase) current.rows = []; },
+      });
+      assert.equal(await state.run(), true);
+      assert.equal(state.elapsed, phase === 'SIGTERM' ? 500 : 10500);
+      assert.deepEqual(state.signals, phase === 'SIGTERM' ? [{ pid: 31, name: 'SIGTERM' }]
+        : [{ pid: 31, name: 'SIGTERM' }, { pid: 31, name: 'SIGKILL' }]);
+      const diagnostic = state.diagnostics[0], terminal = diagnostic.observations[phase === 'SIGTERM' ? 'term' : 'kill'];
+      assert.equal(diagnostic.status, 'passed'); assert.equal(diagnostic.refusalCode, null);
+      assert.equal(terminal.status, 'observed'); assert.equal(terminal.truncated, false);
+      assert.ok(Object.values(terminal.counts).every(count => count === 0));
+      assert.deepEqual(diagnostic.pollRefusals, { term: phase === 'SIGTERM' ? null : 'owned_processes_remaining', kill: null });
+    });
+  }
+
+  test(`cleanup bounds persistent identity uncertainty after ${phase} without signaling it`, async () => {
+    const helper = processRow(31, 1, '/synthetic/helper');
+    const state = cleanupHarness([helper], {
+      onSignal(current, _pid, signal) { if (signal === phase) current.rows = [{ ...helper, startedAt: null }]; },
+    });
+    await assert.rejects(state.run(), error => error.transitionStage === 'process_identity');
+    assert.equal(state.elapsed, phase === 'SIGTERM' ? 10000 : 20000);
+    assert.deepEqual(state.signals, phase === 'SIGTERM' ? [{ pid: 31, name: 'SIGTERM' }]
+      : [{ pid: 31, name: 'SIGTERM' }, { pid: 31, name: 'SIGKILL' }]);
+    const diagnostic = state.diagnostics[0];
+    assert.equal(diagnostic.status, 'failed'); assert.equal(diagnostic.refusalCode, 'process_identity');
+    assert.equal(diagnostic.observations.kill.counts.unresolved, 1);
+    assert.equal(diagnostic.pollRefusals[phase === 'SIGTERM' ? 'term' : 'kill'], 'process_identity');
+  });
+
+  test(`cleanup keeps unavailable inventory fatal after ${phase}`, async () => {
+    const helper = processRow(31, 1, '/synthetic/helper');
+    const state = cleanupHarness([helper], {
+      onSignal(current, _pid, signal) { if (signal === phase) current.unavailable = true; },
+      onRead(current) { if (current.unavailable) throw new Error('PRIVATE_INVENTORY'); return current.rows; },
+    });
+    await assert.rejects(state.run(), error => error.transitionStage === 'process_inventory');
+    assert.equal(state.elapsed, phase === 'SIGTERM' ? 0 : 10000);
+    const diagnostic = state.diagnostics[0], slot = phase === 'SIGTERM' ? 'term' : 'kill';
+    assert.equal(diagnostic.phase, 'wait_' + slot);
+    assert.deepEqual(diagnostic.observations[slot], { status: 'unavailable', counts: null, truncated: false });
+    assert.equal(diagnostic.pollRefusals[slot], 'process_inventory');
+    assert.deepEqual(state.signals.map(row => row.name), phase === 'SIGTERM' ? ['SIGTERM'] : ['SIGTERM', 'SIGKILL']);
+    assert.doesNotMatch(JSON.stringify(diagnostic), /PRIVATE_INVENTORY/u);
+  });
+}
+
+test('a recovered owned fingerprint still does not prove post-signal exit', async () => {
+  const helper = processRow(31, 1, '/synthetic/helper');
+  const state = cleanupHarness([helper], {
+    onSignal(current) { current.rows = [{ ...helper, startedAt: null }]; },
+    onWait(current) { current.rows = current.elapsed === 500 ? [helper] : []; },
+  });
+  assert.equal(await state.run(), true); assert.equal(state.elapsed, 1000);
+  assert.deepEqual(state.signals, [{ pid: 31, name: 'SIGTERM' }]);
+});
+
+for (const disappears of [false, true]) {
+  test(`post-signal unresolved orphan descendants ${disappears ? 'clear only on absence' : 'survive PID reuse without gaining authority'}`, async () => {
+    const helper = processRow(31, 1, '/synthetic/helper');
+    const child = processRow(32, 31, '/synthetic/child', null);
+    const grandchild = processRow(33, 32, '/synthetic/grandchild');
+    const known = new Map([[31, runner.macTransitionProcessFingerprint(helper)]]), before = new Map(known);
+    const state = cleanupHarness([helper], { known,
+      onSignal(current) { current.rows = [helper, child, grandchild]; },
+      onWait(current) {
+        current.rows = current.elapsed === 500 ? [{ ...child, parent: 1, startedAt: processStart }, { ...grandchild, parent: 1 }]
+          : disappears ? [] : [{ ...grandchild, parent: 1, command: '/synthetic/reused', startedAt: 'Sun Oct 4 03:00:00 2026' }];
+      },
+    });
+    if (disappears) { assert.equal(await state.run(), true); assert.equal(state.elapsed, 1000); }
+    else {
+      await assert.rejects(state.run(), error => error.transitionStage === 'process_identity');
+      assert.equal(state.elapsed, 10000);
+      assert.equal(state.diagnostics[0].observations.kill.counts.unresolved, 1);
+    }
+    assert.deepEqual(state.signals, [{ pid: 31, name: 'SIGTERM' }]);
+    assert.deepEqual(known, before, 'unknown ancestry and reused identities never enter the ownership registry');
+  });
+}
+
+test('cleanup preserves fatal inventory refusal and a later final cleanup cannot overwrite the failed observation', async () => {
   const helper = processRow(31, 1, '/synthetic/private-helper');
   const state = cleanupHarness([helper], { onRead(current) {
     if (current.reads === 4) return [{ ...helper, startedAt: null }];
-    if (current.reads === 6) throw new Error('PRIVATE_PROCESS_CONTENT');
+    if (current.reads === 5) throw new Error('PRIVATE_PROCESS_CONTENT');
     return current.rows;
   } });
   await assert.rejects(state.run(), error => error.transitionStage === 'process_inventory'
     && error.message === 'SIGNED_SPARKLE_TRANSITION_REFUSED');
-  assert.deepEqual(state.signals, [{ pid: 31, name: 'SIGTERM' }, { pid: 31, name: 'SIGKILL' }]);
-  assert.equal(state.elapsed, 0, 'an identity/inventory refusal is not deadline exhaustion');
+  assert.deepEqual(state.signals, [{ pid: 31, name: 'SIGTERM' }]);
+  assert.equal(state.elapsed, 500, 'one pending identity is reobserved; unavailable inventory then fails immediately');
   const initial = structuredClone(state.diagnostics[0]);
-  assert.equal(initial.status, 'failed'); assert.equal(initial.phase, 'wait_kill');
+  assert.equal(initial.status, 'failed'); assert.equal(initial.phase, 'wait_term');
   assert.equal(initial.refusalCode, 'process_inventory');
-  assert.deepEqual(initial.pollRefusals, { term: 'process_identity', kill: 'process_inventory' });
-  assert.equal(initial.observations.term.counts.unresolved, 1);
-  assert.deepEqual(initial.observations.kill, { status: 'unavailable', counts: null, truncated: false });
+  assert.deepEqual(initial.pollRefusals, { term: 'process_inventory', kill: null });
+  assert.deepEqual(initial.observations.term, { status: 'unavailable', counts: null, truncated: false });
+  assert.equal(initial.observations.kill, null);
   assert.doesNotMatch(JSON.stringify(initial), /PRIVATE_PROCESS_CONTENT|private-helper|synthetic|"pid"|"command"|"path"/u);
   state.rows = [];
   assert.equal(await state.run(), true);
@@ -266,6 +357,20 @@ test('cleanup refuses unknown live identity before signaling and does not replac
   assert.equal(diagnostic.observations.initial.counts.owned, 0);
   assert.equal(diagnostic.observations.initial.counts.unresolved, 1);
   assert.equal(known.get(31), runner.macTransitionProcessFingerprint(helper));
+});
+
+test('cleanup rejects an identity that becomes unknown between initial capture and signaling', async () => {
+  const helper = processRow(31, 1, '/synthetic/helper');
+  const state = cleanupHarness([helper], {
+    onRead(current) { return current.reads === 3 ? [{ ...helper, startedAt: null }] : current.rows; },
+  });
+  await assert.rejects(state.run(), error => error.transitionStage === 'process_identity');
+  assert.deepEqual(state.signals, []); assert.equal(state.elapsed, 0);
+  const diagnostic = state.diagnostics[0];
+  assert.equal(diagnostic.phase, 'signal_term'); assert.equal(diagnostic.refusalCode, 'process_identity');
+  assert.equal(diagnostic.observations.initial.counts.owned, 1);
+  assert.equal(diagnostic.observations.term.counts.unresolved, 1);
+  assert.deepEqual(diagnostic.pollRefusals, { term: null, kill: null });
 });
 
 test('cleanup records only closed categories from the same proven inventory, then verifies absence', async () => {
