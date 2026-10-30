@@ -122,17 +122,24 @@ function allTokens(totals) {
 const PUBLISHED_SPEND_PRICING_IDENTITIES = Object.freeze({
   historical: Object.freeze({
     method: "server-api-price-equivalent-v0.5",
-    registry: "48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9",
+    registries: Object.freeze([
+      "48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9",
+    ]),
   }),
   current: Object.freeze({
     method: "server-api-price-equivalent-v0.6",
-    registry: "d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d",
+    // Retain the reviewed v0.6 registry alongside its Terra catalog successor.
+    // Recognizing either publication never restamps or reprices its evidence.
+    registries: Object.freeze([
+      "d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d",
+      "206544769b43e4b9645284258edd38f7c07a226022db10f5ec0181335df236ab",
+    ]),
   }),
 });
 
 function publishedSpendPricingIdentity(spend) {
   for (const [identity, pair] of Object.entries(PUBLISHED_SPEND_PRICING_IDENTITIES)) {
-    if (spend.pricingMethodVersion === pair.method && spend.registrySha256 === pair.registry) {
+    if (spend.pricingMethodVersion === pair.method && pair.registries.includes(spend.registrySha256)) {
       return identity;
     }
   }

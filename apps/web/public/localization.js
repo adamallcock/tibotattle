@@ -452,6 +452,8 @@ export const WEB_MESSAGES = Object.freeze({
   "accounting.cacheContinuity.outcome.bucket.fiveToTenMinutes": ["5–10 minutes", "5–10 分钟", "5–10 minutos"],
   "accounting.cacheContinuity.outcome.bucket.tenToThirtyMinutes": ["10–30 minutes", "10–30 分钟", "10–30 minutos"],
   "accounting.cacheContinuity.outcome.bucket.thirtyMinutesToOneHour": ["30 minutes–1 hour", "30 分钟–1 小时", "30 minutos–1 hora"],
+  "accounting.cacheContinuity.outcome.bucket.oneToTwoHours": ["1–2 hours", "1–2 小时", "1–2 horas"],
+  "accounting.cacheContinuity.outcome.bucket.twoToSixHours": ["2–6 hours", "2–6 小时", "2–6 horas"],
   "accounting.cacheContinuity.outcome.bucket.oneToSixHours": ["1–6 hours", "1–6 小时", "1–6 horas"],
   "accounting.cacheContinuity.outcome.bucket.sixToTwentyFourHours": ["6–24 hours", "6–24 小时", "6–24 horas"],
   "accounting.cacheContinuity.outcome.bucket.oneToThreeDays": ["1–3 days", "1–3 天", "1–3 días"],
