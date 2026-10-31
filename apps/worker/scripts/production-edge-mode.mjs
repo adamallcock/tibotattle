@@ -464,10 +464,26 @@ async function readTrackedConfig(workerDirectory) {
   } catch {
     return fail("EDGE_MODE_CONFIG_INVALID");
   }
+  return parseTrackedConfig(text);
+}
+
+function parseTrackedConfig(text) {
   const errors = [];
   const config = parse(text, errors);
   if (errors.length > 0 || !object(config)) fail("EDGE_MODE_CONFIG_INVALID");
   return config;
+}
+
+/** Read only the tracked edge configuration at an exact local source commit.
+ * Publication inspection must not substitute a mutable checkout's config. */
+export function readEdgeModeSourceConfig({ repositoryDirectory, commit, execFile = execFileSync } = {}) {
+  if (typeof repositoryDirectory !== "string" || !repositoryDirectory || !SHA.test(commit ?? "")) fail("EDGE_MODE_CONFIG_INVALID");
+  let text;
+  try {
+    text = execFile("/usr/bin/git", ["-C", repositoryDirectory, "show", `${commit}:apps/worker/wrangler.jsonc`],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000, maxBuffer: 1024 * 1024 });
+  } catch { fail("EDGE_MODE_CONFIG_INVALID"); }
+  return parseTrackedConfig(text);
 }
 
 function defaultBlobReader(workerDirectory) {
