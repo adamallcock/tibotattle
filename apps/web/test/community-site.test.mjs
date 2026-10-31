@@ -46,6 +46,8 @@ import {
   renderInstallerAssurance,
   renderInstallerJourney,
 } from "../public/install-cta.js";
+import { exampleModelSpeeds } from "../public/feature-insights.js";
+import { mountModelPerformance } from "../public/model-performance.js";
 
 const SITE_HTML = new URL("../public/community.html", import.meta.url);
 const SITE_SOURCE = new URL("../public/community.js", import.meta.url);
@@ -3242,6 +3244,150 @@ function publishedModelPerformance() {
 }
 
 const PERFORMANCE_SLOT = { period: "7", speedMode: "fast" };
+
+// From 960px the public site lays the selected model's panel out as a grid.
+// Only the metric cards may share a row: any other direct child left unplaced
+// takes a cell of its own and pushes the cards onto a diagonal. The helpers
+// below read the real stylesheet and the real rendered panels, so a child the
+// renderer adds later is checked without anyone listing it here.
+
+/** Mounts one model performance view in a minimal DOM and returns its panel. */
+async function renderedPerformancePanel(options) {
+  const documentRef = {
+    activeElement: null, hidden: false, addEventListener() {}, removeEventListener() {},
+  };
+  class Node {
+    constructor(tagName) {
+      Object.assign(this, {
+        tagName, ownerDocument: documentRef, children: [], dataset: {}, attributes: {},
+        listeners: {}, className: "", style: { setProperty() {} }, classList: { contains: () => false },
+      });
+    }
+    append(...children) { this.children.push(...children); }
+    all() { return this.children.flatMap((child) => [child, ...child.all()]); }
+    replaceChildren() { this.children = []; }
+    querySelectorAll() { return this.all().filter((node) => node.dataset.performanceFocus); }
+    setAttribute(key, value) { this.attributes[key] = value; if (key === "class") this.className = value; }
+    getBoundingClientRect() { return { left: 0, top: 0, width: 800, height: 256 }; }
+    contains(node) { return node === this || this.all().includes(node); }
+    addEventListener(type, listener) { this.listeners[type] = listener; }
+    focus() { documentRef.activeElement = this; }
+  }
+  documentRef.createElement = (tag) => new Node(tag);
+  documentRef.createElementNS = (namespace, tag) => new Node(tag);
+  const root = new Node("div");
+  const windowRef = {
+    localStorage: { getItem: () => null, setItem() {} },
+    setTimeout: () => 0, clearTimeout() {},
+    MutationObserver: class { observe() {} disconnect() {} },
+  };
+  const controller = mountModelPerformance({
+    ...options, root, windowRef, t: (key, values) => translate(key, values, "en-US"),
+  });
+  try {
+    await controller.refresh();
+    const panel = root.all().find((node) => node.id === "performance-model-panel");
+    assert.ok(panel, "the view renders its model panel");
+    return panel;
+  } finally {
+    controller.destroy();
+  }
+}
+
+/** Every rule inside the stylesheet's `@media (min-width: 960px)` blocks. */
+function wideLayoutRules(styles) {
+  const css = styles.replace(/\/\*[\s\S]*?\*\//gu, "");
+  const opener = "@media (min-width: 960px) {";
+  const rules = [];
+  for (let start = css.indexOf(opener); start !== -1; start = css.indexOf(opener, start + 1)) {
+    let depth = 1, index = start + opener.length;
+    for (; depth > 0; index += 1) {
+      assert.ok(index < css.length, "the wide layout block closes");
+      if (css[index] === "{") depth += 1;
+      else if (css[index] === "}") depth -= 1;
+    }
+    const body = css.slice(start + opener.length, index - 1);
+    for (const [, selectors, declarations] of body.matchAll(/([^{}]+)\{([^{}]*)\}/gu))
+      rules.push({ selectors: selectors.split(",").map((selector) => selector.trim()), declarations });
+  }
+  return rules;
+}
+
+/**
+ * Matches class, id, `:not()` and `*` compounds joined by descendant or child
+ * combinators against a modelled element ancestry. Anything else fails the
+ * test loudly instead of being silently treated as a miss.
+ */
+function selectorMatches(selector, node) {
+  const tokens = selector.replace(/\s*>\s*/gu, " > ").trim().split(/\s+/u);
+  const compound = (text, target) => {
+    const parts = [...text.matchAll(/\.([\w-]+)|#([\w-]+)|:not\(([^()]+)\)|\*/gu)];
+    assert.equal(parts.map(([part]) => part).join(""), text, `supported selector syntax in ${selector}`);
+    return parts.every(([, className, id, negated]) => className ? target.classes.has(className)
+      : id ? target.id === id : negated ? !compound(negated, target) : true);
+  };
+  const from = (index, target) => {
+    if (!target || !compound(tokens[index], target)) return false;
+    if (index === 0) return true;
+    if (tokens[index - 1] === ">") return from(index - 2, target.parent);
+    for (let ancestor = target.parent; ancestor; ancestor = ancestor.parent)
+      if (from(index - 1, ancestor)) return true;
+    return false;
+  };
+  return from(tokens.length - 1, node);
+}
+
+test("the wide public model panel keeps the metric cards on one row and spans every other child", async () => {
+  const html = await readFile(SITE_HTML, "utf8");
+  const styles = await readFile(new URL("../public/feature-tour.css", import.meta.url), "utf8");
+  // The modelled ancestry is the page's own: both views mount into this host.
+  assert.match(html, /<body class="community-site"[^>]*>/u);
+  assert.match(html, /<section class="insight-demo" id="speeds-demo">[\s\S]*?<div class="model-performance" data-speeds-demo><\/div><\/section>/u);
+  const modelled = (className, id, parent) => ({
+    classes: new Set(className.split(/\s+/u).filter(Boolean)), id: id ?? "", parent,
+  });
+  const host = modelled("model-performance", "", modelled("insight-demo", "speeds-demo", modelled("community-site", "", null)));
+
+  const rules = wideLayoutRules(styles);
+  const placement = rules.flatMap(({ selectors, declarations }) => {
+    const column = declarations.match(/(?:^|[;\s])grid-column\s*:\s*([^;]+)/u)?.[1].trim();
+    return column ? selectors.map((selector) => ({ selector, column })) : [];
+  });
+  const views = [
+    // The measured community publication that replaces the demonstration.
+    ["community", await renderedPerformancePanel({
+      source: "community", ...PERFORMANCE_SLOT,
+      client: { modelPerformance: async (period, { speedMode } = {}) =>
+        normalizeCommunityModelPerformance(publishedModelPerformance(), { period, speedMode }) },
+    })],
+    // The synthetic demonstration the page mounts first.
+    ["synthetic", await renderedPerformancePanel({
+      client: { modelPerformance: async (period, { speedMode } = {}) => exampleModelSpeeds(period, speedMode) },
+    })],
+  ];
+  for (const [view, panel] of views) {
+    const panelNode = modelled(panel.className, panel.id, host);
+    const grid = rules.filter(({ selectors, declarations }) => /(?:^|[;\s])display\s*:\s*grid\b/u.test(declarations)
+      && selectors.some((selector) => selectorMatches(selector, panelNode)));
+    assert.equal(grid.length, 1, `${view}: the wide layout makes the panel one grid`);
+    const columns = Number(grid[0].declarations.match(/grid-template-columns\s*:\s*repeat\((\d+),/u)?.[1]);
+    const cards = panel.children.filter((child) => child.className.split(/\s+/u).includes("performance-card"));
+    assert.equal(cards.length, columns, `${view}: the metric cards fill exactly one ${columns}-column row`);
+    assert.ok(panel.children.length > cards.length, `${view}: the panel has children beside its cards`);
+    for (const child of panel.children) {
+      const node = modelled(child.className, child.id, panelNode);
+      const placed = placement.filter(({ selector }) => selectorMatches(selector, node)).map(({ column }) => column);
+      if (cards.includes(child)) {
+        assert.deepEqual(placed, [], `${view}: each metric card keeps a single cell`);
+      } else {
+        assert.ok(
+          placed.length > 0 && placed.every((column) => /^1\s*\/\s*-1$/u.test(column)),
+          `${view}: "${child.className}" must span the grid; unplaced, it takes a cell and pushes the cards onto a diagonal`,
+        );
+      }
+    }
+  }
+});
 
 test("the model performance client requests exactly one closed, same-origin slot", async () => {
   const calls = [];

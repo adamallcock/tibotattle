@@ -280,7 +280,10 @@
  .community-site .tour-cache .tour-copy { order: initial; }
  .community-site .tour-speeds .tour-copy { max-width: 780px; margin-bottom: 20px; }
  .community-site .performance-model-panel { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
- .community-site .performance-model-heading, .community-site .performance-details { grid-column: 1 / -1; }
+ /* Only the two metric cards share a row. Every other panel child (heading,
+    contributor line, methodology) spans it, so a new line cannot take a cell
+    and push the cards onto a diagonal. */
+ .community-site .performance-model-panel > :not(.performance-card) { grid-column: 1 / -1; }
  .community-site .performance-card { margin-bottom: 0; }
 }
 @media (max-width: 650px) {
