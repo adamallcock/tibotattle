@@ -8,8 +8,9 @@
  * and every fits and model-date row of those owners. Rows of owners the run
  * did not compute, and rows older than the horizon, are retained, never
  * retired: a roster change stops future contributions only, and a display
- * window is not a retention policy. Moved out of store.ts unchanged in
- * behaviour.
+ * window is not a retention policy. Before owner-day replacement cascades
+ * its price row, preserve any saved contribution version that still has a
+ * genuine same-run/kernel association to those exact daily values.
  */
 
 import type { PostgresClient } from "../postgres-client";
@@ -19,6 +20,7 @@ import {
   type AnalyticsV2RunOutputs,
 } from "./contract";
 import type { AnalyticsV2RunStamp } from "./kernel";
+import { preserveAnalyticsV2ContributionPriceInputs } from "./store-owner-sets";
 import {
   fail,
   insertRecordset,
@@ -49,6 +51,7 @@ export async function writeAnalyticsV2DerivedFamilies(client: PostgresClient, sc
   if (typeof retainedOwners !== "number" || !Number.isSafeInteger(retainedOwners) || retainedOwners < 0) {
     fail("ANALYTICS_V2_WRITE_FAILED", "retainedOwners");
   }
+  await preserveAnalyticsV2ContributionPriceInputs(client, schema, computedOwners, horizon.ownerDayFromDay);
   await client.query(
     `DELETE FROM ${relation(schema, tables.ownerDay)} WHERE owner_digest = ANY($1::text[]) AND day >= $2::date`,
     [computedOwners, horizon.ownerDayFromDay],

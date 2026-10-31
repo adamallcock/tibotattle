@@ -2,17 +2,20 @@
 title: Bounded historical spend repricing
 date: 2026-10-09
 type: runbook
-status: implemented-candidate-not-live-qualified
+status: maintained
 ---
 
 # Bounded historical spend repricing
 
-The candidate implements a separate saved-cohort repricing lane. It has not
-been deployed or qualified against production. This runbook describes the
-source contract and its production carrier (the reprice Cloud Run Job and the
-typed operator verb, OPS-REPRICE), not permission to migrate, deploy, apply
-infrastructure or execute a production Job. Each of those is an owner-only
-protected step.
+This runbook describes the saved-cohort repricing source contract and its
+production carrier (the reprice Cloud Run Job and the typed operator verb,
+OPS-REPRICE). The lane was deployed at server commit
+`cc344e1ab057640c51dadbe473936ce722bd06e5`. Its completed historical executions
+included input-association refusals; deployment and transaction completion do
+not establish recovered historical spend coverage. The input preservation
+change described below is a subsequent source change with its own deployment
+gate. This runbook grants no permission to migrate, deploy, apply infrastructure
+or execute a production Job. Each is an owner-only protected step.
 The operator retains the exact source commit, image digest, registered kernel,
 manifest version, target configuration, plan receipt and operation identity
 before any separately authorized execution.
@@ -116,6 +119,22 @@ versions archive genuine same-run/kernel inputs in
 `analytics_v2_contribution_price_inputs`; repricing appends the newly priced
 codec document and retains its source-input digest. It does not retroactively
 invent associations for older versions from matching totals.
+
+Before an ordinary refresh replaces an owner-day row, the store preserves any
+still-associated saved version's original pricing document in that same archive.
+This runs within the refresh write transaction and only for the computed owners
+and replacement horizon. The original run, price kernel and complete saved daily
+values must match; equal counts alone are insufficient. An existing conflicting
+archive aborts the transaction. No identifiers or contribution versions are
+rewritten. This prevents an unchanged contribution from losing its original
+inputs when the replaceable owner-day price row is deleted.
+
+That preservation step cannot recover an already missing association. Recovery
+requires authentic original inputs or independently bound historical source
+evidence, with current exclusions and erasure authority respected. Current-source
+recomputation is a new contribution and must not be presented as proof of an old
+snapshot. Do not rewrite run/kernel identifiers or repeat completed refused
+executions to make historical pricing appear current.
 
 The closed per-day refusals are `owner_set_unavailable`,
 `member_link_unavailable`, `price_inputs_unavailable`,
