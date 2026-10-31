@@ -46,6 +46,8 @@ import {
   renderInstallerAssurance,
   renderInstallerJourney,
 } from "../public/install-cta.js";
+import { exampleModelSpeeds } from "../public/feature-insights.js";
+import { mountModelPerformance } from "../public/model-performance.js";
 
 const SITE_HTML = new URL("../public/community.html", import.meta.url);
 const SITE_SOURCE = new URL("../public/community.js", import.meta.url);
@@ -3242,6 +3244,381 @@ function publishedModelPerformance() {
 }
 
 const PERFORMANCE_SLOT = { period: "7", speedMode: "fast" };
+
+// From 960px the public site lays the selected model's panel out as a grid.
+// Only the metric cards may share a row: any other direct child left unplaced
+// takes a cell of its own and pushes the cards onto a diagonal. The helpers
+// below take the panel's ancestry from the page markup and the rendered DOM,
+// read every stylesheet the page links, and resolve the cascade by importance,
+// specificity and order in each environment the matching rules distinguish.
+// A later or stronger rule, a selector scoped by any page ancestor, or a child
+// the renderer adds later is checked without anyone listing it here. Syntax
+// the helpers do not model fails the test loudly instead of counting as a miss.
+
+/** Mounts one model performance view in a minimal DOM and returns its panel. */
+async function renderedPerformancePanel(options) {
+  const documentRef = {
+    activeElement: null, hidden: false, addEventListener() {}, removeEventListener() {},
+  };
+  class Node {
+    constructor(tagName) {
+      Object.assign(this, {
+        tagName, ownerDocument: documentRef, children: [], dataset: {}, attributes: {},
+        listeners: {}, className: "", style: { setProperty() {} }, classList: { contains: () => false },
+      });
+    }
+    append(...children) {
+      for (const child of children) child.testParent = this;
+      this.children.push(...children);
+    }
+    all() { return this.children.flatMap((child) => [child, ...child.all()]); }
+    replaceChildren() { this.children = []; }
+    querySelectorAll() { return this.all().filter((node) => node.dataset.performanceFocus); }
+    setAttribute(key, value) { this.attributes[key] = value; if (key === "class") this.className = value; }
+    getBoundingClientRect() { return { left: 0, top: 0, width: 800, height: 256 }; }
+    contains(node) { return node === this || this.all().includes(node); }
+    addEventListener(type, listener) { this.listeners[type] = listener; }
+    focus() { documentRef.activeElement = this; }
+  }
+  documentRef.createElement = (tag) => new Node(tag);
+  documentRef.createElementNS = (namespace, tag) => new Node(tag);
+  const root = new Node("div");
+  const windowRef = {
+    localStorage: { getItem: () => null, setItem() {} },
+    setTimeout: () => 0, clearTimeout() {},
+    MutationObserver: class { observe() {} disconnect() {} },
+  };
+  const controller = mountModelPerformance({
+    ...options, root, windowRef, t: (key, values) => translate(key, values, "en-US"),
+  });
+  try {
+    await controller.refresh();
+    const panel = root.all().find((node) => node.id === "performance-model-panel");
+    assert.ok(panel, "the view renders its model panel");
+    return panel;
+  } finally {
+    controller.destroy();
+  }
+}
+
+/** Index of the first top-level character of `stops` from `from`, skipping strings and brackets. */
+function cssScan(text, from, stops) {
+  let depth = 0;
+  for (let index = from; index < text.length; index += 1) {
+    const char = text[index];
+    if (char === "\\") index += 1;
+    else if (char === "\"" || char === "'") {
+      for (index += 1; text[index] !== char; index += text[index] === "\\" ? 2 : 1)
+        assert.ok(index < text.length, "every CSS string closes");
+    } else if (depth === 0 && stops.includes(char)) return index;
+    else if (char === "(" || char === "[") depth += 1;
+    else if (char === ")" || char === "]") depth -= 1;
+  }
+  return -1;
+}
+
+/** The non-empty top-level pieces of `text` between `separator` characters. */
+function cssSplit(text, separator) {
+  const parts = [];
+  for (let start = 0, end; start <= text.length; start = end + 1) {
+    end = cssScan(text, start, separator);
+    if (end === -1) end = text.length;
+    parts.push(text.slice(start, end).trim());
+  }
+  return parts.filter(Boolean);
+}
+
+/** A media, supports or container condition as alternatives of parts. */
+function cssCondition(kind, query) {
+  if (kind !== "media") return [[{ toggle: `@${kind} ${query.replace(/\s+/gu, "")}` }]];
+  return cssSplit(query, ",").map((alternative) => alternative.split(/\s+and\s+/iu).map((part) => {
+    const width = part.match(/^\(\s*(min|max)-width\s*:\s*(\d+(?:\.\d+)?)px\s*\)$/u);
+    if (width) return { bound: width[1], px: Number(width[2]) };
+    if (/^(?:only\s+)?(?:screen|all)$/iu.test(part)) return { holds: true };
+    if (/^(?:only\s+)?print$/iu.test(part)) return { holds: false };
+    assert.ok(/^\([\w-]+\s*:\s*[\w-]+\)$/u.test(part) && !/width/u.test(part),
+      `media condition the layout check does not model: ${query}`);
+    return { toggle: part.replace(/\s+/gu, "") };
+  }));
+}
+
+/** Every style rule in one stylesheet, in source order, with its enclosing conditions. */
+function cssRules(css, sheet, name) {
+  const text = css.replace(/\/\*[\s\S]*?\*\//gu, "");
+  const rules = [];
+  let index = 0;
+  const skipBlock = () => {
+    for (let depth = 1; depth > 0; index += 1) {
+      index = cssScan(text, index, "{}");
+      assert.ok(index !== -1, `${name}: every block closes`);
+      depth += text[index] === "{" ? 1 : -1;
+    }
+  };
+  const block = (conditions) => {
+    for (;;) {
+      const stop = cssScan(text, index, "{;}");
+      const prelude = text.slice(index, stop === -1 ? text.length : stop).trim();
+      index = stop + 1;
+      if (stop === -1 || text[stop] === "}") {
+        assert.equal(prelude, "", `${name}: no stray text before a block closes`);
+        assert.equal(stop === -1, conditions.length === 0, `${name}: blocks close where they open`);
+        return;
+      }
+      if (text[stop] === ";") {
+        assert.ok(prelude === "" || /^@charset\b/u.test(prelude), `${name}: at-statement the layout check does not model: ${prelude}`);
+        continue;
+      }
+      const at = prelude.match(/^@([\w-]+)\s*([\s\S]*)$/u);
+      if (at && ["media", "supports", "container"].includes(at[1])) {
+        block([...conditions, cssCondition(at[1], at[2])]);
+      } else if (at) {
+        assert.match(at[1], /^(?:-webkit-)?keyframes$|^font-face$|^property$/u, `${name}: at-rule the layout check does not model: @${at[1]}`);
+        skipBlock();
+      } else {
+        const end = cssScan(text, index, "{}");
+        assert.equal(text[end], "}", `${name}: nested style rules are not modelled: ${prelude}`);
+        const declarations = cssSplit(text.slice(index, end), ";").map((declaration, position) => {
+          const colon = declaration.indexOf(":");
+          assert.ok(colon > 0, `${name}: declaration the layout check does not model: ${declaration}`);
+          const value = declaration.slice(colon + 1).trim();
+          return {
+            property: declaration.slice(0, colon).trim().toLowerCase(), position,
+            value: value.replace(/\s*!\s*important$/iu, ""), important: /!\s*important$/iu.test(value),
+          };
+        });
+        rules.push({ name, sheet, order: rules.length, conditions, declarations,
+          selectors: cssSplit(prelude, ",").map((selector) => selector.replace(/\s+/gu, " ")) });
+        index = end + 1;
+      }
+    }
+  };
+  block([]);
+  return rules;
+}
+
+/** The element carrying `attribute` in `html`, linked to its parsed ancestors. */
+function htmlElementCarrying(html, attribute) {
+  const VOID = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"]);
+  const source = html.replace(/<!--[\s\S]*?-->/gu, "").replace(/<(script|template)\b[^>]*>[\s\S]*?<\/\1>/giu, "");
+  const open = [];
+  for (const [, closing, name, attributes] of source.matchAll(/<(\/?)([a-zA-Z][\w-]*)((?:[^>"']|"[^"]*"|'[^']*')*)>/gu)) {
+    const tag = name.toLowerCase();
+    if (closing) {
+      assert.equal(open.at(-1)?.tag, tag, `community.html closes <${tag}> explicitly and in order`);
+      open.pop();
+      continue;
+    }
+    const attrs = new Map([...attributes.matchAll(/([^\s"'=/]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/gu)]
+      .map(([, key, double, single, bare]) => [key.toLowerCase(), double ?? single ?? bare ?? ""]));
+    const element = { tag, attrs, unknown: new Set(), parent: open.at(-1) ?? null };
+    if (attrs.has(attribute)) return element;
+    if (!VOID.has(tag) && !attributes.trimEnd().endsWith("/")) open.push(element);
+  }
+  return assert.fail(`community.html has an element carrying ${attribute}`);
+}
+
+/** A rendered node as the selector matcher sees it. */
+function renderedElement(node, parent) {
+  const attrs = new Map(Object.entries(node.attributes).map(([key, value]) => [key.toLowerCase(), String(value)]));
+  for (const [key, value] of Object.entries(node.dataset))
+    attrs.set(`data-${key.replace(/[A-Z]/gu, (letter) => `-${letter.toLowerCase()}`)}`, String(value));
+  if (node.className) attrs.set("class", node.className);
+  if (node.id) attrs.set("id", node.id);
+  // Visitors open and close the methodology disclosure, so `[open]` is undecided.
+  return { tag: node.tagName.toLowerCase(), attrs, unknown: new Set(["open"]), parent };
+}
+
+const parsedSelectors = new Map();
+/** A selector as compounds of simple selectors joined by combinators. */
+function parseSelector(selector) {
+  if (parsedSelectors.has(selector)) return parsedSelectors.get(selector);
+  const steps = [{ combinator: null, parts: [] }];
+  for (let index = 0, match; index < selector.length; index += match[0].length) {
+    const rest = selector.slice(index), parts = steps.at(-1).parts;
+    if ((match = rest.match(/^\s*([>+~])\s*|^\s+/u))) steps.push({ combinator: match[1] ?? " ", parts: [] });
+    else if (!parts.length && (match = rest.match(/^(?:\*|[a-zA-Z][\w-]*)/u))) parts.push({ kind: "type", name: match[0].toLowerCase() });
+    else if ((match = rest.match(/^\.(-?[_a-zA-Z][\w-]*)/u))) parts.push({ kind: "class", name: match[1] });
+    else if ((match = rest.match(/^#(-?[_a-zA-Z][\w-]*)/u))) parts.push({ kind: "id", name: match[1] });
+    else if ((match = rest.match(/^\[\s*([\w-]+)\s*(?:([~|^$*]?=)\s*(?:"([^"]*)"|'([^']*)'|([^\]\s]+))\s*)?\]/u)))
+      parts.push({ kind: "attribute", name: match[1].toLowerCase(), operator: match[2], value: match[3] ?? match[4] ?? match[5] });
+    else if ((match = rest.match(/^(::?)([\w-]+)/u))) {
+      const name = match[2].toLowerCase();
+      let args = null;
+      if (rest[match[0].length] === "(") {
+        const close = cssScan(rest, match[0].length + 1, ")");
+        assert.ok(close !== -1, `balanced selector in ${selector}`);
+        args = rest.slice(match[0].length + 1, close);
+        match = [rest.slice(0, close + 1)];
+      }
+      const element = match[0].startsWith("::") || ["before", "after", "first-line", "first-letter"].includes(name);
+      parts.push({ kind: element ? "pseudo-element" : "pseudo-class", name, args });
+    } else assert.fail(`selector syntax the layout check does not model: ${selector}`);
+  }
+  parsedSelectors.set(selector, steps);
+  return steps;
+}
+
+const compareSpecificity = (left, right) => left[0] - right[0] || left[1] - right[1] || left[2] - right[2];
+
+function specificity(steps) {
+  const total = [0, 0, 0];
+  for (const { kind, name, args } of steps.flatMap(({ parts }) => parts)) {
+    let add = kind === "id" ? [1, 0, 0] : kind === "type" && name === "*" ? [0, 0, 0]
+      : kind === "type" || kind === "pseudo-element" ? [0, 0, 1] : [0, 1, 0];
+    if (kind === "pseudo-class" && name === "where") add = [0, 0, 0];
+    else if (kind === "pseudo-class" && ["not", "is", "matches"].includes(name))
+      add = cssSplit(args, ",").map((selector) => specificity(parseSelector(selector))).sort(compareSpecificity).at(-1);
+    for (let index = 0; index < 3; index += 1) total[index] += add[index];
+  }
+  return total;
+}
+
+// Three-valued matching: true, false, or null when the page state cannot decide.
+const kleeneAnd = (left, right) => (left === false || right === false ? false : left === null || right === null ? null : true);
+const kleeneAny = (values) => (values.includes(true) ? true : values.includes(null) ? null : false);
+
+function matchPart(part, node) {
+  switch (part.kind) {
+    case "type": return part.name === "*" || node.tag === part.name;
+    case "class": return (node.attrs.get("class") ?? "").split(/\s+/u).includes(part.name);
+    case "id": return node.attrs.get("id") === part.name;
+    case "pseudo-element": return false;
+    case "attribute": {
+      const value = node.attrs.get(part.name);
+      if (node.unknown.has(part.name)) return null;
+      if (value === undefined || !part.operator) return value !== undefined;
+      return { "=": value === part.value, "~=": value.split(/\s+/u).includes(part.value),
+        "^=": value.startsWith(part.value), "$=": value.endsWith(part.value), "*=": value.includes(part.value),
+        "|=": value === part.value || value.startsWith(`${part.value}-`) }[part.operator];
+    }
+    default: {
+      if (part.name === "root") return node.tag === "html" && !node.parent;
+      if (!["not", "is", "where", "matches"].includes(part.name)) return null;
+      const any = kleeneAny(cssSplit(part.args, ",").map((selector) => matchSelector(parseSelector(selector), node)));
+      return part.name !== "not" ? any : any === null ? null : !any;
+    }
+  }
+}
+
+function matchSelector(steps, node, index = steps.length - 1) {
+  if (!node) return false;
+  const own = steps[index].parts.reduce((result, part) => kleeneAnd(result, matchPart(part, node)), true);
+  if (own === false || index === 0) return own;
+  const { combinator } = steps[index];
+  if (combinator === ">") return kleeneAnd(own, matchSelector(steps, node.parent, index - 1));
+  if (combinator !== " ") return kleeneAnd(own, null); // Siblings are not modelled.
+  const ancestors = [];
+  for (let ancestor = node.parent; ancestor; ancestor = ancestor.parent) ancestors.push(matchSelector(steps, ancestor, index - 1));
+  return kleeneAnd(own, kleeneAny(ancestors));
+}
+
+/** Declarations of `properties` from every rule whose selector matches `node`, in source order. */
+function matchingDeclarations(rules, node, properties, label) {
+  const found = [];
+  for (const rule of rules) {
+    const declarations = rule.declarations.filter(({ property }) => properties.includes(property));
+    if (!declarations.length) continue;
+    let strongest = null;
+    for (const selector of rule.selectors) {
+      const steps = parseSelector(selector), matched = matchSelector(steps, node);
+      assert.notEqual(matched, null, `${rule.name}: the layout check cannot decide whether "${selector}" matches ${label}`);
+      if (matched && (!strongest || compareSpecificity(specificity(steps), strongest) > 0)) strongest = specificity(steps);
+    }
+    if (strongest) for (const declaration of declarations) found.push({ ...declaration, rule, specificity: strongest });
+  }
+  return found;
+}
+
+const conditionHolds = (condition, { width, toggles }) => condition.some((alternative) => alternative.every((part) =>
+  part.bound ? (part.bound === "min" ? width >= part.px : width <= part.px) : part.toggle ? toggles.has(part.toggle) : part.holds));
+
+/** The cascaded value of `property` in `environment`, or null when no declaration applies. */
+function cascadedValue(declarations, property, environment) {
+  let winner = null;
+  for (const declaration of declarations) {
+    if (declaration.property !== property || !declaration.rule.conditions.every((condition) => conditionHolds(condition, environment))) continue;
+    // Source order breaks ties, so a later declaration of equal rank wins.
+    if (!winner || declaration.important > winner.important
+      || (declaration.important === winner.important && compareSpecificity(declaration.specificity, winner.specificity) >= 0)) winner = declaration;
+  }
+  return winner?.value ?? null;
+}
+
+/** Every viewport width interval and on/off combination the declarations' conditions distinguish. */
+function layoutEnvironments(declarations) {
+  const widths = new Set([320, 960, 3840]), toggles = new Set();
+  for (const part of declarations.flatMap(({ rule }) => rule.conditions.flat(2))) {
+    if (part.bound) for (const width of [part.px - 1, part.px, part.px + 1]) widths.add(width);
+    if (part.toggle) toggles.add(part.toggle);
+  }
+  const keys = [...toggles];
+  assert.ok(keys.length <= 10, "few enough conditional groups to try every combination");
+  return [...widths].flatMap((width) => Array.from({ length: 2 ** keys.length }, (_, mask) =>
+    ({ width, toggles: new Set(keys.filter((key, bit) => mask & (1 << bit))) })));
+}
+
+test("the wide public model panel keeps the metric cards on one row and spans every other child", async () => {
+  const html = await readFile(SITE_HTML, "utf8");
+  assert.doesNotMatch(html, /<style\b/u, "the page carries no inline stylesheet the check would miss");
+  const links = [...html.matchAll(/<link\b[^>]*\brel="stylesheet"[^>]*>/gu)].map(([tag]) =>
+    tag.match(/^<link rel="stylesheet" href="\.\/([\w.-]+\.css)">$/u)?.[1]);
+  assert.ok(links.length > 0 && links.every(Boolean), "every page stylesheet is a plain, unconditional local link");
+  const rules = [];
+  for (const [sheet, name] of links.entries())
+    rules.push(...cssRules(await readFile(new URL(`../public/${name}`, import.meta.url), "utf8"), sheet, name));
+  // Both views mount into this host, under the page's real ancestors.
+  const host = htmlElementCarrying(html, "data-speeds-demo");
+
+  const views = [
+    // The measured community publication that replaces the demonstration.
+    ["community", await renderedPerformancePanel({
+      source: "community", ...PERFORMANCE_SLOT,
+      client: { modelPerformance: async (period, { speedMode } = {}) =>
+        normalizeCommunityModelPerformance(publishedModelPerformance(), { period, speedMode }) },
+    })],
+    // The synthetic demonstration the page mounts first.
+    ["synthetic", await renderedPerformancePanel({
+      client: { modelPerformance: async (period, { speedMode } = {}) => exampleModelSpeeds(period, speedMode) },
+    })],
+  ];
+  for (const [view, panel] of views) {
+    const rendered = [];
+    for (let node = panel; node.testParent; node = node.testParent) rendered.unshift(node);
+    const mount = rendered[0].testParent;
+    let panelNode = { ...host, attrs: new Map([...host.attrs, ...renderedElement(mount, null).attrs]) };
+    for (const node of rendered) panelNode = renderedElement(node, panelNode);
+
+    const panelDeclarations = matchingDeclarations(rules, panelNode,
+      ["display", "grid-template-columns", "grid-template", "grid"], `the ${view} panel`);
+    const children = panel.children.map((child) => ({ child, declarations: matchingDeclarations(rules,
+      renderedElement(child, panelNode), ["grid-column", "grid-column-start", "grid-column-end", "grid-area"],
+      `${view} "${child.className}"`) }));
+    for (const { property, rule } of [...panelDeclarations, ...children.flatMap(({ declarations }) => declarations)])
+      assert.ok(["display", "grid-template-columns", "grid-column"].includes(property),
+        `${rule.name}: the layout check does not model ${property} on the ${view} panel`);
+    assert.equal(cascadedValue(panelDeclarations, "display", { width: 960, toggles: new Set() }), "grid",
+      `${view}: from 960px the panel is one grid`);
+    const cards = panel.children.filter((child) => child.className.split(/\s+/u).includes("performance-card"));
+    assert.ok(panel.children.length > cards.length, `${view}: the panel has children beside its cards`);
+
+    const environments = layoutEnvironments([...panelDeclarations, ...children.flatMap(({ declarations }) => declarations)]);
+    for (const environment of environments) {
+      if (!/^(?:inline-)?grid$/u.test(cascadedValue(panelDeclarations, "display", environment) ?? "")) continue;
+      const at = `${view} at ${environment.width}px${[...environment.toggles].map((toggle) => ` + ${toggle}`).join("")}`;
+      const columns = Number(cascadedValue(panelDeclarations, "grid-template-columns", environment)?.match(/^repeat\((\d+),/u)?.[1]);
+      assert.equal(cards.length, columns, `${at}: the metric cards fill exactly one ${columns}-column row`);
+      for (const { child, declarations } of children) {
+        const column = cascadedValue(declarations, "grid-column", environment) ?? "auto";
+        if (cards.includes(child)) {
+          assert.equal(column, "auto", `${at}: each metric card keeps a single cell`);
+        } else {
+          assert.match(column, /^1\s*\/\s*-1$/u,
+            `${at}: "${child.className}" must span the grid; unplaced, it takes a cell and pushes the cards onto a diagonal`);
+        }
+      }
+    }
+  }
+});
 
 test("the model performance client requests exactly one closed, same-origin slot", async () => {
   const calls = [];

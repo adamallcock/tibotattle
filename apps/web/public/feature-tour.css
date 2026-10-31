@@ -267,6 +267,9 @@
 .community-site .feature-tour .dashboard-page-header h2 { font-size: 26px; margin: 0; }
 .community-site .feature-tour .performance-model-heading h3 { font-size: 21px; margin: 0; }
 .community-site .performance-card { padding: 16px; }
+/* The contributor line is a performance unit, whose generic margin in
+   model-performance.css would otherwise leave it flush on the speed card. */
+.community-site .model-performance .performance-model-sources { margin: 4px 0 12px; }
 .community-site .week-demo .trends-horizon { height: 140px; }
 .community-site .week-demo .trends-clock-content { padding: 18px; min-width: 160px; }
 .community-site .week-demo #trends-clock { font-size: 34px; }
@@ -280,8 +283,14 @@
  .community-site .tour-cache .tour-copy { order: initial; }
  .community-site .tour-speeds .tour-copy { max-width: 780px; margin-bottom: 20px; }
  .community-site .performance-model-panel { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
- .community-site .performance-model-heading, .community-site .performance-details { grid-column: 1 / -1; }
- .community-site .performance-card { margin-bottom: 0; }
+ /* Only the two metric cards share a row. Every other panel child (heading,
+    contributor line, methodology) spans it, so a new line cannot take a cell
+    and push the cards onto a diagonal. */
+ .community-site .performance-model-panel > :not(.performance-card) { grid-column: 1 / -1; }
+ /* The grid gap spaces the rows, so the cards and the contributor line drop
+    their stacked-layout bottom margins. */
+ .community-site .model-performance .performance-card,
+ .community-site .model-performance .performance-model-sources { margin-bottom: 0; }
 }
 @media (max-width: 650px) {
  .community-site .feature-tour { width: calc(100% - 28px); }
