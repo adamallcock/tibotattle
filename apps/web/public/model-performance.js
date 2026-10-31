@@ -1210,6 +1210,9 @@ function mountCommunityModelPerformance(options) {
     }
   }
   const number = (value) => { formatters(); return integerFormat.format(value); };
+  // A count phrase picks its One or Other catalogue form, so a single
+  // contributor or sample never reads as plural.
+  const countText = (key, count) => translate(`community.${key}${count === 1 ? "One" : "Other"}`, { count: number(count) });
   const metricNumber = (value, metric) => { formatters(); return (metric === "latency" ? numberFormat : integerFormat).format(value); };
   const fullDate = (value) => { formatters(); return fullDateFormat.format(value); };
   const visible = () => !root.classList.contains("dashboard-page-inactive") && !documentRef.hidden;
@@ -1246,7 +1249,7 @@ function mountCommunityModelPerformance(options) {
   const pointValues = (point, metric) => PERCENTILE_LABELS
     .filter(([key]) => point[key] !== null).map(([key, label]) => estimateText(label, point[key], metric)).join(" · ");
   const formatPoint = (point, metric) => {
-    const text = translate("point", { date: fullDate(point.at), method: translate(metric), values: pointValues(point, metric), count: number(point.n) });
+    const text = translate("point", { date: fullDate(point.at), method: translate(metric), values: pointValues(point, metric), samples: countText("sampleCount", point.n) });
     return point.unresolved ? `${text} · ${translate("community.pointUnresolved", { count: number(point.unresolved) })}` : text;
   };
   const periodLabel = value => value === "1" ? translate("community.latestDay") : translate(value === "all" ? "all" : `days${value}`);
@@ -1257,7 +1260,7 @@ function mountCommunityModelPerformance(options) {
         : reportTranslate("range", { start: fullDate(display.start), end: fullDate(display.end) });
     formatters();
     const omitted = evidence.omittedModels.turns
-      ? translate("community.omittedValue", { models: number(evidence.omittedModels.models), samples: number(evidence.omittedModels.turns) })
+      ? translate("community.omittedValue", { models: number(evidence.omittedModels.models), samples: countText("sampleCount", evidence.omittedModels.turns) })
       : number(evidence.omittedModels.models);
     container.append(
       evidenceRow("period", reportTranslate("period"), `${periodLabel(display.period)} · ${range}`),
@@ -1521,19 +1524,19 @@ function mountCommunityModelPerformance(options) {
     if (selectedIcon) { selectedIcon.setAttribute("class", `allowance-model-icon performance-model-icon ${selectedPresentation.className}`); identity.append(selectedIcon); }
     identity.append(element("span", "", selected.label));
     subheading.append(identity, element("span", "", translate(display.interval))); panel.append(subheading);
-    const sources = element("p", "performance-unit performance-model-sources", translate("community.modelSources", { contributors: number(selected.contributors), devices: number(selected.devices) }));
+    const sources = element("p", "performance-unit performance-model-sources", translate("community.modelSources", { contributors: countText("contributorCount", selected.contributors), devices: countText("installationCount", selected.devices) }));
     panel.append(sources);
     for (const metric of ["speed", "latency"]) {
       const card = element("article", "performance-card chart-card");
       const cardHeading = element("div", "performance-card-heading chart-card-header"), cardTitle = element("div");
       const summary = metric === "speed"
-        ? translate("community.speedSummary", { measured: number(selected.speedTurns), total: number(selected.turns), estimates: number(selected.toolFreeTurns) })
-        : translate("community.latencySummary", { measured: number(selected.ttftTurns), total: number(selected.turns), responses: number(selected.timedResponses) });
+        ? translate("community.speedSummary", { measured: number(selected.speedTurns), samples: countText("sampleCount", selected.turns), estimates: countText("estimateCount", selected.toolFreeTurns) })
+        : translate("community.latencySummary", { measured: number(selected.ttftTurns), samples: countText("sampleCount", selected.turns), responses: countText("responseCount", selected.timedResponses) });
       const coverage = element("p", "performance-unit", summary);
       coverage.dataset.state = (metric === "speed" ? selected.speedTurns : selected.ttftTurns) < selected.turns ? "partial" : "complete";
       cardTitle.append(element("h4", "chart-card-title", translate(metric)), coverage);
       if (metric === "speed" && selected.unresolved > 0)
-        cardTitle.append(element("p", "performance-method-note performance-unresolved-note", translate("community.unresolved", { count: number(selected.unresolved) })));
+        cardTitle.append(element("p", "performance-method-note performance-unresolved-note", countText("unresolved", selected.unresolved)));
       const legend = element("div", "performance-legend chart-card-legend");
       for (const method of ["outerBand", "innerBand", "medianP50", "community.bounds"]) {
         const entry = element("span", "performance-legend-item");

@@ -1373,7 +1373,7 @@ test('community variant renders bound estimates, the under-five rule, unresolved
     assert.deepEqual(textOf(dom, 'performance-method-note performance-unresolved-note'),
       ['2 reported samples were above 120 tokens/s without an exact speed. They are counted, and the bounds widen to cover them.']);
     assert.deepEqual(textOf(dom, 'performance-unit'), [
-      'tokens/s · Higher is faster · 14 of 15 reported samples · 1 full-turn estimates',
+      'tokens/s · Higher is faster · 14 of 15 reported samples · 1 full-turn estimate',
       'seconds · Lower is faster · 13 of 15 reported samples · 20 timed responses',
     ]);
     assert.deepEqual(textOf(dom, 'performance-unit performance-model-sources'), ['3 contributors · 4 installations']);
@@ -1394,6 +1394,49 @@ test('community variant renders bound estimates, the under-five rule, unresolved
     assert.deepEqual(about.children.slice(1).map(node => node.textContent), [en('performance.community.methodology'), en('performance.community.variance')]);
     assert.equal(dom.root.all().some(node => node.textContent === en('performance.provider')), false);
   } finally { controller.destroy(); }
+});
+
+test('community counts of one read in the singular in every count phrase', async () => {
+  const single = communityLatestDay();
+  Object.assign(single.models[0], { turns: 1, speedTurns: 1, ttftTurns: 1, timedResponses: 1, toolFreeTurns: 1 });
+  single.models[0].speed.points[0] = { ...single.models[0].speed.points[0], n: 1, unresolved: 1 };
+  single.models[0].ttft.points = [{ day: '2026-10-10', n: 1, unresolved: 0,
+    p10: null, p25: null, median: { estimate: 1500, lower: 1300, upper: 1900 }, p75: null, p90: null }];
+  single.omittedModels = { models: 1, turns: 1 };
+  for (const [locale, expected] of [
+    ['en-US', {
+      sources: '1 contributor · 1 installation',
+      summaries: ['tokens/s · Higher is faster · 1 of 1 reported sample · 1 full-turn estimate',
+        'seconds · Lower is faster · 1 of 1 reported sample · 1 timed response'],
+      unresolved: '1 reported sample was above 120 tokens/s without an exact speed. It is counted, and the bounds widen to cover it.',
+      point: 'Oct 10, 2026 · Output speed · P50 64 (60-71) tokens/s · 1 reported sample · 1 above 120 tokens/s without an exact speed',
+      omitted: '1 · 1 reported sample',
+    }],
+    ['es', {
+      sources: '1 contribuyente · 1 instalación',
+      summaries: ['tokens/s · Más alto es más rápido · 1 de 1 muestra comunicada · 1 estimación de turno completo',
+        'segundos · Más bajo es más rápido · 1 de 1 muestra comunicada · 1 respuesta con tiempo medido'],
+      unresolved: '1 muestra comunicada superó los 120 tokens/s sin una velocidad exacta. Se cuenta y los límites se amplían para cubrirla.',
+      omitted: '1 · 1 muestra comunicada',
+    }],
+  ]) {
+    const dom = focusHarness();
+    const { client } = communityClient(() => structuredClone(single));
+    const controller = mountModelPerformance({ ...dom, source: 'community', period: '1', client,
+      t: (key, values) => translate(key, values, locale), locale: () => locale });
+    try {
+      dom.show(); await controller.refresh();
+      assert.equal(communityStatus(dom).dataset.state, 'ready', locale);
+      assert.deepEqual(textOf(dom, 'performance-unit performance-model-sources'), [expected.sources], locale);
+      assert.deepEqual(textOf(dom, 'performance-unit'), expected.summaries, locale);
+      assert.deepEqual(textOf(dom, 'performance-method-note performance-unresolved-note'), [expected.unresolved], locale);
+      assert.equal(evidenceOf(dom).omitted, expected.omitted, locale);
+      if (expected.point) {
+        const speed = dom.root.all().find(node => node.tagName === 'svg' && node.listeners.pointermove);
+        assert.deepEqual(speed.all().filter(node => node.className === 'performance-point').map(node => node.attributes['aria-label']), [expected.point]);
+      }
+    } finally { controller.destroy(); }
+  }
 });
 
 test('community period controls offer Latest UTC day, 7d, 30d and All time and request only the selected slot', async () => {
