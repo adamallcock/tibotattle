@@ -23,7 +23,7 @@ const DAY = "2026-09-20", NEXT_DAY = "2026-09-21";
 const NOW = "2026-10-09T12:00:00.000Z", RELEASED = "2026-09-22T03:00:00.000Z";
 const hash = (value) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const owner = (n) => n.toString(16).padStart(64, "0");
-let vite, pool, store, runStore, domain, reprice, readReprice, prices, kernels, route, canonical, target, old;
+let vite, pool, store, derivedStore, runStore, domain, reprice, readReprice, prices, kernels, route, canonical, target, old;
 
 before(async () => {
   vite = await createServer({ root: ROOT, configFile: false, plugins: config.plugins,
@@ -34,6 +34,7 @@ before(async () => {
     } });
   const load = (path) => vite.ssrLoadModule(path);
   store = await load("/src/analytics-v2/store.ts");
+  derivedStore = await load("/src/analytics-v2/store-derived.ts");
   runStore = await load("/src/analytics-v2/store-run.ts");
   domain = await load("/src/analytics-v2/reprice.ts");
   reprice = await load("/src/analytics-v2/reprice-store.ts");
@@ -215,6 +216,149 @@ async function seedDay(schema, { day = DAY, owners = [1], quotaOnly = false, cha
   return members;
 }
 async function expectCode(promise, code) { await assert.rejects(promise, (error) => error?.code === code); }
+
+/** Exercise the real refresh replacement stage in its caller-owned transaction. */
+async function replaceDerived(schema, { computedOwners = [owner(1)], fromDay = DAY, afterReplace } = {}) {
+  return transaction(async (client) => {
+    await derivedStore.writeAnalyticsV2DerivedFamilies(client, `"${schema}"`,
+      { ownerDays: [], cacheBands: [], ownerFits: [], ownerModelDates: [] }, computedOwners,
+      { ownerDayFromDay: fromDay, cacheBandsFromDay: fromDay }, randomUUID(), old);
+    await afterReplace?.(client);
+  });
+}
+async function expectedArchive(schema, day = DAY, ownerDigest = owner(1)) {
+  return (await pool.query(`SELECT c.day::text,c.owner_digest,c.version,c.values_sha256::text,
+    p.projection_version,p.codec,p.inputs,p.inputs_sha256::text,p.inputs_sha256::text AS source_inputs_sha256,
+    p.input_events,c.run_id::text,c.price_kernel_id::integer AS kernel_id
+    FROM ${q(schema, "analytics_v2_daily_contributions")} c
+    JOIN ${q(schema, "analytics_v2_owner_day_price")} p USING(day,owner_digest)
+    WHERE c.day=$1 AND c.owner_digest=$2 ORDER BY c.version`, [day, ownerDigest])).rows;
+}
+async function archives(schema) {
+  return (await pool.query(`SELECT day::text,owner_digest,version,values_sha256::text,
+    projection_version,codec,inputs,inputs_sha256::text,source_inputs_sha256::text,input_events,run_id::text,kernel_id::integer
+    FROM ${q(schema, "analytics_v2_contribution_price_inputs")} ORDER BY day,owner_digest,version`)).rows;
+}
+
+test("PG: refresh replacement preserves exact historical inputs before the mutable price cascade", { skip: SKIP }, async () => {
+  await withSchema(async (schema) => {
+    await infrastructure(schema);
+    await seedDay(schema, { changedCost: true });
+    const expected = await expectedArchive(schema), originalHead = await headRow(schema);
+    const contributions = await snapshot(schema, ["analytics_v2_daily_contributions", "analytics_v2_daily_owner_sets"]);
+    await replaceDerived(schema);
+    assert.deepEqual(await archives(schema), expected, "the original bytea, digest, version, run and kernel survive unchanged");
+    assert.equal((await pool.query(`SELECT count(*)::int AS n FROM ${q(schema, "analytics_v2_owner_day_price")}`)).rows[0].n, 0);
+    assert.deepEqual(await headRow(schema), originalHead);
+    assert.deepEqual(await snapshot(schema, Object.keys(contributions)), contributions);
+    const receipt = await execute(schema, await plan(schema));
+    assert.deepEqual(receipt.counts, { planned: 1, changed: 1, equivalent: 0, unchanged: 0, refused: 0, contributionVersions: 1 });
+    assert.equal(domain.analyticsV2RepriceNonSpend((await headRow(schema)).payload),
+      domain.analyticsV2RepriceNonSpend(originalHead.payload));
+  });
+});
+
+test("PG: refresh archives only matching versions inside the computed-owner replacement horizon", { skip: SKIP }, async () => {
+  await withSchema(async (schema) => {
+    await infrastructure(schema);
+    await seedDay(schema, { owners: [1, 2] });
+    await seedDay(schema, { day: NEXT_DAY, owners: [1, 2] });
+    // A later version does not borrow an earlier version's genuine input association.
+    await pool.query(`INSERT INTO ${q(schema, "analytics_v2_daily_contributions")}
+      (day,owner_digest,version,daily_values,values_schema,values_sha256,stable_values_sha256,
+       devices,price_kernel_id,first_revision,run_id,kernel_id,manifest_version)
+      SELECT day,owner_digest,2,daily_values,values_schema,values_sha256,stable_values_sha256,
+        devices,price_kernel_id,5,$3::uuid,kernel_id,manifest_version
+      FROM ${q(schema, "analytics_v2_daily_contributions")} WHERE day=$1 AND owner_digest=$2`,
+    [NEXT_DAY, owner(1), randomUUID()]);
+    const expected = (await expectedArchive(schema, NEXT_DAY)).filter((row) => row.version === 1);
+    const retained = (await pool.query(`SELECT owner_digest,day::text,run_id::text,inputs_sha256::text
+      FROM ${q(schema, "analytics_v2_owner_day_price")} WHERE owner_digest<>$1 OR day<$2 ORDER BY day,owner_digest`,
+    [owner(1), NEXT_DAY])).rows;
+    await replaceDerived(schema, { fromDay: NEXT_DAY });
+    assert.deepEqual(await archives(schema), expected);
+    assert.deepEqual((await pool.query(`SELECT owner_digest,day::text,run_id::text,inputs_sha256::text
+      FROM ${q(schema, "analytics_v2_owner_day_price")} ORDER BY day,owner_digest`)).rows, retained);
+    await replaceDerived(schema, { computedOwners: [], fromDay: DAY });
+    assert.deepEqual(await archives(schema), expected, "an empty computed set archives nothing else");
+  });
+});
+
+for (const mismatch of ["run", "kernel", "values"]) test(`PG: refresh does not retro-associate ${mismatch}-mismatched saved inputs`,
+  { skip: SKIP }, async () => {
+    await withSchema(async (schema) => {
+      await infrastructure(schema);
+      await seedDay(schema, { wrongAssociation: mismatch === "run" });
+      if (mismatch !== "run") await transaction(async (client) => {
+        const prior = (await client.query(`SELECT * FROM ${q(schema, "analytics_v2_owner_day_price")}`)).rows[0];
+        const daily = (await client.query(`SELECT daily FROM ${q(schema, "analytics_v2_owner_day")}`)).rows[0].daily;
+        await client.query(`DELETE FROM ${q(schema, "analytics_v2_owner_day")}`);
+        const replacement = { ...prior };
+        if (mismatch === "kernel") {
+          await runStore.registerAnalyticsV2RunKernel(client, `"${schema}"`, target, NOW);
+          await insert(client, schema, "analytics_v2_kernel_prices", { kernel_id: target.kernel.kernelId,
+            compute_sha256: null, cards_sha256: hash("synthetic-new-cards"), cards: 1,
+            projection_version: prices.ANALYTICS_V2_PRICE_PROJECTION_VERSION, registered_at: NOW });
+          replacement.kernel_id = target.kernel.kernelId;
+        } else daily.counts.quota++;
+        await insert(client, schema, "analytics_v2_owner_day", { owner_digest: owner(1), day: DAY,
+          daily: JSON.stringify(daily), refusal: null, run_id: prior.run_id, kernel_id: replacement.kernel_id, manifest_version: 1 });
+        await insert(client, schema, "analytics_v2_owner_day_price", replacement);
+      });
+      const saved = await snapshot(schema, ["analytics_v2_daily_contributions", "analytics_v2_published_daily"]);
+      await replaceDerived(schema);
+      assert.deepEqual(await archives(schema), []);
+      assert.deepEqual(await snapshot(schema, Object.keys(saved)), saved);
+    });
+  });
+
+test("PG: refresh preserves an identical archive and refuses a conflicting archive atomically", { skip: SKIP }, async () => {
+  for (const conflict of [false, true]) await withSchema(async (schema) => {
+    await infrastructure(schema);
+    await seedDay(schema);
+    const expected = (await expectedArchive(schema))[0];
+    await transaction((client) => insert(client, schema, "analytics_v2_contribution_price_inputs",
+      { ...expected, ...(conflict ? { source_inputs_sha256: hash("different-source") } : {}) }));
+    const before = await snapshot(schema);
+    if (conflict) {
+      await assert.rejects(replaceDerived(schema), { code: "ANALYTICS_V2_STATE_INVALID", field: "contributionPriceInputs" });
+      assert.deepEqual(await snapshot(schema), before);
+    } else {
+      await replaceDerived(schema);
+      assert.deepEqual(await archives(schema), [expected]);
+    }
+  });
+});
+
+test("PG: refresh refuses an unsupported archive projection without losing mutable inputs", { skip: SKIP }, async () => {
+  await withSchema(async (schema) => {
+    await infrastructure(schema);
+    await seedDay(schema);
+    await transaction(async (client) => {
+      const prior = (await client.query(`SELECT * FROM ${q(schema, "analytics_v2_owner_day_price")}`)).rows[0];
+      await client.query(`DELETE FROM ${q(schema, "analytics_v2_owner_day_price")}`);
+      await insert(client, schema, "analytics_v2_owner_day_price",
+        { ...prior, projection_version: "analytics-v2-price-input-v2" });
+    });
+    const before = await snapshot(schema);
+    await assert.rejects(replaceDerived(schema), { code: "23514", table: "analytics_v2_contribution_price_inputs" });
+    assert.deepEqual(await snapshot(schema), before, "0077 remains closed and the unsupported source row survives rollback");
+  });
+});
+
+test("PG: a later refresh-stage failure rolls back the pre-cascade archive and deletion", { skip: SKIP }, async () => {
+  await withSchema(async (schema) => {
+    await infrastructure(schema);
+    await seedDay(schema);
+    const before = await snapshot(schema);
+    const failure = new Error("synthetic-later-refresh-stage-failure");
+    await assert.rejects(replaceDerived(schema, { afterReplace: async (client) => {
+      assert.equal((await client.query(`SELECT count(*)::int AS n FROM ${q(schema, "analytics_v2_contribution_price_inputs")}`)).rows[0].n, 1);
+      throw failure;
+    } }), (error) => error === failure);
+    assert.deepEqual(await snapshot(schema), before);
+  });
+});
 
 test("PG: pre-migration planning/execution refuse; post-migration planning is stable and read-only", { skip: SKIP }, async () => {
   await withSchema(async (schema) => {
