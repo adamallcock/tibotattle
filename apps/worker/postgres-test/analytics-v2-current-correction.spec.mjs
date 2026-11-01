@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { copyFile, mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,6 +15,9 @@ import config from "../vitest.analytics-v2.config.mjs";
 import { readPostgresMigrations } from "../cloud-run/postgres-migrations.mjs";
 import { grantAndVerifyRuntimePrivileges } from "../cloud-run/postgres-runtime-grants.mjs";
 import { validateAnalyticsCurrentCorrectionResult } from "../cloud-run/analytics-reprice.mjs";
+import { analyticsRefreshRunStamp } from "../cloud-run/analytics-refresh.mjs";
+import { computeAnalyticsKernelIdentity } from "../cloud-run/analytics-kernel-closure.mjs";
+import { cloudRunBuildPlugins } from "../cloud-run/node-host-build.mjs";
 import { applyStockAndStagedMigrations, postgresTestEndpoint,
   NO_ANALYTICS_V2_EXCLUSIONS_SHA256 } from "./staged-migrations-harness.mjs";
 import { dayMs, syntheticOwner, usage } from "../analytics-v2-test/fixtures/synthetic-occurrences.mjs";
@@ -535,9 +539,27 @@ test("PG correction: the real bundled CLI plans, executes and replays the same U
   assert.equal(runtime.stderr,"");
   assert.equal(runtime.stdout.trim(),process.env.EDGE_E2E_NODE ? "v22.16.0" : process.version);
   t.diagnostic(`bundled CLI runtime ${runtime.stdout.trim()} (${process.env.EDGE_E2E_NODE ? "EDGE_E2E_NODE image runtime" : "process.execPath local fallback"})`);
+  // The carrier binds the compute class as well as the registered kernel.
+  // Derive it independently with the canonical write:false identity builder;
+  // a source-only baseline stamp intentionally has no compute-class digest.
+  const cloudRunRoot = join(ROOT,"cloud-run");
+  const { build } = createRequire(join(cloudRunRoot,"package.json"))("esbuild");
+  const identity = await computeAnalyticsKernelIdentity({ build,cwd: cloudRunRoot,
+    vendorRoot: join(ROOT,"vendor/analytics-d43c8f92"),options: {
+      bundle: true,platform: "node",format: "esm",target: "node22",outExtension: { ".js": ".mjs" },
+      sourcemap: false,external: ["@google-cloud/cloud-sql-connector","google-auth-library","jsonc-parser","pg"],
+      logLevel: "silent",metafile: true,plugins: cloudRunBuildPlugins(ROOT),
+    } });
+  const runIdentity = { ...identity,methodVersion: store.ANALYTICS_V2_METHOD_VERSION };
+  assert.deepEqual(store.resolveAnalyticsV2Kernel(runIdentity),BUNDLED);
+  assert.match(identity.computeSha256,/^[0-9a-f]{64}$/u);
+  const cliStamp = analyticsRefreshRunStamp(store,runIdentity);
+  assert.equal(cliStamp.computeSha256,identity.computeSha256);
   await withSchema(async schema => {
     await sourceInfrastructure(schema); await seedCurrentDay(schema);
-    const original = await headRow(schema), reviewedPlan = await plan(schema), beforePlan = await snapshot(schema);
+    const original = await headRow(schema);
+    const reviewedPlan = await reprice.planAnalyticsV2CurrentCorrection(pool,{ ...options(schema),stamp: cliStamp });
+    const beforePlan = await snapshot(schema);
     const b = bounds(), inputSource = "current-owner-day", sourceKernelId = 23;
     const args = [`--schema=${schema}`,`--from-day=${b.fromDay}`,`--through-day=${b.throughDay}`,
       `--max-days=${b.maxDays}`,`--max-members=${b.maxMembers}`,`--max-input-bytes=${b.maxInputBytes}`,
@@ -551,8 +573,8 @@ test("PG correction: the real bundled CLI plans, executes and replays the same U
       assert.deepEqual(receipt,{ schemaVersion: "analytics-reprice-receipt-v2",inputSource,sourceKernelId,
         status: "ok",mode,target: null,now: NOW,clock: "test",
         kernel: { kernelId: target.kernel.kernelId,manifestVersion: target.manifestVersion },result: receipt.result });
-      assert.deepEqual(validateAnalyticsCurrentCorrectionResult(receipt.result,{ mode,bounds: b,stamp: target,
-        pricingMethodVersion: store.analyticsV2BundledPricer().pricingMethodVersion,
+      assert.deepEqual(validateAnalyticsCurrentCorrectionResult(receipt.result,{ mode,bounds: b,stamp: cliStamp,
+        pricingMethodVersion: reviewedPlan.target.pricingMethodVersion,
         expectedPlanSha256: reviewedPlan.planSha256,inputSource,sourceKernelId }),receipt.result);
       return receipt;
     };
