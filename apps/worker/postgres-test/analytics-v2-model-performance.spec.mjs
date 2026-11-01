@@ -7,7 +7,7 @@
  * the fold (src/analytics-v2/compute-performance.ts) after computeAnalyticsV2
  * returns, and publishes through the store (store-publication.ts).
  *
- * It proves, on the promoted primary chain (0001-0079) with the shared SPD-G1
+ * It proves, on the promoted primary chain (0001-0080) with the shared SPD-G1
  * fixtures (postgres-test/fixtures/performance-telemetry.mjs):
  * - an empty corpus, or one with no included record (excluded, unknown-mode
  *   or after the publication's end), writes no head (deferred empty first
@@ -222,7 +222,8 @@ async function promotedSchema() {
   schemas.push(schema);
   await pool.query(`CREATE SCHEMA "${schema}"`);
   const applied = await applyPostgresMigrations({ role: "primary", schema, pool });
-  assert.equal(applied.migrations.at(-1)?.name, PERFORMANCE_MIGRATION_NAME, "the promoted chain ends at 0079");
+  assert.equal(applied.migrations.at(-2)?.name, PERFORMANCE_MIGRATION_NAME, "0079 remains in the promoted prefix");
+  assert.equal(applied.migrations.at(-1)?.name, "0080_analytics_v2_current_correction.sql", "the promoted chain ends at 0080");
   await activatePerformanceRuntime(pool, { schema, nowEpoch: SEEDED_AT_MS });
   return schema;
 }

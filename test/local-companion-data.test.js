@@ -360,7 +360,7 @@ test("local companion builds a closed real-data projection without identifiers o
     assert.equal(fastMode.logObservability.sessionBaselineRecorded, false);
     assert.equal(fastMode.metricLabel, "Speed-priced API-price equivalent");
     assert.deepEqual(fastMode.multipliers, { ...FAST_MODE_QUOTA_MULTIPLIERS });
-    assert.equal(fastMode.multiplierSource.recordedAt, "2026-09-29");
+    assert.equal(fastMode.multiplierSource.recordedAt, "2026-10-26");
     assert.deepEqual(fastMode.coverage, {
       totalEvents: 2,
       observedEvents: 1,

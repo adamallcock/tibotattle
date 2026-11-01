@@ -130,6 +130,12 @@ const REGISTRY_PINS = Object.freeze([
   // Kernel 23: exact daily-state key matching and the primitive-zero decimal
   // shortcut preserve historical acceptance, arithmetic and refusal behavior.
   "340b9dab35a63d6c7baaf25b3f5ecde8d5ef683bedf3db2c30c423146a3b6273",
+  // Kernel 24: preserve genuine saved-version pricing inputs before ordinary
+  // refresh replacement. Vendor, price catalog and calculation are unchanged.
+  "eaef4fff91fbe3a790e7ac336a0b3bdb413510d39497701005542dd2c3b0efbf",
+  // Kernel 25: bounded current-owner-day correction with new-version provenance;
+  // prior registry entries, vendor and price catalog remain unchanged.
+  "01e8207c8f36afc40b20fe1368531afb99a04adceb029debff53a70d469e8e85",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];

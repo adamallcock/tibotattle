@@ -208,6 +208,24 @@
       "priceRegistrySha256": "206544769b43e4b9645284258edd38f7c07a226022db10f5ec0181335df236ab",
       "priceRegistryVersion": "app-official-api-prices-v0.10",
       "methodVersion": "analytics-v2-method-v2"
+    },
+    {
+      "kernelId": 24,
+      "productionCommit": "76179fd4f21816693e958e436d3c84fd8555da60",
+      "vendorManifestSha256": "96fcec084a7ce7b62db1bfbb67fbfa1ddeb9c2f1bf8321926ff1e51814604022",
+      "computeClosureSha256": "d6bc48d869e2922587001d10eee6b94b418e2ac95479de5638e5172156763404",
+      "priceRegistrySha256": "206544769b43e4b9645284258edd38f7c07a226022db10f5ec0181335df236ab",
+      "priceRegistryVersion": "app-official-api-prices-v0.10",
+      "methodVersion": "analytics-v2-method-v2"
+    },
+    {
+      "kernelId": 25,
+      "productionCommit": "76179fd4f21816693e958e436d3c84fd8555da60",
+      "vendorManifestSha256": "96fcec084a7ce7b62db1bfbb67fbfa1ddeb9c2f1bf8321926ff1e51814604022",
+      "computeClosureSha256": "a1f111c1f845220779fd4dfef35d9638cb9db43ec7308f493d7b88c2f0a96760",
+      "priceRegistrySha256": "206544769b43e4b9645284258edd38f7c07a226022db10f5ec0181335df236ab",
+      "priceRegistryVersion": "app-official-api-prices-v0.10",
+      "methodVersion": "analytics-v2-method-v2"
     }
   ]
 }

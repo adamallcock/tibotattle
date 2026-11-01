@@ -163,7 +163,7 @@ export const ANALYTICS_V2_COLUMNS = Object.freeze({
   ] as const),
   contributionPriceInputs: Object.freeze([
     "day", "owner_digest", "version", "values_sha256", "projection_version", "codec", "inputs",
-    "inputs_sha256", "source_inputs_sha256", "input_events", "run_id", "kernel_id",
+    "inputs_sha256", "source_inputs_sha256", "input_events", "run_id", "kernel_id", "correction_provenance",
   ] as const),
   ownerSetBootstrap: Object.freeze([
     "day", "provenance", "set_size", "frozen_participants", "frozen_export_sha256", "frozen_from_day",

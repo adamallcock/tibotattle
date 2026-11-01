@@ -1333,7 +1333,7 @@ test("the same lineage-aware scan produces a bounded weekly calibration summary"
   assert.equal(fastCapacity.basis.unresolvedScenario, "unresolved_as_fast");
   assert.equal(
     standardCapacity.basis.multiplierRegistryRecordedAt,
-    "2026-09-29",
+    "2026-10-26",
   );
   assert.equal(
     standardCapacity.calibration.validation.selectedCostBasis,
