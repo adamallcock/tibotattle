@@ -69,7 +69,7 @@ function capability(now = Date.parse("2026-09-21T12:00:00.000Z")) {
     supportedSpeedMethods: ["receipt", "tool_free"],
     requiredConsent: {
       schemaVersion: "model-performance-daily-v1",
-      fieldDictionaryVersion: "telemetry-performance-registry-2026-09-21.1",
+      fieldDictionaryVersion: "telemetry-performance-registry-2026-09-29.1",
       privacyContractVersion: "privacy-safe-model-performance-v1",
       scope: "model-performance-daily",
     },
@@ -83,6 +83,30 @@ function capability(now = Date.parse("2026-09-21T12:00:00.000Z")) {
     },
   };
 }
+
+test("refuses a stale performance dictionary before preparation or upload", async () => {
+  const stale = capability();
+  stale.requiredConsent.fieldDictionaryVersion = "telemetry-performance-registry-2026-09-21.1";
+  const calls = [];
+  const saved = [];
+  const result = await runTelemetryPerformanceSync({
+    day: DAY,
+    nowEpoch: Date.parse("2026-09-21T12:00:00.000Z"),
+    readCapabilities: async () => stale,
+    prepareDay: async () => { calls.push("prepare"); return await report(); },
+    createEnvelope: async ({ report }) => { calls.push("envelope"); return { report }; },
+    send: async () => { calls.push("send"); return { status: 202 }; },
+    saveState: async (state) => saved.push(state),
+  });
+  assert.deepEqual(calls, []);
+  assert.equal(result.status, "paused");
+  assert.equal(result.state.lastOutcome.code, "response_invalid");
+  assert.equal(result.state.pausedReason, "response_invalid");
+  assert.equal(result.state.nextAttemptAt, null);
+  assert.equal(result.state.retryCount, 0);
+  assert.equal(result.state.cursorDay, null);
+  assert.deepEqual(saved, [result.state]);
+});
 
 test("refuses an old or mismatched speed-method capability before preparation", async () => {
   const stale = capability();

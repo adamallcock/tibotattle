@@ -62,8 +62,8 @@ test("every shipped Priority card and reviewed alias equals the event-weighted S
       checked += 1;
     }
   }
-  assert.equal(checked, 34);
-  assert.equal(FAST_MODE_MODEL_FAMILY_KEYS.length, 20);
+  assert.equal(checked, 36);
+  assert.equal(FAST_MODE_MODEL_FAMILY_KEYS.length, 21);
   assert.equal(Math.max(...Object.values(FAST_MODE_QUOTA_MULTIPLIERS)), 2.5);
 });
 
