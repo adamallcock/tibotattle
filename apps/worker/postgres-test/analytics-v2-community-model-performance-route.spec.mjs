@@ -22,7 +22,7 @@
  *   and its edge-replay outcomes (allowed, limited, unavailable) as 200, 429
  *   and 503 through the real replay bindings and the Worker helper.
  *
- * Each schema applies the promoted primary chain (0001-0079) into a fresh
+ * Each schema applies the promoted primary chain (0001-0080) into a fresh
  * random schema, dropped afterwards. Every payload, digest and identifier is
  * synthetic and content-free (the SPD-G1 fixtures in
  * postgres-test/fixtures/performance-telemetry.mjs).
@@ -138,7 +138,8 @@ async function promotedSchema(label) {
   schemas.push(schema);
   await pool.query(`CREATE SCHEMA "${schema}"`);
   const applied = await applyPostgresMigrations({ role: "primary", schema, pool });
-  assert.equal(applied.migrations.at(-1)?.name, PERFORMANCE_MIGRATION_NAME, "the promoted chain ends at 0079");
+  assert.equal(applied.migrations.at(-2)?.name, PERFORMANCE_MIGRATION_NAME, "0079 remains in the promoted prefix");
+  assert.equal(applied.migrations.at(-1)?.name, "0080_analytics_v2_current_correction.sql", "the promoted chain ends at 0080");
   // The chain seeds publication disabled; the cases read with it enabled.
   await setControls(schema, { publication: true });
   return schema;

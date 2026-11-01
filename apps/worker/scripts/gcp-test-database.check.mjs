@@ -7,7 +7,9 @@
 // client records every statement; no database, connector or credential is used.
 
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { cp, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -25,6 +27,62 @@ import {
 } from "./gcp-test-database.mjs";
 
 const SCRIPTS_ROOT = dirname(fileURLToPath(import.meta.url));
+
+test("the active GCP qualification context includes exactly the current primary chain and refuses stale or future tails", async () => {
+  const root = await mkdtemp(join(tmpdir(), "gcp-test-context-check-"));
+  const builder = join(SCRIPTS_ROOT, "gcp-test-build-context.mjs");
+  const sourceMigrations = join(SCRIPTS_ROOT, "../postgres/migrations/primary");
+  const invoke = (script, args) => spawnSync(process.execPath, [script, ...args], {
+    encoding: "utf8", timeout: 15_000,
+  });
+  try {
+    const output = join(root, "context");
+    const built = invoke(builder, [`--output=${output}`]);
+    assert.equal(built.status, 0, built.stderr);
+    const receipt = JSON.parse(built.stdout);
+    assert.equal(receipt.status, "ok");
+    assert.equal(receipt.primaryMigrations, 80);
+    const migrationRoot = join(output, "apps/worker/postgres/migrations");
+    assert.deepEqual(await readdir(migrationRoot), ["primary"]);
+    const names = (await readdir(sourceMigrations)).sort();
+    assert.equal(names.length, 80);
+    assert.equal(names.at(-1), "0080_analytics_v2_current_correction.sql");
+    assert.deepEqual((await readdir(join(migrationRoot, "primary"))).sort(), names);
+    for (const name of names) {
+      assert.deepEqual(await readFile(join(migrationRoot, "primary", name)),
+        await readFile(join(sourceMigrations, name)), `${name} is copied without modification`);
+    }
+    const copiedBuilder = join(output, "apps/worker/scripts/gcp-test-build-context.mjs");
+    await cp(builder, copiedBuilder);
+    const checked = invoke(copiedBuilder, ["--check"]);
+    assert.equal(checked.status, 0, checked.stderr);
+    assert.equal(JSON.parse(checked.stdout).sourceContentDigest, receipt.sourceContentDigest);
+    const overwrite = invoke(builder, [`--output=${output}`]);
+    assert.equal(overwrite.status, 1);
+    assert.equal(JSON.parse(overwrite.stderr).code, "GCP_TEST_CONTEXT_OUTPUT_EXISTS");
+
+    for (const variant of ["prefix73", "prefix79", "wrong-tail", "future81"]) {
+      const fixture = join(root, variant);
+      await cp(output, fixture, { recursive: true });
+      const primary = join(fixture, "apps/worker/postgres/migrations/primary");
+      if (variant.startsWith("prefix")) {
+        for (const name of names.slice(Number(variant.slice("prefix".length)))) {
+          await rm(join(primary, name));
+        }
+      } else if (variant === "wrong-tail") {
+        await rename(join(primary, names.at(-1)), join(primary, "0080_unexpected.sql"));
+      } else {
+        await writeFile(join(primary, "0081_unexpected.sql"), "SELECT 1;\n");
+      }
+      const refused = invoke(join(fixture, "apps/worker/scripts/gcp-test-build-context.mjs"), ["--check"]);
+      assert.equal(refused.status, 1, variant);
+      assert.equal(JSON.parse(refused.stderr).code, "GCP_TEST_CONTEXT_MIGRATION_SET_UNEXPECTED", variant);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 const RUNTIME = "w2-opsdb-runtime@w2-opsdb-synthetic.iam";
 const PRIMARY = Object.freeze({ role: "primary", schema: "w2_opsdb_qualification_primary" });
 // The retired ledger role, as a stale caller would still pass it.

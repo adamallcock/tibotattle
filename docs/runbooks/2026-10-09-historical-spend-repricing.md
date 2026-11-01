@@ -13,8 +13,9 @@ OPS-REPRICE). The lane was deployed at server commit
 `cc344e1ab057640c51dadbe473936ce722bd06e5`. Its completed historical executions
 included input-association refusals; deployment and transaction completion do
 not establish recovered historical spend coverage. The input preservation
-change described below is a subsequent source change with its own deployment
-gate. This runbook grants no permission to migrate, deploy, apply infrastructure
+and current-source correction changes described below are subsequent source
+changes with separate migration, deployment and publication gates. This runbook
+grants no permission to migrate, deploy, apply infrastructure
 or execute a production Job. Each is an owner-only protected step.
 The operator retains the exact source commit, image digest, registered kernel,
 manifest version, target configuration, plan receipt and operation identity
@@ -146,6 +147,10 @@ membership, usage coverage or other aggregate evidence under a pricing change.
 
 ## Publication, equivalence and replay
 
+This section describes the default saved-snapshot mode. The explicit
+[current-source correction](#current-source-correction) uses new versions and
+does not create equivalence proofs.
+
 | Outcome | Durable behavior |
 |---|---|
 | `unchanged` | No new daily revision; also includes already validated target equivalences |
@@ -210,12 +215,13 @@ that changes the analytics kernel) and the production carrier below.
 
 ## Production carrier
 
-Status: `built`, offline only. The Job and the verb are tested with synthetic
-data and a stubbed `gcloud`. No infrastructure apply, Job execution or log read
-has happened in any project. On 2026-10-19 the owner chose to skip staging for
-the community speed rollout, so the first live run is the owner-authorized
-production run. It uses a read-only `plan` first, then `execute` of that plan's
-digest only ([decision](../decisions/2026-10-10-community-model-speed.md#re-based-deploy-candidate-amendment-2026-10-19)).
+The default saved-snapshot carrier was deployed and executed at the source
+commit named above. Completed executions included association refusals; those
+receipts do not prove restored coverage. The current-source mode below remains
+a subsequent source change until its own migration, roll and execution have
+been verified. Both modes use a read-only `plan` first, then `execute` of that
+plan's digest only. The prior staging exception was specific to the community
+speed rollout ([decision](../decisions/2026-10-10-community-model-speed.md#re-based-deploy-candidate-amendment-2026-10-19)).
 
 **The Job.** `jobs.analytics-reprice` in both committed desired states
 (`tibotattle-analytics-reprice` in production, `tibotattle-staging-analytics-reprice`
@@ -267,14 +273,16 @@ With `--execute`, the verb holds the environment's deployment coordination lock
 3. It runs `gcloud run jobs execute --async --args=<entry and the CLI's
    explicit arguments>` once, then polls the execution until it completes,
    for at most the task timeout plus five minutes.
-4. It reads exactly one `analytics-reprice-receipt-v1` line for that execution
+4. It reads exactly one `analytics-reprice-receipt-v1` line (`v2` for explicit
+   current-source correction) for that execution
    from Cloud Logging. While no line has been ingested, it retries a bounded
    number of times.
 5. It validates the receipt with the CLI's own `validateAnalyticsRepriceResult`.
    The receipt must name the requested mode, this environment, the wall clock,
    the expected kernel and that kernel's registered price-registry digest.
    Execute must also carry the reviewed plan hash.
-6. It writes a digest-sealed `tibotattle-gcp-analytics-reprice-v1` receipt,
+6. It writes a digest-sealed `tibotattle-gcp-analytics-reprice-v1` receipt
+   (`v2` for explicit current-source correction),
    owner-only, to `--receipt-out`.
 
 The verb prints only counts, cap flags, the refusal histogram, `replayed`,
@@ -323,12 +331,13 @@ failure receipt is still written.
 |---|---|---|
 | `REPRICE_AUTHORIZATION_REQUIRED`, `REPRICE_AUTHORIZATION_MISMATCH` | `--execute` without authorization, or a token for another mode, plane, commit or plan | Obtain the owner's authorization for exactly this step |
 | `REPRICE_KERNEL_UNREGISTERED`, `REPRICE_KERNEL_UNEXPECTED` | The expected kernel is not in this checkout's registry, or the Job's receipt names another kernel or manifest version | Stop. The checkout or the rolled image is not the kernel you meant. Never substitute the receipt's kernel |
+| `REPRICE_SOURCE_INVALID`, `REPRICE_SOURCE_CATALOG_MISMATCH`, `REPRICE_PLAN_SOURCE_MISMATCH` | Current-source flags are incomplete, the source catalog differs, or the plan belongs to another source/mode | Correct the explicit source binding and prepare a matching plan; never substitute another receipt |
 | `REPRICE_JOB_COMMIT_MISMATCH`, `REPRICE_JOB_IMAGE_UNRECOGNIZED`, `REPRICE_JOB_UNRECOGNIZED` | The live Job is not the reviewed render at `--commit` | Nothing ran. Read back the estate (`gcp-infra.mjs readback --require-clean`) and finish the roll |
 | `REPRICE_OVERLAP_REFUSED` | A refresh, reprice or migration execution is running | Nothing ran. Wait for it. Never cancel a refresh to make room |
 | `REPRICE_PLAN_RECEIPT_REQUIRED`, `REPRICE_PLAN_RECEIPT_MISMATCH`, `REPRICE_PLAN_BOUNDS_MISMATCH`, `REPRICE_PLAN_DIGEST_MISMATCH`, `REPRICE_PLAN_CAPPED`, `REPRICE_PLAN_EMPTY`, `REPRICE_PLAN_RECEIPT_STALE`, `REPRICE_PLAN_IMAGE_MISMATCH`, `REPRICE_RECEIPT_FILE_INVALID` | Execution without a matching, sealed, fresh, uncapped and non-empty plan on the same image | Nothing ran. Plan again |
 | `REPRICE_RECEIPT_UNAVAILABLE`, `REPRICE_RECEIPT_AMBIGUOUS`, `REPRICE_RECEIPT_INVALID`, `REPRICE_EXECUTION_TIMEOUT`, `REPRICE_EXECUTION_OUTCOME_UNKNOWN` | The execution ran but its outcome is unproven | For execute, reconcile with the same run id as above. For plan, plan again |
 | `REPRICE_JOB_REFUSED` with `jobCode` `ANALYTICS_V2_REPRICE_PLAN_CHANGED` | The plan changed before execution | Plan again |
-| `REPRICE_JOB_REFUSED` with `jobCode` `ANALYTICS_V2_REPRICE_SCHEMA_UNAVAILABLE` | Migration 0077 is not applied | Stop. Migration is a separate owner step |
+| `REPRICE_JOB_REFUSED` with `jobCode` `ANALYTICS_V2_REPRICE_SCHEMA_UNAVAILABLE` | Required repricing schema is missing (0077 for the default mode, 0080 for current correction) | Stop. Migration is a separate owner step |
 | `REPRICE_JOB_REFUSED`, other `jobCode` | One of the CLI's closed refusals | Read this runbook's sections above for that code |
 | `PRODUCTION_COORDINATION_*`, `STAGING_COORDINATION_*` | The deployment lock is held | Stop, as for OPS-10 ([GCP origin rollout](./gcp-rollout.md#when-something-fails)) |
 
@@ -338,3 +347,93 @@ The offline checks are `node --test apps/worker/scripts/gcp-analytics-reprice.ch
 claim is proven locally by the PostgreSQL test "the runtime grant policy alone
 plans, executes and replays" in `postgres-test/analytics-v2-reprice.spec.mjs`.
 None of these qualifies a live apply, execution or log format.
+
+## Current-source correction
+
+Use this explicitly selected mode when a saved contribution has lost its
+original input association but the server retains a verifiable current daily
+projection and its pricing inputs. An ordinary refresh recomputes owner history
+but queues only affected publication days; its completion does not republish
+every historical head. This mode uses the existing reprice Job, without a full
+refresh or backup restore.
+
+Both the CLI and operator require the paired flags
+`--input-source=current-owner-day --source-kernel=<registered-source-kernel>`.
+Omitting them retains the original saved-snapshot behavior. The source kernel
+may precede the executing kernel, but must have the same catalog and analytics
+method identities. The compiled and database kernel identities must agree.
+Source identity is evidence, never an instruction to rewrite old run stamps.
+
+The domain contracts are in
+[current-correction.ts](../../apps/worker/src/analytics-v2/current-correction.ts),
+with bounded source reading and transactional execution beside it. Migration
+[0080](../../apps/worker/postgres/migrations/primary/0080_analytics_v2_current_correction.sql)
+extends the existing archive and run ledger; the CLI refuses an older
+schema and never migrates it. Existing archive rows and v1 receipts retain
+their original meaning.
+
+For each saved member, an associated immutable archive takes precedence. A
+present but invalid archive refuses the day; it cannot silently fall back to
+current data. Only an absent archive permits current owner-day inputs. They
+must have the exact owner/day/run/kernel/manifest association, a completed full
+run under the pinned source kernel, a closed canonical daily projection, and
+valid codec, digest, event count, pricing and token-component totals. The whole
+saved and current non-spend documents must match. Event timestamps and unknown
+values remain as recorded. Matching counts or spend alone are insufficient.
+
+The fold preserves saved membership, device counts and current exclusions, and
+must reproduce the public head's complete non-spend payload. Any member failure
+refuses the entire day. The same bounds, source locks and shared refresh lock
+apply; current daily and completed-run evidence are additionally locked and
+included in the plan digest. No new contributor roster is introduced.
+Quota/session-only members retain their saved versions and require no pricing
+inputs. During rollout, finish this correction before restarting an ordinary
+refresh that would replace the pinned current-source rows; retain the existing
+scheduler pause/resume procedure. Source changes between planning and execution
+refuse rather than silently switching to another run or kernel.
+
+A successful changed day appends contribution versions, publishes a new daily
+revision and preserves the former head. Each new archive records whether its
+inputs came from an original archive or a current owner-day, plus the prior
+version/value digest and actual source run/kernel/manifest/daily/input digests.
+Those source stamps remain distinct from the new correction's execution stamp.
+Owner erasure covers the new provenance through the existing archive cascade.
+
+This mode creates no old-head equivalence proof. A price-identity change may
+produce a new version even if amounts are equal. If current-sourced target
+values are byte-identical to the saved values, it refuses that day rather than
+forcing a version or attaching newly sourced inputs to the old version.
+
+The additional closed refusals are `current_source_unavailable`,
+`current_source_binding_unproven`, `current_source_run_unproven`,
+`current_source_non_spend_drift` and `current_source_values_unchanged`.
+Existing refusal reasons still apply. A completed receipt with refused days
+does not establish repaired coverage.
+
+Plans use `analytics-v2-current-correction-plan-v1`; execution results use
+`analytics-v2-current-correction-execution-v1`. Both bind `inputSource` and
+`sourceKernelId`. Execution counts are `planned`, `changed`, `unchanged`,
+`refused`, `contributionVersions`, `currentSourceVersions` and
+`archiveSourceVersions`; there is no `equivalent` count. The three day outcomes
+sum to `planned`, the two source-version counts sum to `contributionVersions`,
+and the refusal histogram sums to `refused`.
+
+The carrier emits `analytics-reprice-receipt-v2`; the operator seals
+`tibotattle-gcp-analytics-reprice-v2`. Both include the same source binding.
+Use authorization `current-correction-plan:<env>:<sourceKernel>:<commit>` or
+`current-correction-execute:<env>:<sourceKernel>:<planSha256>` with the existing
+operator flags. The operator requires a registered source kernel with the same
+catalog digest, selects only the matching receipt version in Cloud Logging and
+refuses a plan from the other mode or source kernel before submission.
+
+Retain the same UUID, plan, bounds, source kernel and target when reconciling an
+uncertain execution. Cross-mode or full-refresh UUID reuse refuses. Publication,
+new versions, archives, provenance and the completed receipt commit together.
+After execution, compare live public spend coverage and amounts and unchanged
+non-spend evidence against the retained pre-correction response. Source tests,
+metadata-only planning and Job completion do not substitute for that readback.
+
+Focused checks add `analytics-v2-test/current-correction.spec.ts` and
+`postgres-test/analytics-v2-current-correction.spec.mjs` to the existing CLI and
+operator checks. Use synthetic inputs and an isolated PostgreSQL17 fixture,
+including pre-migration refusal, rollback, drift, replay and erasure cases.

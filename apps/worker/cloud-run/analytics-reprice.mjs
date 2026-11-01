@@ -19,6 +19,8 @@ import {
 
 export const ANALYTICS_REPRICE_ENTRY = "analytics-reprice";
 export const ANALYTICS_REPRICE_RECEIPT_VERSION = "analytics-reprice-receipt-v1";
+export const ANALYTICS_CURRENT_CORRECTION_RECEIPT_VERSION = "analytics-reprice-receipt-v2";
+export const ANALYTICS_CURRENT_CORRECTION_INPUT_SOURCE = "current-owner-day";
 export const ANALYTICS_REPRICE_POOL_MAX = 2;
 /** Mirror the domain's hard caps; run-time equality is checked before connecting. */
 export const ANALYTICS_REPRICE_LIMITS = Object.freeze({ days: 32, members: 1_000,
@@ -28,17 +30,24 @@ export const ANALYTICS_REPRICE_REFUSALS = Object.freeze([
   "price_input_association_unproven", "price_inputs_corrupt", "contribution_invalid",
   "reprice_membership_or_evidence_drift",
 ]);
+export const ANALYTICS_CURRENT_CORRECTION_REFUSALS = Object.freeze([
+  ...ANALYTICS_REPRICE_REFUSALS, "current_source_unavailable", "current_source_binding_unproven",
+  "current_source_run_unproven", "current_source_non_spend_drift", "current_source_values_unchanged",
+]);
 export const ANALYTICS_REPRICE_USAGE = `Usage: node analytics-reprice.mjs --mode=<plan|execute>
   --from-day=YYYY-MM-DD --through-day=YYYY-MM-DD
   --max-days=<1..32> --max-members=<1..1000> --max-input-bytes=<1..16777216>
 
 Execute also requires --run-id=<UUID> --expected-plan-sha256=<64 lowercase hex>.
+Current-input correction additionally requires --input-source=current-owner-day
+and --source-kernel=<registered source kernel>. It creates new contribution
+versions; it never proves an old snapshot's input association.
 Local synthetic targets may use --schema=<identifier> and --now=<ISO instant>
 under the existing test-clock guard. Production uses PRIMARY_SCHEMA and the
 real clock. --help must be used alone. No automatic execution or retries.
 `;
 const FLAGS = new Set(["mode", "from-day", "through-day", "max-days", "max-members",
-  "max-input-bytes", "run-id", "expected-plan-sha256", "schema", "now"]);
+  "max-input-bytes", "run-id", "expected-plan-sha256", "schema", "now", "input-source", "source-kernel"]);
 const SHA = /^[0-9a-f]{64}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const TOKEN = /^[A-Za-z0-9._:-]{1,64}$/u;
@@ -86,36 +95,90 @@ export function parseAnalyticsRepriceArguments(argv, env = {}) {
   }
   const mode = flags.get("mode");
   if (!["plan", "execute"].includes(mode)) fail("ANALYTICS_V2_REPRICE_ARGUMENT_INVALID", true);
-  if (analyticsRefreshProductionTargetRequested(env) && (flags.has("schema") || flags.has("now"))) {
-    fail("ANALYTICS_V2_REPRICE_ARGUMENT_FORBIDDEN", true);
+  const inputSource = flags.get("input-source");
+  if (inputSource !== undefined && inputSource !== ANALYTICS_CURRENT_CORRECTION_INPUT_SOURCE
+      || (inputSource !== undefined) !== flags.has("source-kernel")) {
+    fail("ANALYTICS_V2_REPRICE_ARGUMENT_INVALID", true);
   }
-  const schema = flags.get("schema") ?? env.PRIMARY_SCHEMA;
-  if (typeof schema !== "string" || !/^[A-Za-z_][A-Za-z0-9_]{0,62}$/u.test(schema)
-      || schema.startsWith("pg_") || schema === "information_schema") fail("ANALYTICS_V2_REPRICE_ARGUMENT_INVALID", true);
-  const fromDay = flags.get("from-day"), throughDay = flags.get("through-day");
-  if (!day(fromDay) || !day(throughDay) || fromDay > throughDay) fail("ANALYTICS_V2_REPRICE_ARGUMENT_INVALID", true);
-  const bounds = Object.freeze({ fromDay, throughDay,
-    maxDays: integer(flags.get("max-days"), ANALYTICS_REPRICE_LIMITS.days),
-    maxMembers: integer(flags.get("max-members"), ANALYTICS_REPRICE_LIMITS.members),
-    maxInputBytes: integer(flags.get("max-input-bytes"), ANALYTICS_REPRICE_LIMITS.inputBytes) });
-  const runId = flags.get("run-id") ?? null, expectedPlanSha256 = flags.get("expected-plan-sha256") ?? null;
-  if (mode === "execute" ? !UUID.test(runId ?? "") || !SHA.test(expectedPlanSha256 ?? "")
-    : runId !== null || expectedPlanSha256 !== null) fail("ANALYTICS_V2_REPRICE_ARGUMENT_INVALID", true);
-  let nowMs = null;
-  if (flags.has("now")) {
-    if (!analyticsRefreshTestClockAllowed(env)) fail("ANALYTICS_V2_TEST_CLOCK_FORBIDDEN", true);
-    const text = flags.get("now");
-    nowMs = Date.parse(text);
-    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/u.test(text)
-        || !Number.isSafeInteger(nowMs) || nowMs < 0 || new Date(nowMs).toISOString().slice(0, 19) !== text.slice(0, 19)) {
-      fail("ANALYTICS_V2_REPRICE_ARGUMENT_INVALID", true);
+  const sourceKernelId = inputSource === undefined ? null : integer(flags.get("source-kernel"), 32767);
+  try {
+    if (analyticsRefreshProductionTargetRequested(env) && (flags.has("schema") || flags.has("now"))) {
+      fail("ANALYTICS_V2_REPRICE_ARGUMENT_FORBIDDEN", true);
     }
+    const schema = flags.get("schema") ?? env.PRIMARY_SCHEMA;
+    if (typeof schema !== "string" || !/^[A-Za-z_][A-Za-z0-9_]{0,62}$/u.test(schema)
+        || schema.startsWith("pg_") || schema === "information_schema") fail("ANALYTICS_V2_REPRICE_ARGUMENT_INVALID", true);
+    const fromDay = flags.get("from-day"), throughDay = flags.get("through-day");
+    if (!day(fromDay) || !day(throughDay) || fromDay > throughDay) fail("ANALYTICS_V2_REPRICE_ARGUMENT_INVALID", true);
+    const bounds = Object.freeze({ fromDay, throughDay,
+      maxDays: integer(flags.get("max-days"), ANALYTICS_REPRICE_LIMITS.days),
+      maxMembers: integer(flags.get("max-members"), ANALYTICS_REPRICE_LIMITS.members),
+      maxInputBytes: integer(flags.get("max-input-bytes"), ANALYTICS_REPRICE_LIMITS.inputBytes) });
+    const runId = flags.get("run-id") ?? null, expectedPlanSha256 = flags.get("expected-plan-sha256") ?? null;
+    if (mode === "execute" ? !UUID.test(runId ?? "") || !SHA.test(expectedPlanSha256 ?? "")
+      : runId !== null || expectedPlanSha256 !== null) fail("ANALYTICS_V2_REPRICE_ARGUMENT_INVALID", true);
+    let nowMs = null;
+    if (flags.has("now")) {
+      if (!analyticsRefreshTestClockAllowed(env)) fail("ANALYTICS_V2_TEST_CLOCK_FORBIDDEN", true);
+      const text = flags.get("now");
+      nowMs = Date.parse(text);
+      if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/u.test(text)
+          || !Number.isSafeInteger(nowMs) || nowMs < 0 || new Date(nowMs).toISOString().slice(0, 19) !== text.slice(0, 19)) {
+        fail("ANALYTICS_V2_REPRICE_ARGUMENT_INVALID", true);
+      }
+    }
+    return Object.freeze({ help: false, mode, schema, bounds, runId, expectedPlanSha256, nowMs,
+      ...(inputSource === undefined ? {} : { inputSource, sourceKernelId }) });
+  } catch (error) {
+    // Once the explicit source pair is valid, even an early environment refusal
+    // must be discoverable by the operator's source-specific receipt filter.
+    if (validCorrectionSource(inputSource, sourceKernelId)) Object.assign(error, {
+      inputSource, sourceKernelId, phase: "configuration",
+    });
+    throw error;
   }
-  return Object.freeze({ help: false, mode, schema, bounds, runId, expectedPlanSha256, nowMs });
 }
 function figures(value, keys) { return closed(value, keys) && keys.every(key => count(value[key])); }
+function validCorrectionSource(inputSource, sourceKernelId) {
+  return inputSource === ANALYTICS_CURRENT_CORRECTION_INPUT_SOURCE && Number.isSafeInteger(sourceKernelId)
+    && sourceKernelId >= 1 && sourceKernelId <= 32767;
+}
+/** The new source strategy has its own closed result; the saved-input v1 contract stays unchanged. */
+export function validateAnalyticsCurrentCorrectionResult(result, { mode, bounds, stamp, pricingMethodVersion,
+  expectedPlanSha256, inputSource, sourceKernelId }) {
+  let valid = validCorrectionSource(inputSource, sourceKernelId) && sourceKernelId <= stamp.kernel.kernelId
+    && result?.inputSource === inputSource && result.sourceKernelId === sourceKernelId;
+  if (mode === "plan") {
+    const keys = ["heads", "members", "inputBytes"];
+    valid &&= closed(result, ["schema", "status", "inputSource", "sourceKernelId", "planSha256", "counts", "caps", "target"])
+      && result.schema === "analytics-v2-current-correction-plan-v1" && result.status === "planned"
+      && figures(result.counts, keys) && closed(result.caps, keys)
+      && keys.every(key => typeof result.caps[key] === "boolean")
+      && result.counts.heads <= bounds.maxDays && result.counts.members <= bounds.maxMembers
+      && result.counts.inputBytes <= bounds.maxInputBytes
+      && closed(result.target, ["kernelId", "manifestVersion", "registrySha256", "pricingMethodVersion"])
+      && result.target.kernelId === stamp.kernel.kernelId && result.target.manifestVersion === stamp.manifestVersion
+      && result.target.registrySha256 === stamp.kernel.priceRegistrySha256
+      && result.target.pricingMethodVersion === pricingMethodVersion;
+  } else {
+    valid &&= mode === "execute"
+      && closed(result, ["schema", "status", "inputSource", "sourceKernelId", "planSha256", "counts", "refusals", "replayed"])
+      && result.schema === "analytics-v2-current-correction-execution-v1" && result.status === "complete"
+      && figures(result.counts, ["planned", "changed", "unchanged", "refused", "contributionVersions", "currentSourceVersions", "archiveSourceVersions"])
+      && figures(result.refusals, ANALYTICS_CURRENT_CORRECTION_REFUSALS) && typeof result.replayed === "boolean"
+      && result.planSha256 === expectedPlanSha256 && result.counts.planned <= bounds.maxDays
+      && result.counts.contributionVersions <= bounds.maxMembers
+      && result.counts.currentSourceVersions + result.counts.archiveSourceVersions === result.counts.contributionVersions
+      && result.counts.changed + result.counts.unchanged + result.counts.refused === result.counts.planned
+      && Object.values(result.refusals).reduce((sum, value) => sum + value, 0) === result.counts.refused;
+  }
+  if (!valid || typeof result.planSha256 !== "string" || !SHA.test(result.planSha256)) fail("ANALYTICS_V2_REPRICE_RECEIPT_INVALID");
+  return structuredClone(result);
+}
 /** Reject unexpected fields rather than printing a domain/driver object wholesale. */
-export function validateAnalyticsRepriceResult(result, { mode, bounds, stamp, pricingMethodVersion, expectedPlanSha256 }) {
+export function validateAnalyticsRepriceResult(result, options) {
+  const { mode, bounds, stamp, pricingMethodVersion, expectedPlanSha256, inputSource, sourceKernelId } = options;
+  if (inputSource !== undefined || sourceKernelId !== undefined) return validateAnalyticsCurrentCorrectionResult(result, options);
   let valid;
   if (mode === "plan") {
     const keys = ["heads", "members", "inputBytes"];
@@ -163,7 +226,10 @@ function safeCode(error) {
   catch { return "ANALYTICS_V2_REPRICE_FAILED"; }
 }
 export function analyticsRepriceFailureReceipt(error) {
-  return { schemaVersion: ANALYTICS_REPRICE_RECEIPT_VERSION, status: "failed", code: safeCode(error),
+  const correction = validCorrectionSource(error?.inputSource, error?.sourceKernelId);
+  return { schemaVersion: correction ? ANALYTICS_CURRENT_CORRECTION_RECEIPT_VERSION : ANALYTICS_REPRICE_RECEIPT_VERSION,
+    ...(correction ? { inputSource: error.inputSource, sourceKernelId: error.sourceKernelId } : {}),
+    status: "failed", code: safeCode(error),
     ...(PHASES.has(error?.phase) ? { phase: error.phase } : {}) };
 }
 export async function runAnalyticsReprice({ argv = process.argv.slice(2), env = process.env, dependencies = {} } = {}) {
@@ -182,27 +248,43 @@ export async function runAnalyticsReprice({ argv = process.argv.slice(2), env = 
         || Object.keys(ANALYTICS_REPRICE_LIMITS).some(key => contract.ANALYTICS_V2_REPRICE_LIMITS[key] !== ANALYTICS_REPRICE_LIMITS[key])) {
       fail("ANALYTICS_V2_REPRICE_MODULES_UNAVAILABLE");
     }
+    const correction = parsed.inputSource === ANALYTICS_CURRENT_CORRECTION_INPUT_SOURCE;
+    if (correction && (typeof reprice.planAnalyticsV2CurrentCorrection !== "function"
+        || typeof reprice.executeAnalyticsV2CurrentCorrection !== "function"
+        || !figures(reprice.ANALYTICS_V2_CURRENT_CORRECTION_LIMITS, Object.keys(ANALYTICS_REPRICE_LIMITS))
+        || Object.keys(ANALYTICS_REPRICE_LIMITS).some(key => reprice.ANALYTICS_V2_CURRENT_CORRECTION_LIMITS[key] !== ANALYTICS_REPRICE_LIMITS[key])
+        || !Array.isArray(reprice.ANALYTICS_V2_CURRENT_CORRECTION_REFUSALS)
+        || [...reprice.ANALYTICS_V2_CURRENT_CORRECTION_REFUSALS].sort().join(",") !== [...ANALYTICS_CURRENT_CORRECTION_REFUSALS].sort().join(","))) {
+      fail("ANALYTICS_V2_REPRICE_MODULES_UNAVAILABLE");
+    }
     const bounds = contract.validAnalyticsV2RepriceBounds(parsed.bounds);
     const stamp = analyticsRefreshRunStamp(store, dependencies.kernelIdentity);
+    if (correction && parsed.sourceKernelId > stamp.kernel.kernelId) fail("ANALYTICS_V2_REPRICE_INVALID");
     const pricingMethodVersion = store.analyticsV2BundledPricer?.().pricingMethodVersion;
     if (typeof pricingMethodVersion !== "string" || !TOKEN.test(pricingMethodVersion)) fail("ANALYTICS_V2_REPRICE_MODULES_UNAVAILABLE");
     phase = "connection";
     if (database.kind === "cloud-sql") connector = (dependencies.createConnector ?? (() => new Connector()))();
     pool = await (dependencies.createPool ?? defaultCreatePool)(database, { connector });
     phase = parsed.mode;
-    const options = { schema: parsed.schema, bounds, stamp };
-    const result = parsed.mode === "plan" ? await reprice.planAnalyticsV2Reprice(pool, options)
-      : await reprice.executeAnalyticsV2Reprice(pool, { ...options, runId: parsed.runId,
+    const options = { schema: parsed.schema, bounds, stamp, ...(correction ? { sourceKernelId: parsed.sourceKernelId } : {}) };
+    const plan = correction ? reprice.planAnalyticsV2CurrentCorrection : reprice.planAnalyticsV2Reprice;
+    const execute = correction ? reprice.executeAnalyticsV2CurrentCorrection : reprice.executeAnalyticsV2Reprice;
+    const result = parsed.mode === "plan" ? await plan(pool, options)
+      : await execute(pool, { ...options, runId: parsed.runId,
         expectedPlanSha256: parsed.expectedPlanSha256, nowMs });
     phase = "receipt";
-    receipt = { schemaVersion: ANALYTICS_REPRICE_RECEIPT_VERSION, status: "ok", mode: parsed.mode,
+    receipt = { schemaVersion: correction ? ANALYTICS_CURRENT_CORRECTION_RECEIPT_VERSION : ANALYTICS_REPRICE_RECEIPT_VERSION,
+      ...(correction ? { inputSource: parsed.inputSource, sourceKernelId: parsed.sourceKernelId } : {}),
+      status: "ok", mode: parsed.mode,
       target: database.target ?? null, now: new Date(nowMs).toISOString(), clock: parsed.nowMs === null ? "wall" : "test",
       kernel: { kernelId: stamp.kernel.kernelId, manifestVersion: stamp.manifestVersion },
       result: validateAnalyticsRepriceResult(result, { ...parsed, bounds, stamp, pricingMethodVersion }) };
   } catch (error) { failure = Object.assign(new Error(safeCode(error)), { code: safeCode(error), phase }); }
   try { await (dependencies.closeResources ?? closeCloudSqlResources)({ pools: pool === undefined ? [] : [pool], connector }); }
   catch (error) { failure ??= Object.assign(new Error(safeCode(error)), { code: safeCode(error), phase: "cleanup" }); }
-  if (failure) throw failure;
+  if (failure) throw Object.assign(failure, parsed.inputSource === undefined ? {} : {
+    inputSource: parsed.inputSource, sourceKernelId: parsed.sourceKernelId,
+  });
   return receipt;
 }
 async function main() {
