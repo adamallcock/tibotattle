@@ -370,6 +370,7 @@ export async function authenticatePostgresDeviceBearer(
   let outcome: BearerOutcome;
   try {
     outcome = await withPostgresMutation(pool, async (client): Promise<BearerOutcome> => {
+      // Lock the participant before the device, as upload claims do.
       const result = await client.query<DeviceAuthorityRow>(
         `SELECT device.id, device.participant_id, device.authority_kind, device.secret_hash,
                 device.state, device.issued_at, device.expires_at, device.last_used_at,
@@ -377,10 +378,10 @@ export async function authenticatePostgresDeviceBearer(
                 device.accountless_enrollment_device_id,
                 participant.state AS participant_state, participant.owner_kind AS participant_owner_kind,
                 participant.consent_version AS participant_consent_version
-           FROM ${table(schema, "device_credentials")} device
-           JOIN ${table(schema, "participants")} participant ON participant.id = device.participant_id
+           FROM ${table(schema, "participants")} participant
+           JOIN ${table(schema, "device_credentials")} device ON device.participant_id = participant.id
           WHERE device.id = $1
-          FOR UPDATE OF device, participant`,
+          FOR UPDATE OF participant, device`,
         [parsed.id],
       );
       const row = result.rows[0];
