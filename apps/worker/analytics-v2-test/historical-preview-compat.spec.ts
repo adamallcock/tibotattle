@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { ADMIN_MODEL_CONFIG, OCTOBER26_ADMIN_MODEL_CONFIG, expandAdminModelHistoryDay,
+import { ADMIN_MODEL_CONFIG, expandAdminModelHistoryDay,
   projectAdminModelHistoryDay } from "@app-usagemonitor/telemetry-contract";
 import * as canonical from "../src/admin-community-allowance";
 import * as vendored from "../vendor/analytics-d43c8f92/apps/worker/src/admin-community-allowance";
@@ -45,7 +45,7 @@ for (const [name, api, currentCatalog, validHistorical, graph] of [
   ["GCP compatibility", canonical, ADMIN_MODEL_CONFIG, validReadableAdminCommunityAllowancePreview,
     (row: Parameters<typeof vendoredGraph>[0], options: Parameters<typeof vendoredGraph>[1]) =>
       projectPublicAllowanceGraphForGcp(row, options, metadata)],
-  ["vendored kernel", vendored, OCTOBER26_ADMIN_MODEL_CONFIG, vendored.validCachedAdminCommunityAllowancePreview, vendoredGraph],
+  ["vendored kernel", vendored, ADMIN_MODEL_CONFIG, vendored.validCachedAdminCommunityAllowancePreview, vendoredGraph],
 ] as const) describe(`${name} historical preview compatibility`, () => {
   it("retains the exact known kernel10 publication and leaves new Sol unobserved", async () => {
     const preview = historicalPreview();

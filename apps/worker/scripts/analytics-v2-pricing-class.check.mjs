@@ -467,24 +467,28 @@ test("the pure pricer prices a battery selecting every reachable card exactly as
     }
     const { APP_OFFICIAL_PRICE_CARDS: cards } = await import(pathToFileURL(join(VENDOR_ROOT, "packages", "accounting",
       "src", "price-registry.js")).href);
-    const shifted = (day, days) => new Date(Date.parse(`${day}T00:00:00.000Z`) + days * 86_400_000).toISOString().slice(0, 10);
     const records = [];
     for (const card of cards) {
       const provider = card.provider === "openai" ? "openai_codex" : "anthropic_claude_code";
-      const days = new Set(["2026-08-01"]);
-      for (const bound of [card.effective?.from, card.effective?.to]) {
-        if (typeof bound === "string") for (const offset of [-1, 0, 1]) days.add(shifted(bound, offset));
+      const eventTimes = new Set(["2026-08-01T12:00:00.000Z"]);
+      for (const [edge, bound] of Object.entries(card.effective ?? {})) {
+        const epoch = Date.parse(bound);
+        if (bound.length === 10) {
+          for (const offset of [-1, 0, 1]) eventTimes.add(new Date(epoch + offset * 86_400_000 + 43_200_000).toISOString());
+        }
+        const boundary = epoch + (bound.length === 10 && edge === "to" ? 86_399_999 : 0);
+        for (const offset of [-1, 0, 1]) eventTimes.add(new Date(boundary + offset).toISOString());
       }
       const surfaces = provider === "openai_codex"
         ? [["openai_api", card.service_tier, "standard"], ["openai_api", null, "standard"],
           ["chatgpt_subscription", null, "standard"], ["chatgpt_subscription", null, "fast"]]
         : [["anthropic_api", null, "standard"], ["claude_subscription", null, "standard"]];
       for (const modelId of [card.model, ...(card.aliases ?? []), "unknown"]) {
-        for (const day of days) {
+        for (const eventTime of eventTimes) {
           for (const [billingSurface, apiServiceTier, speedMode] of surfaces) {
             for (const context of [1_000, 300_000, null]) {
               records.push({ provider, modelId, billingSurface, speedMode, apiServiceTier, reasoningEffort: "high",
-                eventTime: `${day}T12:00:00.000Z`, totalInputContextTokens: context,
+                eventTime, totalInputContextTokens: context,
                 components: { inputUncachedTokens: 100, inputCacheReadTokens: context === 300_000 ? 299_000 : 900,
                   inputCacheWriteTokens: provider === "anthropic_claude_code" ? 50 : 0, outputTextTokens: 50,
                   outputReasoningTokens: 25, outputCombinedTokens: context === null ? 75 : null } });

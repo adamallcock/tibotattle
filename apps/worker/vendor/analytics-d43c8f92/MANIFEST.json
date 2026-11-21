@@ -1,6 +1,6 @@
 {
   "schemaVersion": "analytics-kernel-vendor-manifest-v1",
-  "sourceCommit": "76179fd4f21816693e958e436d3c84fd8555da60",
+  "sourceCommit": "2175b2c6960a8ef71c74161c25a71de80460e612",
   "generator": "apps/worker/scripts/vendor-analytics-kernels.mjs",
   "check": "apps/worker/scripts/vendor-analytics-kernels.check.mjs",
   "authoredFiles": [
@@ -72,9 +72,9 @@
   "sourcePatches": [
     {
       "path": "apps/worker/src/admin-community-allowance.ts",
-      "id": "historical-preview-catalog-compatibility",
-      "hunks": 4,
-      "sha256": "67e143fa82f1b1ec20bf5306ebd8eef3c375f5d822be8ae3087f2d5ca9f89eda"
+      "id": "gpt62-historical-preview-catalog-compatibility",
+      "hunks": 6,
+      "sha256": "619436b159915a8dee445cd68037c13f518682eeeefb1cd46b8c68b1317c42cc"
     },
     {
       "path": "apps/worker/src/telemetry-usage-reconciliation.ts",
@@ -157,7 +157,7 @@
     {
       "path": "apps/worker/src/admin-community-allowance.ts",
       "blob": "c836c294112eda15e11bb9f9a81f24bbafcb135c",
-      "sha256": "de3ad0521f597ded542ab861dae87c35cf755e3c7b2b2152861a3f3ccdea7ec9",
+      "sha256": "98750c80d716ec50764128371896c50e9f236e544ab45063acc520585cbd55cf",
       "patch": "source",
       "reach": "kernel"
     },
@@ -429,8 +429,8 @@
     },
     {
       "path": "apps/worker/src/server-pricing.ts",
-      "blob": "2af1cc16a46397220baf38a051059afeede5b7a5",
-      "sha256": "b6e25a9c576c2ca8173e8a91e8364742d1f8267cc0a94a1122bc5acecc46c7a8",
+      "blob": "0ba10c466f18520b7798bf18a27d8ff82e50e388",
+      "sha256": "081bf23e6ada7f51c9bb989302234e43d20d588e8f761f4ea587c8c3ff33b4ec",
       "patch": "none",
       "reach": "kernel"
     },
@@ -779,8 +779,8 @@
     },
     {
       "path": "packages/accounting/index.d.ts",
-      "blob": "0e7c40e0046dbbd27cc51f4e3a61be48d6f77748",
-      "sha256": "d53abafef4f46db61c23519a1292592a3073c92f8b01fb2b53a78ade85365267",
+      "blob": "05cbb019a37c32bbdfbbc38b1d37e32c6fbf88fa",
+      "sha256": "8e2e1c8dabdc03e2b733b0377b0024c3eda4f891182ed72ca700db950fcc487f",
       "patch": "none",
       "reach": "package"
     },
@@ -800,8 +800,8 @@
     },
     {
       "path": "packages/accounting/src/cost-ledger.js",
-      "blob": "5f660baf6750bac0a246a72e6201f5eaad34ae3e",
-      "sha256": "57befd9a265c66a7ede0b991a6783db6fc6201ce586035110e0cf2ed7657a15f",
+      "blob": "c759112bcdb5820d526c51655803fcf154432631",
+      "sha256": "2bd0d0a57b3be84e8816ce255d02f80b8d40725c363a44e37cb5adef924faf0a",
       "patch": "none",
       "reach": "package"
     },
@@ -814,15 +814,15 @@
     },
     {
       "path": "packages/accounting/src/price-registry.js",
-      "blob": "7db4d51eeff204449c421c5f9387684e7faef590",
-      "sha256": "66b0902330cc6e416ddaee44ed6472b9f6919bf796bfbf7221c20b6790d3ffb7",
+      "blob": "e1dbce82e80d8b496927398fcaf8156d1506025d",
+      "sha256": "16e7e3f41767403be6ce4869f6bcaf598c0f6611ec4cc6870052008d1673a399",
       "patch": "none",
       "reach": "package"
     },
     {
       "path": "packages/accounting/src/subscription-speed.js",
-      "blob": "2484ef616c41442057294692b8dacec9c0977963",
-      "sha256": "d2281868d2bf7913471db733a1aa549e826a3e0ff5216e27dad7cf4a90a1f21e",
+      "blob": "99098d7fd7617a516d9906ad925337fd5bcea8f6",
+      "sha256": "13d598c97228f3d51815c76e925f0aadb4091803f81a0e18fcca640d019e63e1",
       "patch": "none",
       "reach": "package"
     },
@@ -905,15 +905,15 @@
     },
     {
       "path": "packages/telemetry-contract/index.d.ts",
-      "blob": "8837793de6a1b0ac00181dfd82f4bfecc04c3487",
-      "sha256": "689119a1241631eb1a33a73f20c85a102f7fd5f12de2e721658f3da1f068fda5",
+      "blob": "8dcf7c7433f5953d9b1db7d4020b016004260562",
+      "sha256": "42b84781f14f002bc27b545f7d9dda1731f00a6df30a9f0500e438157439d091",
       "patch": "none",
       "reach": "package"
     },
     {
       "path": "packages/telemetry-contract/index.js",
-      "blob": "67fbc2efe90a93749f22f808aef9bf96ab8c5e79",
-      "sha256": "8fe6a839b74df4fece1285c7f7c43dde02dee3b4b3fe8c4900f2b84f45b03da2",
+      "blob": "d85d6b49d97ee4bb04b6d7ef86fd84c143e3bca2",
+      "sha256": "ff10cd71349f01898816ef115b475a4f7f60e00834df7ace6cf45fa4c71375f9",
       "patch": "none",
       "reach": "package"
     },
@@ -926,15 +926,15 @@
     },
     {
       "path": "packages/telemetry-contract/src/admin-model-history.js",
-      "blob": "648b27e130b8e94b17abfff93bf088a5731ea2f7",
-      "sha256": "87eea5f4436ad5a8e8bb386862398913a0538be203f8ba5e6969ebe54e2337c9",
+      "blob": "048e7add3bed0eda9d1f6da75958d7a6345fe8a9",
+      "sha256": "a44a15562c7bee2f5cbed3e50e5005623ef571dd3ab6c8fba7be8d29b3fcf064",
       "patch": "none",
       "reach": "package"
     },
     {
       "path": "packages/telemetry-contract/src/constants.js",
-      "blob": "dc305a2c8b7da83560cc7273c462ce32a6f82996",
-      "sha256": "c7f019ea2246ba4ea154a1c64633aaf65b90411dd216cf09df04e9f3117f40cd",
+      "blob": "a6740e5c27cfd96ef6cd346626865d1717092d7f",
+      "sha256": "4a081d92f820dc9d9d9c5f10a02941f42318f43c29edfff07a7fc987874fb1a7",
       "patch": "none",
       "reach": "package"
     },
@@ -961,8 +961,8 @@
     },
     {
       "path": "packages/telemetry-contract/src/model-catalog.js",
-      "blob": "82ab6bd5ad691ad57022845ed926c308076b1ee3",
-      "sha256": "2702c5c59bdbc486aa1d9730702e6582acb74672641a76cb2ae5a9ed18138256",
+      "blob": "270c0f5adea92c6c69e7c12687862515e14b91a0",
+      "sha256": "c642961489119263b53095ccd5b8d414a9e9c1118d635d2dd2050d68427565f5",
       "patch": "none",
       "reach": "package"
     },
@@ -1003,8 +1003,8 @@
     },
     {
       "path": "packages/telemetry-contract/src/telemetry-v0.2.js",
-      "blob": "0fa03b0c982f0d6b0b55d9c37e40d37d9c1c3422",
-      "sha256": "44993a2e7811235672b0b1aad62a756c6b98e8ba1fdcffa7dc7060f6a676659b",
+      "blob": "eaf52647c3fc739d1ab0d33e32d5aaa7a89e222e",
+      "sha256": "c83ccd83b79491f2c921bb60b79e3293448d63708034bafa1ea6d8f4c2128ce9",
       "patch": "none",
       "reach": "package"
     },

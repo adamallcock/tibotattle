@@ -220,7 +220,7 @@ export async function loadQ1CurrentContract(options) {
     requireThat(exactKeys(spend, SPEND_KEYS) && spend.pricingMethodVersion === "server-api-price-equivalent-v0.5"
       && spend.registrySha256 === "48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9");
     spend.pricingMethodVersion = "server-api-price-equivalent-v0.6";
-    spend.registrySha256 = "206544769b43e4b9645284258edd38f7c07a226022db10f5ec0181335df236ab";
+    spend.registrySha256 = "eca860219a79a24a2cc1ba07471e2ecc321281508dc7e8d48412deef77609c77";
   }
   golden.allowanceBreakdowns = currentBreakdowns(original.golden.allowanceBreakdowns, publicMetadata);
   const perDateExpected = structuredClone(original.perDateExpected);

@@ -93,17 +93,19 @@ function syntheticCard(model = "synthetic-unseen-model-km1"): PriceCard {
 }
 
 describe("baseline projection (manifest version 1)", () => {
-  it("preserves the immutable cutover file and the exact vendored registry predecessor", async () => {
+  it("preserves the immutable cutover file and exact current Worker and vendored cards", async () => {
     const fromPackages = compiledBaselineCatalogManifest();
     expect(canonicalCatalogPayloadText(fromPackages)).toBe(JSON.stringify(committedBaseline));
-    expect(vendoredRegistry.APP_PRICE_REGISTRY_MANIFEST.version).toBe("app-official-api-prices-v0.10");
+    expect(vendoredRegistry.APP_PRICE_REGISTRY_MANIFEST.version).toBe("app-official-api-prices-v0.11");
     expect(vendoredRegistry.APP_PRICE_REGISTRY_MANIFEST.sha256)
-      .toBe("206544769b43e4b9645284258edd38f7c07a226022db10f5ec0181335df236ab");
+      .toBe("eca860219a79a24a2cc1ba07471e2ecc321281508dc7e8d48412deef77609c77");
     expect(await webCryptoSha256Hex(JSON.stringify(vendoredRegistry.APP_OFFICIAL_PRICE_CARDS)))
       .toBe(vendoredRegistry.APP_PRICE_REGISTRY_MANIFEST.sha256);
-    const retainedIds = new Set(vendoredRegistry.APP_OFFICIAL_PRICE_CARDS.map(({ id }) => id));
-    expect(APP_OFFICIAL_PRICE_CARDS.filter(({ id }) => retainedIds.has(id)))
-      .toEqual(vendoredRegistry.APP_OFFICIAL_PRICE_CARDS);
+    expect(JSON.stringify(vendoredRegistry.APP_OFFICIAL_PRICE_CARDS)).toBe(JSON.stringify(APP_OFFICIAL_PRICE_CARDS));
+    const retainedCards = APP_OFFICIAL_PRICE_CARDS.filter((card) =>
+      (card.metadata?.provenance as { observed_at?: string }).observed_at !== "2026-11-21T14:12:40Z");
+    expect(await webCryptoSha256Hex(JSON.stringify(retainedCards)))
+      .toBe("206544769b43e4b9645284258edd38f7c07a226022db10f5ec0181335df236ab");
     expect(fromPackages.version).toBe(CATALOG_BASELINE_RELEASE.version);
     expect(fromPackages.projectedFromCommit).toBe("d43c8f92a059d9c577776f7eca8a331eb305b8a6");
     // Current compiled packages may advance; version 1 never changes identity.

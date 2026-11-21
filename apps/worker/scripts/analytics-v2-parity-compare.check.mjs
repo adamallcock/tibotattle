@@ -613,7 +613,7 @@ test("all added headers, empty summaries, metadata and catalog stamps have the d
   for (const day of expected.golden.days) {
     assert.equal(day.payload.apiEquivalentSpend.pricingMethodVersion, "server-api-price-equivalent-v0.6");
     assert.equal(day.payload.apiEquivalentSpend.registrySha256,
-      "206544769b43e4b9645284258edd38f7c07a226022db10f5ec0181335df236ab");
+      "eca860219a79a24a2cc1ba07471e2ecc321281508dc7e8d48412deef77609c77");
   }
 });
 

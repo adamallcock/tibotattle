@@ -34,6 +34,66 @@ test("inclusive effective-to dates and both context threshold conventions are ca
   }
 });
 
+test("the bundled GCP adapter prices GPT-6.2 exact tiers, contexts and epochs", () => {
+  const pricer = fast.module.createFastTelemetryUsagePricer();
+  const launch = "2026-11-17T00:00:00.000Z";
+  const prelaunch = "2026-11-16T23:59:59.999Z";
+  const promoEnd = "2027-03-01T07:59:59.999Z";
+  const listStart = "2027-03-01T08:00:00.000Z";
+  const modelPrices = [
+    { modelId: "gpt-6.2-astra", standard: [5_560_000_000, 9_120_016_000],
+      batch: [2_780_000_000, 4_560_008_000], priority: [11_120_000_000, 18_240_032_000],
+      promo: [16_680_000_000, 27_360_048_000], list: [33_360_000_000, 54_720_096_000] },
+    { modelId: "gpt-6.2-sol", standard: [1_390_000_000, 2_280_004_000],
+      batch: [695_000_000, 1_140_002_000], priority: [2_780_000_000, 4_560_008_000],
+      promo: [4_170_000_000, 6_840_012_000], list: [8_340_000_000, 13_680_024_000] },
+  ];
+  function event(modelId, context = 272_000) {
+    return ordinaryEvent({ modelId, eventTime: launch, billingSurface: "openai_api", apiServiceTier: "standard",
+      totalInputContextTokens: context, components: { ...ordinaryEvent().components,
+        inputUncachedTokens: context - 172_000, inputCacheReadTokens: 100_000, inputCacheWriteTokens: 72_000,
+        outputTextTokens: 40_000, outputReasoningTokens: 60_000, outputCombinedTokens: 100_000 } });
+  }
+  function verify(row, costNanousd) {
+    assertSame(oracle.module.priceTelemetryUsageEvent, pricer, row, "GPT-6.2 oracle parity");
+    const expected = { costNanousd: costNanousd ?? 0,
+      pricingStatus: costNanousd === null ? "unpriced" : "fully_priced", modelId: row.modelId };
+    assert.deepEqual(fast.module.priceChunkUsageRecord(JSON.stringify(row), row.eventTime), expected,
+      "actual bound stored record adapter");
+    assert.equal(pricer(row).registrySha256, "eca860219a79a24a2cc1ba07471e2ecc321281508dc7e8d48412deef77609c77");
+  }
+  for (const prices of modelPrices) {
+    for (const [index, context] of [272_000, 272_001].entries()) {
+      const row = event(prices.modelId, context);
+      for (const apiServiceTier of ["standard", "batch", "priority"]) {
+        verify({ ...row, apiServiceTier }, prices[apiServiceTier][index]);
+        verify({ ...row, apiServiceTier, eventTime: prelaunch }, null);
+      }
+      for (const apiServiceTier of ["unknown", "flex"]) verify({ ...row, apiServiceTier }, null);
+      verify({ ...row, billingSurface: "chatgpt_subscription", apiServiceTier: "unknown", speedMode: "fast" }, prices.priority[index]);
+      for (const billingSurface of ["openai_api", "chatgpt_subscription"]) {
+        const ultra = { ...row, billingSurface, apiServiceTier: billingSurface === "openai_api" ? "ultrafast" : "unknown", speedMode: "ultrafast" };
+        verify({ ...ultra, eventTime: promoEnd }, prices.promo[index]);
+        verify({ ...ultra, eventTime: listStart }, prices.list[index]);
+      }
+    }
+  }
+  const law = event("gpt-6.2-astra-law");
+  verify(law, 5_560_000_000);
+  verify({ ...law, eventTime: prelaunch }, null);
+  verify({ ...law, eventTime: "2026-12-31T23:59:59.999Z" }, 5_560_000_000);
+  verify({ ...law, eventTime: "2027-01-01T00:00:00.000Z" }, null);
+  for (const apiServiceTier of ["unknown", "batch", "priority", "flex", "ultrafast"]) verify({ ...law, apiServiceTier }, null);
+  verify({ ...law, billingSurface: "chatgpt_subscription", apiServiceTier: "unknown", speedMode: "fast" }, null);
+
+  const zeros = { ...law, components: Object.fromEntries(COMPONENT_KEYS.map((key) => [key, 0])) };
+  verify(zeros, 0);
+  verify({ ...zeros, apiServiceTier: "flex" }, null);
+  verify({ ...zeros, eventTime: prelaunch }, null);
+  assert.ok(pricer.getStats().fastPathHits > 0);
+  assert.ok(pricer.getStats().fallbackCalls > 0);
+});
+
 test("partial observations, split writes, duplicate aliases and large/invalid quantities retain reasons and errors", () => {
   for (const provider of ["openai_codex", "anthropic_claude_code", "unknown"]) {
     const modelId = provider === "anthropic_claude_code" ? "claude-fable-5" : "gpt-5.5";
