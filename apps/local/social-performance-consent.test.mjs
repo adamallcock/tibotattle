@@ -1,14 +1,24 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import test from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { startLocalCompanionServer } from "./server.js";
+import { createLocalTelemetryPerformanceState } from "./telemetry-performance-state.js";
 import { initialTelemetryPerformanceSyncState } from "../../src/application/index.js";
 
 const ORIGIN = "https://telemetry.example";
 const DEVICE_ID = "11111111-1111-4111-8111-111111111111";
+function legacySyncState(patch = {}) {
+  return {
+    schemaVersion: "telemetry-performance-sync-state-v1",
+    cursorDay: null, lastAttemptAt: null, lastOutcome: null, nextAttemptAt: null,
+    paused: false, pausedReason: null, retryCount: 0, lastReportRevision: null,
+    ...patch,
+  };
+}
+
 const METHODS = ["receipt", "tool_free"];
 const CONSENT = {
   schemaVersion: "model-performance-daily-v1",
@@ -73,6 +83,7 @@ async function fixture(t, { initialSyncState = null, readHostedCapability } = {}
     mkdir(codexHome, { recursive: true }),
   ]);
   const syncStatePath = join(stateRoot, "private", "social-performance-sync-state-v1.json");
+  const currentSyncStatePath = join(stateRoot, "private", "social-performance-sync-state-v2.json");
   if (initialSyncState !== null) {
     await mkdir(join(stateRoot, "private"), { recursive: true, mode: 0o700 });
     await writeFile(syncStatePath, JSON.stringify(initialSyncState), { mode: 0o600 });
@@ -110,7 +121,11 @@ async function fixture(t, { initialSyncState = null, readHostedCapability } = {}
   return {
     get app() { return app; },
     setHostedAvailable(value) { hostedAvailable = value; },
-    readSyncState: async () => JSON.parse(await readFile(syncStatePath, "utf8")),
+    readSyncState: async () => {
+      try { return JSON.parse(await readFile(currentSyncStatePath, "utf8")).state; }
+      catch (error) { if (error.code !== "ENOENT") throw error; }
+      return JSON.parse(await readFile(syncStatePath, "utf8"));
+    },
     async restart() {
       await app.close();
       app = await startApp();
@@ -196,8 +211,8 @@ async function requestApproval(base) {
 
 test("renewed social approval durably resumes authorization failures without resetting progress", async t => {
   for (const reason of ["authorization_rejected", "response_invalid"]) {
-    const previous = { ...initialTelemetryPerformanceSyncState(), cursorDay: "2026-09-28",
-      lastReportRevision: "a".repeat(64), paused: true, pausedReason: reason, retryCount: 4 };
+    const previous = legacySyncState({ cursorDay: "2026-09-28",
+      lastReportRevision: "a".repeat(64), paused: true, pausedReason: reason, retryCount: 4 });
     const value = await fixture(t, { initialSyncState: previous });
     const base = `http://127.0.0.1:${value.app.port}`;
     const refused = await requestApproval(base);
@@ -207,7 +222,8 @@ test("renewed social approval durably resumes authorization failures without res
     const approved = await requestApproval(base);
     assert.equal(approved.status, 200);
     const resumed = await value.readSyncState();
-    assert.deepEqual(resumed, { ...previous, paused: false, pausedReason: null, retryCount: 0 });
+    assert.deepEqual(resumed, { ...initialTelemetryPerformanceSyncState(),
+      cursorDay: previous.cursorDay, lastReportRevision: previous.lastReportRevision });
     await value.restart();
     assert.deepEqual(await value.readSyncState(), resumed);
     const status = await fetch(`http://127.0.0.1:${value.app.port}/api/local/performance/status`);
@@ -217,7 +233,7 @@ test("renewed social approval durably resumes authorization failures without res
 
 test("social reapproval preserves disconnect and invalid-report pauses", async t => {
   for (const reason of ["global_paused", "device_disconnected", "report_invalid", "upload_rejected"]) {
-    const previous = { ...initialTelemetryPerformanceSyncState(), paused: true, pausedReason: reason };
+    const previous = legacySyncState({ paused: true, pausedReason: reason });
     const value = await fixture(t, { initialSyncState: previous });
     value.setHostedAvailable(true);
     assert.equal((await requestApproval(`http://127.0.0.1:${value.app.port}`)).status, 200);
@@ -239,4 +255,38 @@ test("overlapping social approvals cannot replace an active approval writer", as
   assert.equal((await second.json()).error.code, "performance_approval_in_progress");
   release(hostedCapability());
   assert.equal((await first).status, 200);
+});
+
+test("performance retry metadata upgrades atomically and stays bound to one device and destination", async t => {
+  const folder = await mkdtemp(join(tmpdir(), "performance-retry-state-"));
+  t.after(async () => rm(folder, { recursive: true, force: true }));
+  const legacyPath = join(folder, "performance-v1.json");
+  const path = join(folder, "performance-v2.json");
+  const legacy = legacySyncState({ cursorDay: "2026-11-16", lastReportRevision: "a".repeat(64) });
+  const legacyBytes = JSON.stringify(legacy);
+  await writeFile(legacyPath, legacyBytes, { mode: 0o600 });
+  await writeFile(`${path}.interrupted.tmp`, '{"partial":', { mode: 0o600 });
+  const store = () => createLocalTelemetryPerformanceState({ path, legacyPath, origin: ORIGIN });
+  const migrated = await store().read(DEVICE_ID);
+  assert.equal(migrated.cursorDay, legacy.cursorDay);
+  assert.equal(migrated.lastReportRevision, legacy.lastReportRevision);
+  assert.deepEqual(migrated.pendingReports, []);
+  const queued = { ...migrated, pendingReports: [{
+    day: "2026-11-17", code: "report_record_invalid", retryCount: 1,
+    nextAttemptAt: "2026-11-17T12:01:00.000Z",
+  }] };
+  await store().save(queued, DEVICE_ID);
+  assert.equal(await readFile(legacyPath, "utf8"), legacyBytes);
+  assert.equal((await stat(path)).mode & 0o777, 0o600);
+  assert.equal((await readFile(path, "utf8")).includes(DEVICE_ID), false);
+  assert.deepEqual(await store().read(DEVICE_ID), queued);
+  for (const other of [null, "22222222-2222-4222-8222-222222222222"]) {
+    assert.deepEqual(await store().read(other), initialTelemetryPerformanceSyncState());
+  }
+  assert.deepEqual(await createLocalTelemetryPerformanceState({
+    path, legacyPath, origin: "https://other.example",
+  }).read(DEVICE_ID), initialTelemetryPerformanceSyncState());
+  await writeFile(path, "corrupt current state", { mode: 0o600 });
+  await assert.rejects(store().read(DEVICE_ID), SyntaxError);
+  assert.equal(await readFile(legacyPath, "utf8"), legacyBytes, "current corruption cannot fall back to an unbound predecessor");
 });

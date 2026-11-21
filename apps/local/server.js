@@ -3,8 +3,6 @@ import {
   createTelemetryPerformanceClient,
   createTelemetryPerformanceScheduler,
   createWorkUsageService,
-  initialTelemetryPerformanceSyncState,
-  parseTelemetryPerformanceSyncState,
   resumeTelemetryPerformanceSyncAfterAuthorization,
   TELEMETRY_PERFORMANCE_AUTHORIZATION_VERSION,
   TELEMETRY_PERFORMANCE_CAPABILITIES_VERSION,
@@ -12,6 +10,7 @@ import {
   TELEMETRY_PERFORMANCE_SCOPE,
   TELEMETRY_PERFORMANCE_SUPPORTED_SPEED_METHODS,
 } from "../../src/application/index.js";
+import { createLocalTelemetryPerformanceState } from "./telemetry-performance-state.js";
 import { createWorkUsageSnapshotStore } from "./work-usage-snapshots.js";
 import { enrichWorkUsageRows } from "../../src/local-work-usage-source.js";
 import { createServer } from "node:http";
@@ -272,6 +271,8 @@ const LOCAL_PERFORMANCE_ENVELOPE_KEY_PATH = "/api/v1/envelope-key";
 const LOCAL_PERFORMANCE_CONSENT_FILE =
   "social-performance-consent-v1.json";
 const LOCAL_PERFORMANCE_SYNC_STATE_FILE =
+  "social-performance-sync-state-v2.json";
+const LEGACY_PERFORMANCE_SYNC_STATE_FILE =
   "social-performance-sync-state-v1.json";
 const LOCAL_PERFORMANCE_REVIEW_LIFETIME_MS = 10 * 60_000;
 const MAX_ACTIVE_PERFORMANCE_REVIEWS = 8;
@@ -4332,9 +4333,11 @@ function createPreparedLocalCompanionServer({
   const socialPerformanceConsentFile = join(
     stateRoot, "private", LOCAL_PERFORMANCE_CONSENT_FILE,
   );
-  const socialPerformanceStateFile = join(
-    stateRoot, "private", LOCAL_PERFORMANCE_SYNC_STATE_FILE,
-  );
+  const socialPerformanceState = createLocalTelemetryPerformanceState({
+    path: join(stateRoot, "private", LOCAL_PERFORMANCE_SYNC_STATE_FILE),
+    legacyPath: join(stateRoot, "private", LEGACY_PERFORMANCE_SYNC_STATE_FILE),
+    origin: contributionServiceOrigin,
+  });
   const readSocialPerformanceDeviceCapability = async () => {
     const injected = socialPerformanceOptions?.readDeviceCapability;
     if (injected !== undefined) return injected();
@@ -4476,21 +4479,32 @@ function createPreparedLocalCompanionServer({
     const options = socialPerformanceOptions ?? {};
     const fetchImpl = options.fetchImpl ?? centralFetch;
     const readAuthorization = socialPerformanceOptions?.readAuthorization
-      ?? (async () => withContributionDeviceSecret({
-        backend: await createContributionDeviceBackend(),
-        stateFile: statePaths.contributionDeviceStateFile,
-        expectedOrigin: contributionServiceOrigin,
-        operation: async (secret, binding) => {
-          if (!PERFORMANCE_DEVICE_ID.test(binding.deviceId)) {
-            throw new Error("performance_device_unavailable");
-          }
-          return `Device um_device_${binding.deviceId}.${secret.toString("base64url")}`;
-        },
-      }));
+      ?? (async (deviceId) => {
+        const authorization = await withContributionDeviceSecret({
+          backend: await createContributionDeviceBackend(),
+          stateFile: statePaths.contributionDeviceStateFile,
+          expectedOrigin: contributionServiceOrigin,
+          operation: async (secret, binding) => binding.deviceId === deviceId
+            ? `Device um_device_${binding.deviceId}.${secret.toString("base64url")}` : null,
+        });
+        if (authorization === null) throw new Error("performance_device_unavailable");
+        return authorization;
+      });
     socialPerformanceClient = createTelemetryPerformanceClient({
       origin: contributionServiceOrigin,
       fetchImpl,
-      readAuthorization,
+      readAuthorization: async deviceId => {
+        if (deviceId !== null) return readAuthorization(deviceId);
+        throw Object.assign(new Error("Performance device authorization unavailable"), {
+          code: "telemetry_performance_authorization_rejected",
+        });
+      },
+      readDeviceId: async () => {
+        const consent = await readSocialPerformanceConsent();
+        if (consent === null) return null;
+        const capability = await readSocialPerformanceDeviceCapability();
+        return capability?.deviceId === consent.deviceId ? consent.deviceId : null;
+      },
       readPreparedDay: options.readPreparedDay
         ?? (async ({ day, nowEpoch }) => {
           modelPerformanceController ??= createModelPerformanceController({
@@ -4500,19 +4514,8 @@ function createPreparedLocalCompanionServer({
             day, provider: "openai_codex", nowEpoch,
           });
         }),
-      readState: async () => {
-        try {
-          return parseTelemetryPerformanceSyncState(
-            await readJsonIfExists(socialPerformanceStateFile, null),
-          );
-        } catch {
-          return initialTelemetryPerformanceSyncState();
-        }
-      },
-      saveState: (value) => writeJsonOwnerOnlyAtomic(
-        socialPerformanceStateFile,
-        parseTelemetryPerformanceSyncState(value),
-      ),
+      readState: socialPerformanceState.read,
+      saveState: socialPerformanceState.save,
       createEnvelope: async ({ report }) => {
         const key = await readPerformanceEnvelopeKey(fetchImpl, contributionServiceOrigin);
         return (options.createEnvelope ?? createTelemetryPerformanceEnvelope)({
@@ -4522,7 +4525,8 @@ function createPreparedLocalCompanionServer({
     });
     socialPerformanceScheduler = createTelemetryPerformanceScheduler({
       ...(options.schedulerOptions ?? {}),
-      runner: ({ day, nowEpoch, resetRetryCount }) => socialPerformanceClient.runDay({ day, nowEpoch, resetRetryCount }),
+      runner: socialPerformanceClient.runDay,
+      readRetryDays: socialPerformanceClient.readRetryDays,
       backfillDays: options.schedulerOptions?.backfillDays ?? 7,
       includeCurrentDay: options.schedulerOptions?.includeCurrentDay ?? true,
     });
@@ -5557,12 +5561,10 @@ function createPreparedLocalCompanionServer({
             sendError(response, 409, "performance_review_expired_or_changed");
             return;
           }
-          const syncState = parseTelemetryPerformanceSyncState(
-            await readJsonIfExists(socialPerformanceStateFile, null),
-          );
+          const syncState = await socialPerformanceState.read(authorization.grantDeviceId);
           const resumedState = resumeTelemetryPerformanceSyncAfterAuthorization(syncState);
           if (syncState.paused && !resumedState.paused) {
-            await writeJsonOwnerOnlyAtomic(socialPerformanceStateFile, resumedState);
+            await socialPerformanceState.save(resumedState, authorization.grantDeviceId);
           }
           await saveSocialPerformanceConsent({
             schemaVersion: LOCAL_PERFORMANCE_CONSENT_STATE_SCHEMA_VERSION,

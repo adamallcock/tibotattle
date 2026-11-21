@@ -123,6 +123,7 @@ export function createTelemetryPerformanceDayRunner({
  */
 export function createTelemetryPerformanceScheduler({
   runner,
+  readRetryDays = async () => [],
   day = null,
   now = () => Date.now(),
   onStatus = () => {},
@@ -133,7 +134,7 @@ export function createTelemetryPerformanceScheduler({
   backfillDays = DEFAULT_BACKFILL_DAYS,
   includeCurrentDay = false,
 } = {}) {
-  if (typeof runner !== "function" || typeof now !== "function"
+  if (typeof runner !== "function" || typeof readRetryDays !== "function" || typeof now !== "function"
       || typeof onStatus !== "function" || typeof setTimer !== "function"
       || typeof clearTimer !== "function"
       || (day !== null && !validDay(day))
@@ -150,6 +151,7 @@ export function createTelemetryPerformanceScheduler({
   let pending = null;
   let generation = 0;
   let rerun = false;
+  let nextOrdinaryAt = null;
   let status = Object.freeze({ state: "off", lastAcceptedAt: null, nextAttemptAt: null });
   const publish = (state, nextAttemptAt = null, accepted = false) => {
     status = Object.freeze({
@@ -163,16 +165,16 @@ export function createTelemetryPerformanceScheduler({
     if (timer !== null) clearTimer(timer);
     timer = null;
   };
-  const schedule = (delay) => {
+  const schedule = (delay, retryOnly = false) => {
     if (!started || stopped) return;
     clear();
     timer = setTimer(() => {
       timer = null;
-      void run();
+      void run(retryOnly);
     }, delay);
     timer?.unref?.();
   };
-  async function run() {
+  async function run(retryOnly = false) {
     if (!started || stopped) return status;
     if (pending !== null) return pending;
     clear();
@@ -181,42 +183,69 @@ export function createTelemetryPerformanceScheduler({
       try {
         const nowEpoch = now();
         if (!validNow(nowEpoch)) invalid("invalid_telemetry_performance_clock");
-        // Revisit a bounded completed-day window on every pass. Local timing
-        // evidence can arrive late or become ineligible after replay, and an
-        // empty replacement must supersede an older uploaded day. A fixed day
-        // remains a useful deterministic/test mode and performs one attempt.
-        const days = day === null
-          ? [
-            ...(includeCurrentDay ? [new Date(nowEpoch).toISOString().slice(0, 10)] : []),
-            ...Array.from({ length: backfillDays }, (_, index) => shiftDay(completedDay(nowEpoch), -index)),
-          ]
-          : [day];
+        // A single rejected day must not restart every successful daily
+        // upload on each retry timer. An ordinary pass still runs each day.
+        const pendingOnly = retryOnly && day === null && nextOrdinaryAt !== null
+          && nowEpoch < nextOrdinaryAt;
+        if (!pendingOnly) nextOrdinaryAt = nowEpoch + intervalMilliseconds;
+        const days = day !== null ? [day] : pendingOnly ? [] : [
+          ...(includeCurrentDay ? [new Date(nowEpoch).toISOString().slice(0, 10)] : []),
+          ...Array.from({ length: backfillDays }, (_, index) => shiftDay(completedDay(nowEpoch), -index)),
+        ];
+        let nextDayRetryAt = Number.POSITIVE_INFINITY;
+        if (day === null) {
+          const pending = await readRetryDays({ nowEpoch });
+          if (epoch !== generation || stopped) return status;
+          if (!Array.isArray(pending) || pending.length > 11 || !pending.every(validDay)) {
+            invalid("invalid_telemetry_performance_retry_days");
+          }
+          if (pendingOnly) days.push(...new Set(pending));
+          else if (pending.some(selectedDay => !days.includes(selectedDay))) {
+            // Do carryover in a paced follow-up. A combined pass could exceed
+            // the server's per-device request budget before reaching the tail.
+            nextDayRetryAt = nowEpoch;
+          }
+        }
         let result = null;
         for (const [index, selectedDay] of days.entries()) {
           if (stopped) break;
-          // Successful prefixes must not reset the backoff for an older day
-          // that repeatedly fails. Persist the count until the whole pass wins.
-          result = await runner({ day: selectedDay, nowEpoch, resetRetryCount: index === days.length - 1 });
+          // Successful prefixes must not reset global outage backoff.
+          const attempt = await runner({
+            day: selectedDay, nowEpoch, resetRetryCount: index === days.length - 1,
+            ...(pendingOnly ? { onlyPending: true } : {}),
+          });
           if (epoch !== generation) return status;
-          if (result?.status !== "succeeded") break;
+          if (attempt?.status === "skipped") continue;
+          result = attempt;
+          if (result?.status === "retry" && result.retryScope === "day") {
+            const retryAt = Date.parse(result.retryAt ?? "");
+            nextDayRetryAt = Math.min(nextDayRetryAt,
+              Number.isFinite(retryAt) ? retryAt : nowEpoch + retryMilliseconds);
+          } else if (result?.status !== "succeeded") break;
         }
-        result ??= { status: "paused" };
         if (stopped) return status;
-        if (result?.status === "succeeded") {
-          publish("up_to_date", new Date(now() + intervalMilliseconds).toISOString(), true);
-          schedule(intervalMilliseconds);
-        } else if (result?.status === "retry") {
+        const finishedAt = now();
+        const ordinaryDelay = Math.min(MAX_TIMER, Math.max(1, nextOrdinaryAt - finishedAt));
+        if (result?.status === "retry" && result.retryScope !== "day") {
           const retryAt = Date.parse(result.state?.nextAttemptAt ?? "");
-          const delay = Number.isFinite(retryAt) ? Math.min(MAX_TIMER, Math.max(retryMilliseconds, retryAt - now())) : retryMilliseconds;
-          publish("retry_wait", new Date(now() + delay).toISOString());
-          schedule(delay);
-        } else {
+          const delay = Number.isFinite(retryAt)
+            ? Math.min(MAX_TIMER, Math.max(retryMilliseconds, retryAt - finishedAt)) : retryMilliseconds;
+          publish("retry_wait", new Date(finishedAt + delay).toISOString());
+          schedule(delay, pendingOnly);
+        } else if (result !== null && !["retry", "succeeded"].includes(result?.status)) {
           publish("paused");
+        } else if (Number.isFinite(nextDayRetryAt)) {
+          const delay = Math.min(ordinaryDelay, Math.max(retryMilliseconds, nextDayRetryAt - finishedAt));
+          publish("retry_wait", new Date(finishedAt + delay).toISOString());
+          schedule(delay, true);
+        } else {
+          publish("up_to_date", new Date(finishedAt + ordinaryDelay).toISOString(), result?.status === "succeeded");
+          schedule(ordinaryDelay);
         }
       } catch {
         if (!stopped) {
           publish("retry_wait", new Date(now() + retryMilliseconds).toISOString());
-          schedule(retryMilliseconds);
+          schedule(retryMilliseconds, retryOnly);
         }
       }
       return status;
@@ -237,7 +266,7 @@ export function createTelemetryPerformanceScheduler({
       }
       return status;
     },
-    runNow: run,
+    runNow: () => run(),
     inspect: () => status,
     preferenceChanged() {
       generation += 1;

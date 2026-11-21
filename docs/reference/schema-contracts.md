@@ -360,6 +360,18 @@ capability and authorization routes, encrypted report delivery, typed cohort and
 bucket storage, idempotent per-device report revisions, and owner-erasure/restore
 coverage. Usage consent cannot authorize performance. Local timing source and
 scheduler integration are qualified separately from hosted chart publication.
+The client acknowledges a day only after receiving an HTTP 202 receipt with
+the matching day and report revision. Exact duplicates return an idempotent
+receipt with the `idempotency-replayed: true` header. HTTP 409 refusals and unreadable receipts leave
+the day unacknowledged and use paced, per-day retries while other eligible days
+continue. Ordinary delivery covers the current UTC day and seven completed days.
+A durable day marker precedes each new send, so an interrupted attempt remains
+eligible for retry. The client retries unresolved days through the tenth
+completed day, matching the PostgreSQL service's new-admission limit. On
+expiry, local state records the unresolved day and the local timing evidence
+remains available. The retry state is
+owner-only, scoped to the destination and device, and stored alongside the
+legacy cursor so older clients cannot overwrite it.
 Timing SQLite schemas advance to primary 6 and supplement 7 while parser methods remain 2/3. Source parser version 18 recognizes GPT-6.1 Sol and Ultrafast. Still-present, verified sources replay through bounded staging; completed old rows remain readable through cancellation and restart until the final verified chunk atomically replaces them. Missing or rewritten sources retain their last good rows and prior parser provenance. Older writers refuse the upgraded stores.
 Old rows retain existing TPS/TTFT
 with unavailable new fields. Receipt timing

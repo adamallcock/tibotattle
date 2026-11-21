@@ -25,7 +25,10 @@ export const TELEMETRY_PERFORMANCE_CAPABILITIES_VERSION =
 export const TELEMETRY_PERFORMANCE_AUTHORIZATION_VERSION =
   "telemetry-performance-authorization-v1";
 export const TELEMETRY_PERFORMANCE_SYNC_STATE_VERSION =
-  "telemetry-performance-sync-state-v1";
+  "telemetry-performance-sync-state-v2";
+const LEGACY_SYNC_STATE_VERSION = "telemetry-performance-sync-state-v1";
+const REPORT_RETRY_PAST_DAYS = 10;
+const DAY_MS = 86_400_000;
 export const TELEMETRY_PERFORMANCE_SCOPE = "model-performance-daily";
 export const TELEMETRY_PERFORMANCE_SUPPORTED_SPEED_METHODS = Object.freeze([
   "receipt", "tool_free",
@@ -53,11 +56,18 @@ const CAPABILITY_KEYS = Object.freeze([
   "schemaVersion", "lifecycle", "consentCurrent", "authorizationCurrent",
   "requiredConsent", "authorization", "supportedSpeedMethods",
 ]);
-const STATE_KEYS = Object.freeze([
+const LEGACY_STATE_KEYS = Object.freeze([
   "schemaVersion", "cursorDay", "lastAttemptAt", "lastOutcome", "nextAttemptAt",
   "paused", "pausedReason", "retryCount", "lastReportRevision",
 ]);
+const STATE_KEYS = Object.freeze([...LEGACY_STATE_KEYS, "pendingReports", "lastExpiredReportDay"]);
 const OUTCOME_KEYS = Object.freeze(["at", "code", "status"]);
+const PENDING_KEYS = Object.freeze(["day", "code", "retryCount", "nextAttemptAt"]);
+const RECEIPT_KEYS = Object.freeze(["schemaVersion", "status", "reportId", "day", "reportRevision", "replayed"]);
+const REPORT_RECEIPT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+const REPORT_SEND_INTENT = "report_acknowledgement_pending";
+const REPORT_RETRY_CODES = new Set([REPORT_SEND_INTENT, "report_receipt_invalid",
+  "report_record_invalid", "report_manifest_conflict", "report_conflict_unconfirmed"]);
 
 function plain(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -258,13 +268,16 @@ export function initialTelemetryPerformanceSyncState() {
     pausedReason: null,
     retryCount: 0,
     lastReportRevision: null,
+    pendingReports: [],
+    lastExpiredReportDay: null,
   });
 }
 
 function normalizedState(value) {
   if (value === null || value === undefined) return initialTelemetryPerformanceSyncState();
-  if (!exact(value, STATE_KEYS)
-      || value.schemaVersion !== TELEMETRY_PERFORMANCE_SYNC_STATE_VERSION
+  const legacy = exact(value, LEGACY_STATE_KEYS) && value.schemaVersion === LEGACY_SYNC_STATE_VERSION;
+  if ((!legacy && (!exact(value, STATE_KEYS)
+        || value.schemaVersion !== TELEMETRY_PERFORMANCE_SYNC_STATE_VERSION))
       || (value.cursorDay !== null && !day(value.cursorDay))
       || (value.lastAttemptAt !== null && !instant(value.lastAttemptAt))
       || (value.nextAttemptAt !== null && !instant(value.nextAttemptAt))
@@ -279,7 +292,44 @@ function normalizedState(value) {
           || !["succeeded", "retry", "paused"].includes(value.lastOutcome.status)))) {
     fail("state_invalid");
   }
-  return freeze({ ...value, lastOutcome: value.lastOutcome === null ? null : { ...value.lastOutcome } });
+  const pendingReports = legacy ? [] : value.pendingReports;
+  const lastExpiredReportDay = legacy ? null : value.lastExpiredReportDay;
+  if (!Array.isArray(pendingReports) || pendingReports.length > REPORT_RETRY_PAST_DAYS + 1
+      || (lastExpiredReportDay !== null && !day(lastExpiredReportDay))
+      || pendingReports.some((entry, index) => !exact(entry, PENDING_KEYS) || !day(entry.day)
+        || !REPORT_RETRY_CODES.has(entry.code) || !instant(entry.nextAttemptAt)
+        || !integer(entry.retryCount, MAX_TELEMETRY_PERFORMANCE_RETRIES)
+        || (entry.retryCount === 0) !== (entry.code === REPORT_SEND_INTENT)
+        || (index > 0 && pendingReports[index - 1].day >= entry.day))) {
+    fail("state_invalid");
+  }
+  // v1 used "idempotent" only for HTTP 409. That status did not
+  // establish admission on the reviewed services.
+  const unconfirmedLegacyAck = legacy && value.lastOutcome?.status === "succeeded"
+    && value.lastOutcome.code === "idempotent";
+  return freeze({
+    ...value,
+    ...(unconfirmedLegacyAck ? { cursorDay: null, lastReportRevision: null } : {}),
+    schemaVersion: TELEMETRY_PERFORMANCE_SYNC_STATE_VERSION,
+    lastOutcome: unconfirmedLegacyAck || value.lastOutcome === null ? null : { ...value.lastOutcome },
+    pendingReports: pendingReports.map(entry => ({ ...entry })),
+    lastExpiredReportDay,
+  });
+}
+
+function reportRetryWindow(nowEpoch) {
+  const today = Math.floor(nowEpoch / DAY_MS) * DAY_MS;
+  return {
+    from: new Date(today - REPORT_RETRY_PAST_DAYS * DAY_MS).toISOString().slice(0, 10),
+    through: new Date(today).toISOString().slice(0, 10),
+  };
+}
+
+export function readTelemetryPerformanceRetryDays(value, nowEpoch) {
+  const { from, through } = reportRetryWindow(nowEpoch);
+  return normalizedState(value).pendingReports
+    .filter(entry => entry.day >= from && entry.day <= through)
+    .map(entry => entry.day);
 }
 
 export function parseTelemetryPerformanceSyncState(value) {
@@ -368,6 +418,28 @@ function responseStatus(value) {
   return null;
 }
 
+function acknowledgedReceipt(value, expectedReport, idempotencyReplayed) {
+  return exact(value, RECEIPT_KEYS)
+    && value.schemaVersion === "telemetry-performance-receipt-v1"
+    && ["accepted", "replaced", "idempotent"].includes(value.status)
+    && typeof value.reportId === "string" && REPORT_RECEIPT_ID.test(value.reportId)
+    && value.day === expectedReport.day
+    && value.reportRevision === expectedReport.reportRevision
+    && (value.status === "idempotent"
+      ? value.replayed === true && idempotencyReplayed === true
+      : value.replayed === false && idempotencyReplayed === undefined);
+}
+
+function withPendingReport(state, entry) {
+  return [...state.pendingReports.filter(existing => existing.day !== entry.day), entry]
+    .sort((left, right) => left.day.localeCompare(right.day));
+}
+
+function dayRetryResult(state, pending, reportRevision = null) {
+  return Object.freeze({ state, status: "retry", retryScope: "day",
+    retryAt: pending.nextAttemptAt, reportRevision });
+}
+
 /**
  * Execute one bounded performance report attempt.  State persistence is
  * injected so the app can use its owner-only storage and tests can use an
@@ -381,13 +453,15 @@ export async function runTelemetryPerformanceSync({
   globalPaused = false,
   deviceConnected = true,
   resetRetryCount = true,
+  onlyPending = false,
   readCapabilities,
   prepareDay,
   createEnvelope,
   send,
   saveState = async () => {},
 } = {}) {
-  if (!day(selectedDay) || !integer(nowEpoch) || nowEpoch < 0 || typeof resetRetryCount !== "boolean"
+  if (!day(selectedDay) || !integer(nowEpoch) || typeof resetRetryCount !== "boolean"
+      || typeof onlyPending !== "boolean"
       || typeof readCapabilities !== "function"
       || typeof prepareDay !== "function"
       || typeof createEnvelope !== "function"
@@ -418,8 +492,27 @@ export async function runTelemetryPerformanceSync({
     await saveState(state);
   }
   if (state.paused) return Object.freeze({ state, status: "paused", reportRevision: null });
+  const { from: retryFrom, through: retryThrough } = reportRetryWindow(nowEpoch);
+  const expired = state.pendingReports.findLast(entry => entry.day < retryFrom);
+  if (expired !== undefined) {
+    state = freeze({ ...state,
+      pendingReports: state.pendingReports.filter(entry => entry.day >= retryFrom),
+      lastExpiredReportDay: state.lastExpiredReportDay !== null
+        && state.lastExpiredReportDay > expired.day ? state.lastExpiredReportDay : expired.day,
+    });
+    await saveState(state);
+  }
   if (state.nextAttemptAt !== null && Date.parse(state.nextAttemptAt) > nowEpoch) {
     return Object.freeze({ state, status: "retry", reportRevision: null });
+  }
+  const pending = state.pendingReports.find(entry => entry.day === selectedDay);
+  // A scheduled carryover may belong to a device that was replaced between
+  // passes. The current binding must still own an eligible pending report.
+  if (onlyPending && (pending === undefined || selectedDay < retryFrom || selectedDay > retryThrough)) {
+    return Object.freeze({ state, status: "skipped", reportRevision: null });
+  }
+  if (pending !== undefined && Date.parse(pending.nextAttemptAt) > nowEpoch) {
+    return dayRetryResult(state, pending);
   }
   const transportFailure = async (error, defaultCode, reportRevision = null) => {
     const code = error?.code === "telemetry_performance_authorization_rejected" ? "authorization_rejected"
@@ -445,6 +538,7 @@ export async function runTelemetryPerformanceSync({
   try {
     report = await prepareDay({ day: selectedDay, capability: cap });
     validateReportShape(report);
+    if (report.day !== selectedDay) fail("report_day_mismatch");
   } catch {
     state = outcomeState(state, nowEpoch, "report_invalid", "paused", {
       paused: true, pausedReason: "report_invalid", nextAttemptAt: null,
@@ -460,6 +554,17 @@ export async function runTelemetryPerformanceSync({
     return transportFailure(knownTransportFailure ? error : { code: "telemetry_performance_response_invalid" },
       "service_unavailable", report.reportRevision);
   }
+  const eligibleForRetry = selectedDay >= retryFrom && selectedDay <= retryThrough;
+  if (pending === undefined && eligibleForRetry) {
+    // Persist the day before POST. If the process stops before the response
+    // can be saved, the next pass can still recover its exact day and revision
+    // from local timing evidence even after ordinary lookback moves forward.
+    state = freeze({ ...state, pendingReports: withPendingReport(state, {
+      day: selectedDay, code: REPORT_SEND_INTENT, retryCount: 0,
+      nextAttemptAt: new Date(nowEpoch).toISOString(),
+    }) });
+    await saveState(state);
+  }
   let response;
   try {
     response = await send({ envelope, authorization: cap.authorization, report });
@@ -467,18 +572,33 @@ export async function runTelemetryPerformanceSync({
     return transportFailure(error, "service_unavailable", report.reportRevision);
   }
   const status = responseStatus(response);
-  if ((status !== null && status >= 200 && status < 300)
-      || status === 409) {
-    state = outcomeState(state, nowEpoch, status === 409 ? "idempotent" : "accepted", "succeeded", {
+  if (status === 202 && acknowledgedReceipt(response.receipt, report, response.idempotencyReplayed)) {
+    state = outcomeState(state, nowEpoch, response.receipt.status === "idempotent" ? "idempotent" : "accepted", "succeeded", {
       cursorDay: selectedDay,
       lastReportRevision: report.reportRevision,
       retryCount: resetRetryCount ? 0 : state.retryCount,
       nextAttemptAt: null,
       paused: false,
       pausedReason: null,
+      pendingReports: state.pendingReports.filter(entry => entry.day !== selectedDay),
     });
     await saveState(state);
     return Object.freeze({ state, status: "succeeded", reportRevision: report.reportRevision });
+  }
+  if (status === 409 || (status !== null && status >= 200 && status < 300)) {
+    const code = status !== 409 ? "report_receipt_invalid"
+      : response?.errorCode === "TELEMETRY_RECORD_INVALID" ? "report_record_invalid"
+        : response?.errorCode === "TELEMETRY_MANIFEST_CONFLICT" ? "report_manifest_conflict"
+          : "report_conflict_unconfirmed";
+    const retryCount = Math.min(MAX_TELEMETRY_PERFORMANCE_RETRIES, (pending?.retryCount ?? 0) + 1);
+    const retry = { day: selectedDay, code, retryCount, nextAttemptAt: new Date(nowEpoch
+      + Math.max(retryDelay(retryCount), retryAfterDelay(response?.retryAfter, nowEpoch))).toISOString() };
+    state = outcomeState(state, nowEpoch, code, "retry", {
+      nextAttemptAt: null,
+      ...(eligibleForRetry ? { pendingReports: withPendingReport(state, retry) } : {}),
+    });
+    await saveState(state);
+    return dayRetryResult(state, retry, report.reportRevision);
   }
   if (status === 401 || status === 403) {
     state = outcomeState(state, nowEpoch, "authorization_rejected", "paused", {
