@@ -10,6 +10,7 @@ export const LINUX_FINAL_CONFIRMATION = 'RUN_DISPOSABLE_FINAL_LINUX_LIFECYCLE';
 export const LINUX_FINAL_SCHEMA = 'tibotattle-linux-final-lifecycle-intake-v1';
 export const LINUX_FINAL_SCHEMA_V2 = 'tibotattle-linux-final-lifecycle-intake-v2';
 export const LINUX_FINAL_SCHEMA_V3 = 'tibotattle-linux-final-lifecycle-intake-v3';
+export const LINUX_FINAL_SCHEMA_V4 = 'tibotattle-linux-final-lifecycle-intake-v4';
 const FINAL_RELEASES = Object.freeze({
   [LINUX_FINAL_SCHEMA]: Object.freeze({ version: '0.1.27', buildNumber: '2026100301',
     lifecycleSchema: 'tibotattle-linux-final-installed-lifecycle-v1',
@@ -20,6 +21,9 @@ const FINAL_RELEASES = Object.freeze({
   [LINUX_FINAL_SCHEMA_V3]: Object.freeze({ version: '0.1.29', buildNumber: '2026102601',
     lifecycleSchema: 'tibotattle-linux-final-installed-lifecycle-v3',
     publicPredecessorUpdate: 'exact_published_0.1.28_to_final_0.1.29' }),
+  [LINUX_FINAL_SCHEMA_V4]: Object.freeze({ version: '0.1.30', buildNumber: '2026112101',
+    lifecycleSchema: 'tibotattle-linux-final-installed-lifecycle-v4',
+    publicPredecessorUpdate: 'exact_published_0.1.29_to_final_0.1.30' }),
 });
 export const LINUX_FINAL_INPUT = '.release-build/linux-final-qualification';
 export const LINUX_FINAL_PREDECESSOR = Object.freeze({
@@ -33,6 +37,19 @@ export const LINUX_FINAL_PREDECESSOR_V2 = Object.freeze({
   file: 'TiboTattle-0.1.28-linux-x86_64.AppImage', bytes: 132501565,
   sha256: '0dacbd7a0b4d34e24b04029602798729435d44cb856039021d4db64141e8aaa4',
   manifestSha256: '459b89538461b4249dc38e9bbcb5f7c6eb8f49b202856f3cc4f1db8a57650f89',
+});
+// Digests match GitHub's immutable release metadata and the exact published manifest.
+export const LINUX_FINAL_PREDECESSOR_V3 = Object.freeze({
+  version: '0.1.29', sourceRevision: '905d9f9682ef472671eb87281fb35ead38711561',
+  file: 'TiboTattle-0.1.29-linux-x86_64.AppImage', bytes: 133072454,
+  sha256: 'ec40445c6a875ac6581a16df78b554f88481a18e05bc3aacd815088740d993ac',
+  manifestSha256: '731b1ffe5d1c5fa9a8e38c23c439d2f77327fa045b25cf31da955a6834da446c',
+});
+const FINAL_PREDECESSORS = Object.freeze({
+  [LINUX_FINAL_SCHEMA]: LINUX_FINAL_PREDECESSOR,
+  [LINUX_FINAL_SCHEMA_V2]: LINUX_FINAL_PREDECESSOR,
+  [LINUX_FINAL_SCHEMA_V3]: LINUX_FINAL_PREDECESSOR_V2,
+  [LINUX_FINAL_SCHEMA_V4]: LINUX_FINAL_PREDECESSOR_V3,
 });
 export const LINUX_FINAL_FEED = 'https://updates.tibotattle.com/electron/stable/linux-x64';
 export const linuxFinalFailure = code => { throw Object.assign(new Error(`LINUX_FINAL_LIFECYCLE_${code}`), { code: `LINUX_FINAL_LIFECYCLE_${code}` }); };
@@ -50,7 +67,8 @@ export function resolveLinuxFinalRelease({ schemaVersion, version, buildNumber }
   return release;
 }
 export function resolveLinuxFinalPredecessor(intake) {
-  return resolveLinuxFinalRelease(intake).version === '0.1.29' ? LINUX_FINAL_PREDECESSOR_V2 : LINUX_FINAL_PREDECESSOR;
+  resolveLinuxFinalRelease(intake);
+  return FINAL_PREDECESSORS[intake.schemaVersion];
 }
 export function validateLinuxFinalIntake(value) {
   const keys = ['schemaVersion', 'runnerRevision', 'sourceRevision', 'version', 'buildNumber',

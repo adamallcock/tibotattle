@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { ADMIN_MODEL_CONFIG, expandAdminModelHistoryDay,
+import { ADMIN_MODEL_CONFIG, OCTOBER26_ADMIN_MODEL_CONFIG, expandAdminModelHistoryDay,
   projectAdminModelHistoryDay } from "@app-usagemonitor/telemetry-contract";
 import * as canonical from "../src/admin-community-allowance";
 import * as vendored from "../vendor/analytics-d43c8f92/apps/worker/src/admin-community-allowance";
@@ -41,11 +41,11 @@ function historicalPreview() {
 }
 
 const metadata = [{ id: "gpt-6-astra", label: "GPT-6 Astra", family: "astra", order: 0 }];
-for (const [name, api, validHistorical, graph] of [
-  ["GCP compatibility", canonical, validReadableAdminCommunityAllowancePreview,
+for (const [name, api, currentCatalog, validHistorical, graph] of [
+  ["GCP compatibility", canonical, ADMIN_MODEL_CONFIG, validReadableAdminCommunityAllowancePreview,
     (row: Parameters<typeof vendoredGraph>[0], options: Parameters<typeof vendoredGraph>[1]) =>
       projectPublicAllowanceGraphForGcp(row, options, metadata)],
-  ["vendored kernel10", vendored, vendored.validCachedAdminCommunityAllowancePreview, vendoredGraph],
+  ["vendored kernel", vendored, OCTOBER26_ADMIN_MODEL_CONFIG, vendored.validCachedAdminCommunityAllowancePreview, vendoredGraph],
 ] as const) describe(`${name} historical preview compatibility`, () => {
   it("retains the exact known kernel10 publication and leaves new Sol unobserved", async () => {
     const preview = historicalPreview();
@@ -109,7 +109,7 @@ for (const [name, api, validHistorical, graph] of [
 
   it("keeps current builders and current-catalog publications valid", () => {
     const preview = api.buildAdminCommunityAllowancePreview([], NOW);
-    expect(preview.models.modelConfig).toEqual(ADMIN_MODEL_CONFIG);
+    expect(preview.models.modelConfig).toEqual(currentCatalog);
     expect(validHistorical(preview, preview.generatedAt, NOW)).toBe(true);
   });
 });
@@ -143,6 +143,7 @@ describe("retained Pro 10x (v0.4) preview compatibility", () => {
       .toBe(fixture("allowance-breakdowns-v14-expected.json"));
     const current = withCurrentPublicModelMetadata(published)!.breakdowns;
     expect(current.modelConfig.map(({ id }) => id)).toEqual([
+      "gpt-6.2-astra", "gpt-6.2-sol",
       "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-terra",
       "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna",
     ]);

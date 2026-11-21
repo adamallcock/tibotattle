@@ -843,10 +843,11 @@ export async function ingestLocalUnifiedIndexIncrement({
       if (retained === undefined) continue;
       const runtimeQuarantine = typeof cursor.quarantine_code === "string";
       writer.copySourceDiagnostics(sourceKey, previousGenerationId);
-      if (cursor.parser_version !== LOCAL_UNIFIED_INDEX_PARSER_VERSION) {
-        // This source rotated away before the v8 typed-tool pass could rescan
-        // it. Preserve its usage/quota facts, but permanently attest the tool
-        // history gap instead of publishing a false zero.
+      if (cursor.parser_version !== LOCAL_UNIFIED_INDEX_PARSER_VERSION
+          && cursor.parser_version !== "unified-rollout-typed-v21") {
+        // v21 and v22 have the same typed-tool semantics. For other parser
+        // versions, retain usage and quota facts and mark the tool history
+        // gap. Any gap already recorded for v21 was copied above.
         writer.writeSourceDiagnostics(sourceKey, {
           toolSourceHistoryUnavailable: 1,
         });

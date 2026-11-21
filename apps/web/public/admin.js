@@ -2666,7 +2666,8 @@ export function adminAllowanceChartModel(preview, {
     label: model.label,
     hasEvidence: rangeDaysWithEvidence.some(day => modelDayByDay.get(day.day)?.byModel?.[model.modelId]?.capacityUsd != null),
     ...allowanceModelPresentation(model.modelId, index),
-  })).sort((left, right) => left.order - right.order);
+  })).filter(({ key, hasEvidence }) => !adminAllowanceModelRequiresEvidence(key) || hasEvidence)
+    .sort((left, right) => left.order - right.order);
   const activePlanFilter = mode === "plans"
     && planSeries.some((plan) => plan.key === planFilter)
     ? planFilter
@@ -3239,11 +3240,18 @@ function renderAdminAllowanceControls() {
   }
 }
 
+function adminAllowanceModelRequiresEvidence(modelId) {
+  // Keep restricted configurations out of the comparison until a fit identifies them.
+  return modelId === "gpt-6.2-astra-law";
+}
+
 function appendModelAllowanceSummaries(container, preview) {
   const models = preview.models;
   const modelConfig = models.modelConfig.map((model, index) => ({
     ...model, ...allowanceModelPresentation(model.modelId, index),
-  })).sort((left, right) => left.order - right.order);
+  })).filter(({ modelId }) => !adminAllowanceModelRequiresEvidence(modelId)
+    || models.days.some(day => day.byModel?.[modelId]?.capacityUsd != null))
+    .sort((left, right) => left.order - right.order);
   const filterLabel = document.createElement("label");
   filterLabel.className = "admin-allowance-model-filter";
   filterLabel.textContent = "Model view ";
@@ -3260,6 +3268,10 @@ function appendModelAllowanceSummaries(container, preview) {
     filter.append(option);
   }
   filter.value = state.allowanceModelFilter;
+  if (adminAllowanceModelRequiresEvidence(state.allowanceModelFilter) && !filter.value) {
+    state.allowanceModelFilter = "observed";
+    filter.value = state.allowanceModelFilter;
+  }
   filter.addEventListener("change", () => {
     state.allowanceModelFilter = filter.value;
     state.allowanceModelFocus = null;
@@ -3281,6 +3293,7 @@ function appendModelAllowanceSummaries(container, preview) {
   grid.className = "admin-allowance-plan-summaries allowance-summary-cards";
   for (const model of modelConfig) {
     const summary = latest?.byModel[model.modelId];
+    if (adminAllowanceModelRequiresEvidence(model.modelId) && summary?.capacityUsd == null) continue;
     if (state.allowanceModelFilter === "observed"
         ? summary?.capacityUsd == null
         : state.allowanceModelFilter !== "all"

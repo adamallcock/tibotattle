@@ -6,6 +6,7 @@ import { createRequire } from 'node:module';
 import { mkdtemp, readFile, writeFile, rm, realpath, mkdir, copyFile, readdir, lstat, symlink, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { finished } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 import * as runner from '../scripts/smoke-electron-macos-production-update.mjs';
 import { captureMacTransitionProcesses, readMacTransitionProcesses } from '../scripts/smoke-electron-macos-sparkle-transition.mjs';
@@ -56,6 +57,45 @@ const replacementFixture = (target = 'darwin-arm64') => ({ ...fixture(target),
 const terraFixture = (target = 'darwin-arm64') => ({ ...fixture(target),
   schemaVersion: 'tibotattle-production-electron-update-intake-v4', version: '0.1.29',
   buildNumber: '2026102601', bundleVersion: '1037' });
+const modelSupportFixture = (target = 'darwin-arm64') => ({ ...fixture(target),
+  schemaVersion: 'tibotattle-production-electron-update-intake-v5', version: '0.1.30',
+  buildNumber: '2026112101', bundleVersion: '1038' });
+const published029 = { version: '0.1.29', sourceRevision: '905d9f9682ef472671eb87281fb35ead38711561',
+  buildNumber: '2026102601', bundleVersion: '1037' };
+test('v5 admits the allocated 030 successor and binds both immutable 029 predecessor architectures', async () => {
+  const bytes = await readFile(new URL('./fixtures/releases/v0.1.29/release-manifest.json', import.meta.url));
+  assert.equal(hash(bytes), '731b1ffe5d1c5fa9a8e38c23c439d2f77327fa045b25cf31da955a6834da446c');
+  const manifest = JSON.parse(bytes);
+  assert.equal(manifest.commit, published029.sourceRevision);
+  assert.equal(manifest.version, published029.version);
+  for (const target of ['darwin-arm64', 'darwin-x64']) {
+    const identity = modelSupportFixture(target);
+    const input = runner.validateProductionUpdateIntake(identity);
+    const artifact = manifest.artifacts.find(row => row.platform === 'macos' && row.architecture === input.architecture);
+    assert.equal(input.predecessorDmgSha256, artifact.sha256);
+    assert.equal(input.predecessorUrl, artifact.downloadUrl);
+    assert.equal(input.feedUrl, runner.validateProductionUpdateIntake(terraFixture(target)).feedUrl);
+    assert.equal(input.candidateUrl, `https://github.com/adamallcock/tibotattle/releases/download/v0.1.30/TiboTattle-0.1.30-mac-${input.architecture}.dmg`);
+    const pkg = { name: 'app-usagemonitor', version: published029.version,
+      tibotattleDistribution: createProductionDistributionMetadata({ ...published029, target }) };
+    const plist = { CFBundleIdentifier: 'com.usagemonitor.local', CFBundleShortVersionString: published029.version,
+      CFBundleVersion: published029.bundleVersion };
+    assert.deepEqual(runner.validateProductionUpdatePredecessorMetadata(input, pkg, plist), pkg.tibotattleDistribution);
+    for (const change of [{ schemaVersion: fixture().schemaVersion }, { schemaVersion: terraFixture().schemaVersion },
+      { version: '0.1.29', bundleVersion: '1037' }, { bundleVersion: '1037' }, { bundleVersion: identity.buildNumber },
+      { buildNumber: '2026112102' }, { buildNumber: 2026112101 },
+      { predecessorUrl: 'https://example.invalid' }, { feedUrl: 'https://example.invalid' }]) {
+      assert.throws(() => runner.validateProductionUpdateIntake({ ...identity, ...change }));
+    }
+    for (const change of [{ sourceRevision: 'a'.repeat(40) }, { buildNumber: identity.buildNumber },
+      { target: target === 'darwin-arm64' ? 'darwin-x64' : 'darwin-arm64' }]) {
+      const altered = structuredClone(pkg);
+      Object.assign(altered.tibotattleDistribution, change);
+      assert.throws(() => runner.validateProductionUpdatePredecessorMetadata(input, altered, plist));
+    }
+    assert.throws(() => runner.validateProductionUpdatePredecessorMetadata(input, pkg, { ...plist, CFBundleVersion: '1038' }));
+  }
+});
 test('v4 pins published 028 bytes and admits only the allocated 029 successor', async () => {
   const manifestBytes = await readFile(new URL('./fixtures/releases/v0.1.28/release-manifest.json', import.meta.url));
   assert.equal(hash(manifestBytes), '459b89538461b4249dc38e9bbcb5f7c6eb8f49b202856f3cc4f1db8a57650f89');
@@ -157,9 +197,12 @@ test('predecessor metadata refuses mixed source, build, bundle, architecture and
   }
 });
 test('live feed must bind both exact artifacts and cannot redirect the updater', () => {
-  for (const [version, bundleVersion] of [['0.1.22', '1029'], ['0.1.23', '1030'], ['0.1.27', '1035'], ['0.1.28', '1036'], ['0.1.29', '1037']]) {
+  const identities = [fixture(), { ...fixture(), version: '0.1.23', bundleVersion: '1030' },
+    currentFixture(), replacementFixture(), terraFixture(), modelSupportFixture()];
+  for (const identity of identities) {
+    const { version } = identity;
     const zip = Buffer.from('signed ZIP'), dmg = Buffer.from('signed DMG');
-    const input = runner.validateProductionUpdateIntake({ ...(version === '0.1.29' ? terraFixture() : version === '0.1.28' ? replacementFixture() : version === '0.1.27' ? currentFixture() : fixture()), version, bundleVersion, zipSha256: hash(zip), dmgSha256: hash(dmg) });
+    const input = runner.validateProductionUpdateIntake({ ...identity, zipSha256: hash(zip), dmgSha256: hash(dmg) });
     const manifest = { version, files: [[input.zipFileName, zip], [input.dmgFileName, dmg]].map(([url, b]) => ({ url, size: b.length, sha512: hash(b, 'sha512', 'base64') })),
       path: input.zipFileName, sha512: hash(zip, 'sha512', 'base64') };
     assert.equal(runner.validateProductionMacUpdateFeed(input, manifest, zip, dmg), true);
@@ -182,9 +225,12 @@ test('plan reads intake only and makes no artifact, feed, process or signed-app 
     for (const key of ['productionFeedVerified', 'signedArtifactVerified', 'disposableAccountVerified', 'updaterRelaunchedCandidate', 'candidateCopiedByRunner', 'ownedProcessesStopped']) assert.equal(result[key], false);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
-for (const [make, schema] of [[currentFixture, runner.ELECTRON_PRODUCTION_UPDATE_SCHEMA_V2],
-  [replacementFixture, runner.ELECTRON_PRODUCTION_UPDATE_SCHEMA_V3],
-  [terraFixture, runner.ELECTRON_PRODUCTION_UPDATE_SCHEMA_V4]]) test(`${schema} plan retains unqualified native and credential assertions`, async () => {
+const published026 = ['0.1.26', 'acfc385c95b49b8e1040cedfa857659b49a61d8d', '2026092701', '1034'];
+const published028 = ['0.1.28', 'bf84bc6c04372bb2cee64ef4a4f29981432fc3eb', '2026100901', '1036'];
+for (const [make, schema, published] of [[currentFixture, runner.ELECTRON_PRODUCTION_UPDATE_SCHEMA_V2, published026],
+  [replacementFixture, runner.ELECTRON_PRODUCTION_UPDATE_SCHEMA_V3, published026],
+  [terraFixture, runner.ELECTRON_PRODUCTION_UPDATE_SCHEMA_V4, published028],
+  [modelSupportFixture, runner.ELECTRON_PRODUCTION_UPDATE_SCHEMA_V5, Object.values(published029)]]) test(`${schema} plan retains unqualified native and credential assertions`, async () => {
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'production-update-plan-v2-')));
   try {
     for (const target of ['darwin-arm64', 'darwin-x64']) {
@@ -194,10 +240,8 @@ for (const [make, schema] of [[currentFixture, runner.ELECTRON_PRODUCTION_UPDATE
       assert.equal(result.status, 'planned');
       assert.equal(result.schemaVersion, schema);
       for (const key of ['version', 'buildNumber', 'bundleVersion', 'sourceRevision']) assert.equal(result[key], identity[key]);
-      assert.equal(result.predecessorVersion, make === terraFixture ? '0.1.28' : '0.1.26');
-      assert.equal(result.predecessorSourceRevision, make === terraFixture ? 'bf84bc6c04372bb2cee64ef4a4f29981432fc3eb' : 'acfc385c95b49b8e1040cedfa857659b49a61d8d');
-      assert.equal(result.predecessorBuildNumber, make === terraFixture ? '2026100901' : '2026092701');
-      assert.equal(result.predecessorBundleVersion, make === terraFixture ? '1036' : '1034');
+      assert.deepEqual([result.predecessorVersion, result.predecessorSourceRevision,
+        result.predecessorBuildNumber, result.predecessorBundleVersion], published);
       assert.equal(result.predecessorProcessesExitedNaturally, false);
       for (const key of ['productionFeedVerified', 'signedArtifactVerified', 'disposableAccountVerified',
         'updaterRelaunchedCandidate', 'candidateCopiedByRunner', 'ownedProcessesStopped', 'existingCredentialFixture', 'feedOverrideApplied']) {
@@ -481,7 +525,7 @@ test('replacement verification refreshes the real ASAR path cache after an updat
       const source = join(directory, version); await mkdir(source);
       await writeFile(join(source, 'a.txt'), padding);
       await writeFile(join(source, 'package.json'), JSON.stringify({name:'app-usagemonitor',version}));
-      await api.createPackage(source, join(directory, version + '.asar'));
+      await finished(await api.createPackage(source, join(directory, version + '.asar')));
     }
     await copyFile(join(directory, '0.1.20.asar'), archive);
     assert.equal(JSON.parse(api.extractFile(archive,'package.json').toString()).version, '0.1.20');
@@ -519,7 +563,8 @@ async function predecessorArchiveFixture(t, { source = fixtureIndexSource,
   await writeFile(join(tree, 'src', 'fixture-value.js'), 'export const value = "pinned predecessor";');
   if (link) await symlink('fixture-value.js', join(tree, 'src', 'fixture-link.js'));
   if (unpacked) await writeFile(join(tree, 'native.node'), 'unbound native bytes');
-  await api.createPackageWithOptions(tree, archive, unpacked ? { unpack: '*.node' } : {});
+  // ASAR 3.4.1 resolves to its writable stream before all archive bytes are flushed.
+  await finished(await api.createPackageWithOptions(tree, archive, unpacked ? { unpack: '*.node' } : {}));
   const input = { directory, predecessorAsarSha256: hash(await readFile(archive)) };
   return { directory, app, archive, input };
 }
@@ -544,7 +589,8 @@ test('predecessor API loads exact packed archive bytes with private permissions 
   assert.deepEqual(await scratchNames(directory), []);
 });
 
-for (const schemaVersion of ['tibotattle-production-electron-update-intake-v3', 'tibotattle-production-electron-update-intake-v4'])
+for (const schemaVersion of ['tibotattle-production-electron-update-intake-v3', 'tibotattle-production-electron-update-intake-v4',
+  'tibotattle-production-electron-update-intake-v5'])
   test(`${schemaVersion} loads and requires the verified predecessor public ingestion API`, async t => {
   const valid = await predecessorArchiveFixture(t);
   const result = await runner.withProductionUpdatePredecessorIndex({ ...valid.input,

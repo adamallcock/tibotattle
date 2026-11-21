@@ -166,10 +166,11 @@ describe("GCP current Pro 20x B' projection with retained Pro 10x and legacy pro
   it("names current reviewed models without changing a published GPT-6.1 Sol tuple", () => {
     const currentMetadata = buildCurrentPublicModelMetadata();
     expect(currentMetadata.map(entry => entry.id)).toEqual([
+      "gpt-6.2-astra", "gpt-6.2-sol",
       "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna",
       "gpt-6.1-terra", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna",
     ]);
-    expect(currentMetadata[1]).toEqual({ id: "gpt-6.1-sol", label: "GPT-6.1 Sol", family: "sol", order: 1 });
+    expect(currentMetadata[3]).toEqual({ id: "gpt-6.1-sol", label: "GPT-6.1 Sol", family: "sol", order: 3 });
     const raw = composition("pro"); raw.composition.fit.capacityUsdByModel = { "gpt-6.1-sol": 123.45 };
     const modelDay = buildCommunityModelCompositionDay({ compositions: [raw], v1ParticipantCount: 1,
       refusedParticipantCount: 0, unsupportedSourceParticipantCount: 0 }, DAY);
@@ -187,6 +188,29 @@ describe("GCP current Pro 20x B' projection with retained Pro 10x and legacy pro
     expect(missing.breakdowns.days[0]!.models).toEqual([]);
     const legacy = projectPublicAllowanceGraphForGcp(row(buildLegacyPreview(fits, NOW)), options, metadata)!;
     expect(legacy.breakdowns.modelConfig).toEqual(metadata);
+  });
+
+  it("labels Astra for Law only when the published projection contains its exact tuple", () => {
+    const modelId = "gpt-6.2-astra-law";
+    const day = "2026-11-17", otherDay = "2026-11-16";
+    const nowMs = Date.parse("2026-11-18T12:00:00.000Z");
+    const base = composition("pro");
+    const raw = { ...base, composition: { ...base.composition, latestQuotaObservedAt: `${day}T12:00:00.000Z` } };
+    raw.composition.fit.capacityUsdByModel = { [modelId]: 123.45 };
+    const modelDay = buildCommunityModelCompositionDay({ compositions: [raw], v1ParticipantCount: 1,
+      refusedParticipantCount: 0, unsupportedSourceParticipantCount: 0 }, day);
+    const preview = buildAdminCommunityAllowancePreview([], nowMs, [], {
+      modelConfig: ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG, basis: ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS,
+      gate: ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE, days: [modelDay],
+    });
+    const cache = { generated_at: preview.generatedAt, payload_json: JSON.stringify(preview) };
+    const served = projectPublicAllowanceGraphForGcp(cache, { nowMs, publishedDays: [day] }, metadata)!.breakdowns;
+    expect(served.days[0]!.models).toEqual([[modelId, 123.45, 1]]);
+    expect(served.modelConfig.at(-1)).toEqual({ id: modelId, label: "GPT-6.2 Astra for Law", family: "astra", order: 10 });
+    const filtered = projectPublicAllowanceGraphForGcp(cache, { nowMs, publishedDays: [otherDay] }, metadata)!.breakdowns;
+    expect(filtered.days).toHaveLength(1);
+    expect(filtered.days[0]!.models).toEqual([]);
+    expect(filtered.modelConfig).toEqual(buildCurrentPublicModelMetadata());
   });
 
   it("keeps retained v0.3 values byte equivalent to the v1.1 oracle under v1.3", () => {
@@ -217,6 +241,7 @@ describe("GCP current Pro 20x B' projection with retained Pro 10x and legacy pro
     // that display roster must recover every byte of the retained oracle.
     expect(JSON.stringify({ ...graph.breakdowns, modelConfig: JSON.parse(expected).modelConfig })).toBe(expected);
     expect(graph.breakdowns.modelConfig.map(({ id }) => id)).toEqual([
+      "gpt-6.2-astra", "gpt-6.2-sol",
       "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-terra",
       "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna",
     ]);

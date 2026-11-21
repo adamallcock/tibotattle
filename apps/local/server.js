@@ -317,7 +317,7 @@ function openImmutableLocalUnifiedIndex(indexFile) {
   });
 }
 
-const COLD_REFRESH_V21_PREDECESSOR_PARSERS = Object.freeze([
+const COLD_REFRESH_V22_PREDECESSOR_PARSERS = Object.freeze([
   "unified-rollout-typed-v10",
   "unified-rollout-typed-v11",
   "unified-rollout-typed-v12",
@@ -329,12 +329,13 @@ const COLD_REFRESH_V21_PREDECESSOR_PARSERS = Object.freeze([
   "unified-rollout-typed-v18",
   "unified-rollout-typed-v19",
   "unified-rollout-typed-v20",
+  "unified-rollout-typed-v21",
 ]);
 
 function publishedParserUpgradeNeedsColdRefresh(database, compatibility, schemaVersion) {
   // This is a deadline decision, not permission to read or publish facts. The
-  // worker still validates the complete index. Only reviewed v10 through v20
-  // predecessors can receive the v21 rescan window. Their physical schema and
+  // worker still validates the complete index. Only reviewed v10 through v21
+  // predecessors can receive the v22 rescan window. Their physical schema and
   // immutable source identity remain compatible; v12 nullable counters and
   // v13 ordinal-bearing compaction headers and v14 paginated setting boundaries
   // and v15 historical parent-model fallback require reparsing present sources.
@@ -344,9 +345,10 @@ function publishedParserUpgradeNeedsColdRefresh(database, compatibility, schemaV
   // v19 refreshes reviewed model identity without changing recorded usage.
   // v20 retains exact auto-review source markers for event-time allowance treatment.
   // v21 recognizes exact GPT-6.1 Terra declarations without changing recorded usage.
+  // v22 recognizes exact GPT-6.2 Astra, Sol and Astra for Law declarations.
   // Keep the target pinned too: a future parser needs an explicit review and
   // must not silently inherit this longer deadline for every mismatch.
-  if (LOCAL_UNIFIED_INDEX_PARSER_VERSION !== "unified-rollout-typed-v21"
+  if (LOCAL_UNIFIED_INDEX_PARSER_VERSION !== "unified-rollout-typed-v22"
       || schemaVersion !== LOCAL_UNIFIED_INDEX_SCHEMA_VERSION
       || !compatibility.metadataPresent
       || compatibility.formatUserVersion !== LOCAL_UNIFIED_INDEX_USER_VERSION
@@ -388,7 +390,7 @@ function publishedParserUpgradeNeedsColdRefresh(database, compatibility, schemaV
           AND g.tool_provenance_complete = 0)
       )
   `).get(generationId);
-  return COLD_REFRESH_V21_PREDECESSOR_PARSERS.includes(generation?.parser_version)
+  return COLD_REFRESH_V22_PREDECESSOR_PARSERS.includes(generation?.parser_version)
     && generation.parser_contract_version === TELEMETRY_SCHEMA_VERSION
     && generation.contract_version === TELEMETRY_SCHEMA_VERSION
     && Number.isSafeInteger(generation.completed_at_ms)

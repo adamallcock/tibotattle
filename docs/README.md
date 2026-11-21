@@ -37,7 +37,7 @@ an informal archive.
 | Usage coaching | [Usage explainer agent protocol](./reference/usage-explainer-agent-protocol.md) | Maintained plan selection, pagination, evidence lookup, model-synthesis, and claim boundaries for agents |
 | Codex plugin | [Codex plugin and installed agent interface](./reference/codex-plugin.md) | Self-contained skill, local MCP tools, installed Electron agent protocol, and confirmation-bound macOS installation |
 | Schemas | [Schema and contract lifecycle](./reference/schema-contracts.md) | Canonical owners, mirrors, generators, versioning, and retirement |
-| Local index | [Unified local index schema](./reference/unified-index-schema.md) | Current format-12 compatibility fence, parser-v21 semantics, retained schema-11 cleanup indexes, tables, generation, and migration rules |
+| Local index | [Unified local index schema](./reference/unified-index-schema.md) | Current format-12 compatibility fence, parser-v22 semantics, retained schema-11 cleanup indexes, tables, generation, and migration rules |
 | Local recovery | [Unified index preservation and recovery](./runbooks/unified-index-recovery.md) | Preservation-first diagnosis and candidate rebuild; never relabel or destroy the only index |
 | Sidebar recovery | [Collapsed dashboard sidebar rescue](./runbooks/sidebar-stranded-collapsed-rescue.md) | Current 0.1.16 recovery for persisted collapsed navigation; removes only exact window-geometry defaults |
 | Platform support | [Platform support and qualification](./reference/platform-support.md) | Released Electron 0.1.28 across four targets, exact artifact assurances and platform-specific qualification limits |

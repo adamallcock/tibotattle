@@ -101,6 +101,18 @@ test("unpriced share reflects models with no published price card", () => {
   assert.equal(unknownRow.unpricedShare, 1);
 });
 
+test("Ultrafast price epochs leave the separately qualified Fast ratio available", () => {
+  const result = summarizeWindowBreakdownRows([
+    usageRow({ model: "gpt-6.2-sol", speed: "ultrafast", inputUncached: 1_000, observedAt: "2027-03-01T07:55:00.000Z" }),
+    usageRow({ model: "gpt-6.2-sol", speed: "ultrafast", inputUncached: 1_000, observedAt: "2027-03-01T08:05:00.000Z" }),
+  ]);
+  assert.equal(result.byModel.length, 1);
+  assert.equal(result.byModel[0].fastModeFamily, "gpt-6.2-sol");
+  assert.equal(result.byModel[0].fastModeMultiplier, 2);
+  assert.equal(result.ultrafastEvents, 2);
+  assert.equal(result.ultrafastCostUsd, 0.004);
+});
+
 test("window repricing preserves missing inputs and uses observed context for output-only evidence", () => {
   for (const pricer of [null, createAccountingPricer()]) {
     for (const { context, inputs, expectedCost, unpriced } of [

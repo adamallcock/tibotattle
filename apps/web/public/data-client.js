@@ -2451,7 +2451,7 @@ const CACHE_SWITCH_ALLOWANCE_INTERPRETATION =
 const MONITORING_GAP_COPY = Object.freeze({
   quota_snapshots: ["Quota snapshots", "Current provider quota windows and their freshness."],
   account_attribution: ["Account attribution", "Whether quota and usage can be tied safely to one pseudonymous local account scope."],
-  fast_mode: ["Fast-mode accounting", "Codex can record speed in turn context or applied thread settings; older records can omit it. An observed tier always wins; a timestamp-covered config declaration comes next, and anything neither covers is attributed to Standard as a visible assumption. Fast and Ultrafast increments use published API rates for the exact model, context and date; unsupported Ultrafast remains unpriced. Window-level inference is diagnostic only and never changes the money."],
+  fast_mode: ["Fast-mode accounting", "Codex can record speed in turn context or applied thread settings; older records can omit it. An observed tier always wins; a timestamp-covered config declaration comes next, and anything neither covers is attributed to Standard as a visible assumption. Fast and Ultrafast increments use published API rates for the exact model, context and date. Configurations with only a Standard price stay unpriced in Fast and Ultrafast. Unsupported Ultrafast usage stays unpriced. Window-level inference is diagnostic only and never changes the money."],
   subagents: ["Subagents and child rollouts", "Lineage-aware accounting excludes inherited parent snapshots before attributing genuine child-rollout increments; ambiguous lineage remains unknown."],
   shared_pool_surfaces: ["Work, Workspace Agents, Excel and connected Voice", "These shared-pool surfaces may not write complete local Codex evidence."],
   third_party_auth: ["Third-party ChatGPT-authenticated apps", "No complete local accounting source is available for third-party authenticated apps."],
@@ -3562,10 +3562,9 @@ function normalizeCacheContinuityImpact(value) {
 }
 
 const OBSERVED_SPEED_KEYS = Object.freeze(["standard", "fast", "ultrafast", "unknown"]);
-// Published Priority (Fast) API price ratios over Standard, mirrored so the
-// dashboard never has to trust a server-supplied number to explain its own
-// arithmetic. Keys are canonical registered models; uncovered model/context/
-// date evidence occupies the separate disclosed assumed-2x bucket.
+// Published API price ratios over Standard. The browser projects only these
+// reviewed ratios from the companion. Uncovered Fast evidence occupies the
+// separate disclosed assumed-2x bucket.
 const FAST_MODE_MULTIPLIERS = Object.freeze({
   "gpt-4.1": 1.75,
   "gpt-4.1-mini": 1.75,
@@ -3586,17 +3585,30 @@ const FAST_MODE_MULTIPLIERS = Object.freeze({
   "gpt-6-sol": 2,
   "gpt-6-luna": 2,
   "gpt-6.1-sol": 2,
-  "gpt-6.1-terra": 2
+  "gpt-6.1-terra": 2,
+  "gpt-6.2-astra": 2,
+  "gpt-6.2-sol": 2,
 });
-const FAST_MODE_FAMILY_KEYS = Object.freeze([
-  ...Object.keys(FAST_MODE_MULTIPLIERS), "unsupported"
+// Date-qualified keys let one period carry both API price ratios without
+// flattening the promotion and list rate into an allowance multiplier.
+const ULTRAFAST_API_MULTIPLIERS = Object.freeze({
+  "gpt-6-astra": 6,
+  "gpt-6.1-sol": 6,
+  "gpt-6.2-astra:3x": 3,
+  "gpt-6.2-astra:6x": 6,
+  "gpt-6.2-sol:3x": 3,
+  "gpt-6.2-sol:6x": 6,
+});
+const SPEED_MODE_API_FAMILY_KEYS = Object.freeze([
+  ...new Set([...Object.keys(FAST_MODE_MULTIPLIERS), ...Object.keys(ULTRAFAST_API_MULTIPLIERS)]),
+  "gpt-6.2-astra-law", "unsupported",
 ]);
 const FAST_MODE_ASSUMED_MULTIPLIER = 2;
 const FAST_MODE_METRIC_LABEL = "Speed-priced API-price equivalent";
 const FAST_MODE_METRIC_SHORT_LABEL = "Speed-priced API equivalent";
 const FAST_MODE_STANDARD_METRIC_LABEL = "Standard-rate API-price equivalent";
 const FAST_MODE_METRIC_EXPLAINER =
-  "Standard-rate API prices, with Fast and Ultrafast increments priced at published API rates for the exact model, context, and date. Where no eligible Priority rate exists, Fast retains a disclosed assumed 2x Standard; unsupported Ultrafast remains unpriced. These comparisons do not measure included subscription allowance consumption.";
+  "Standard-rate API prices, with Fast and Ultrafast increments priced at published API rates for the exact model, context, and date. Configurations with only a Standard price stay unpriced in Fast and Ultrafast. Other Fast usage without an eligible Priority rate retains a disclosed assumed 2x Standard. Unsupported Ultrafast usage stays unpriced. These comparisons do not measure included subscription allowance consumption.";
 const ALLOWANCE_SCENARIOS = Object.freeze([
   "unresolved_as_standard",
   "unresolved_as_fast"
@@ -3828,7 +3840,7 @@ function normalizeCompactTimelineAllowanceWeighting(
 function normalizeSpeedWeighting(value) {
   return Object.fromEntries(OBSERVED_SPEED_KEYS.map((speed) => [
     speed,
-    Object.fromEntries(FAST_MODE_FAMILY_KEYS.map((family) => {
+    Object.fromEntries(SPEED_MODE_API_FAMILY_KEYS.map((family) => {
       const cell = value?.[speed]?.[family] ?? {};
       return [family, {
         events: count(cell.events, 0),
@@ -3853,7 +3865,7 @@ function normalizeFastMode(value) {
     metricExplainer: FAST_MODE_METRIC_EXPLAINER,
     standardMetricLabel: FAST_MODE_STANDARD_METRIC_LABEL,
     multipliers: { ...FAST_MODE_MULTIPLIERS },
-    ultrafastMultipliers: { "gpt-6-astra": 6 },
+    ultrafastMultipliers: { ...ULTRAFAST_API_MULTIPLIERS },
     quotaWeightedApiPriceEquivalentUsd: nonNegative(
       value?.quotaWeightedApiPriceEquivalentUsd,
       null
@@ -3874,8 +3886,9 @@ function normalizeFastMode(value) {
       0
     ),
     appliedMultipliers: {
-      ...(finite(value?.appliedMultipliers?.["ultrafast:gpt-6-astra"], null) !== null
-        ? { "ultrafast:gpt-6-astra": 6 } : {}),
+      ...Object.fromEntries(Object.entries(ULTRAFAST_API_MULTIPLIERS)
+        .map(([family, ratio]) => [`ultrafast:${family}`, ratio])
+        .filter(([key]) => finite(value?.appliedMultipliers?.[key], null) !== null)),
       ...Object.fromEntries(
         Object.keys(FAST_MODE_MULTIPLIERS)
           .filter((family) => finite(value?.appliedMultipliers?.[family], null) !== null)

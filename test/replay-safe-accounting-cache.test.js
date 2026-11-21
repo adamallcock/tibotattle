@@ -1334,7 +1334,7 @@ test("the same lineage-aware scan produces a bounded weekly calibration summary"
   assert.equal(fastCapacity.basis.unresolvedScenario, "unresolved_as_fast");
   assert.equal(
     standardCapacity.basis.multiplierRegistryRecordedAt,
-    "2026-10-26",
+    "2026-11-21",
   );
   assert.equal(
     standardCapacity.calibration.validation.selectedCostBasis,
@@ -4634,6 +4634,57 @@ test("Ultrafast replay weights Astra once and withholds unsupported Sol without 
       assert.equal(weighted.unweightedUnknownApiPriceEquivalentUsd, standard);
     }
   }
+});
+
+test("replay prices observed and declared GPT-6.2 Ultrafast at the exact epoch boundary", async () => {
+  const boundary = Date.parse("2027-03-01T08:00:00.000Z");
+  const timestamps = [boundary - 1, boundary].map(ms => new Date(ms).toISOString());
+  const cache = await buildReplaySafeAccountingCache({
+    now: () => boundary + 1,
+    scan: scanner(timestamps.flatMap(timestamp => [
+      usageEvent({ timestamp, model: "gpt-6.2-astra", speed: "ultrafast",
+        components: { input_uncached_tokens: 1_000 } }),
+      usageEvent({ timestamp, model: "gpt-6.2-sol", speed: "unknown",
+        components: { input_uncached_tokens: 1_000 } }),
+    ])),
+    declaredSpeedBaselines: [{
+      firstSeenAt: timestamps[0], lastSeenAt: timestamps[1], mode: "ultrafast",
+    }],
+  });
+  assert.doesNotThrow(() => assertReplaySafeAccountingCache(cache));
+  const period = cache.periods.find(row => row.id === "all");
+  assert.equal(period.events, 4);
+  assert.equal(period.totalTokens, 4_000);
+  assert.equal(period.apiPriceEquivalentUsd, 0.02);
+  const weighted = summarizeQuotaWeightedAccounting({
+    speedWeighting: period.speedWeighting,
+    declaredSpeedWeighting: period.declaredSpeedWeighting,
+  });
+  assert.equal(weighted.weightingStatus, "complete");
+  assert.equal(weighted.coverage.observedEvents, 2);
+  assert.equal(weighted.coverage.declaredFromConfigEvents, 2);
+  assert.equal(weighted.quotaWeightedApiPriceEquivalentUsd, 0.09);
+  assert.equal(weighted.unweightedUnknownApiPriceEquivalentUsd, 0);
+});
+
+test("replay retains Standard-equivalent Astra for Law totals when Fast weighting is unavailable", async () => {
+  const timestamp = "2026-11-17T18:00:00.000Z";
+  const cache = await buildReplaySafeAccountingCache({
+    now: () => Date.parse(timestamp) + 1,
+    scan: scanner([usageEvent({ timestamp, model: "gpt-6.2-astra-law", speed: "fast",
+      components: { input_uncached_tokens: 1_000 } })]),
+  });
+  assert.doesNotThrow(() => assertReplaySafeAccountingCache(cache));
+  const period = cache.periods.find(row => row.id === "all");
+  assert.equal(period.events, 1);
+  assert.equal(period.totalTokens, 1_000);
+  assert.equal(period.apiPriceEquivalentUsd, 0.008);
+  assert.equal(period.bySpeed.fast.events, 1);
+  const weighted = summarizeQuotaWeightedAccounting({ speedWeighting: period.speedWeighting });
+  assert.equal(weighted.weightingStatus, "unknown");
+  assert.equal(weighted.coverage.observedEvents, 1);
+  assert.equal(weighted.quotaWeightedApiPriceEquivalentUsd, null);
+  assert.equal(weighted.unweightedUnknownApiPriceEquivalentUsd, 0.008);
 });
 
 test("memoized accounting matches reviewed context boundaries and nullable observations", () => {

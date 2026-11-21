@@ -1729,7 +1729,8 @@ test("an available shared-period search with no rows is empty rather than unavai
 test("model filter uses shared identity order and sends the exact selected ID", async () => {
   const { root, windowRef } = mountedRoot();
   const requests = [];
-  const models = ["gpt-5.5", "gpt-5.6-luna", "gpt-6-astra", "gpt-5.6-terra", "gpt-5.6-sol-wm", "gpt-5.4-mini", "gpt-6.1-terra", "gpt-5.4", "unreviewed-model"];
+  const models = ["gpt-5.5", "gpt-5.6-luna", "gpt-6-astra", "gpt-5.6-terra", "gpt-5.6-sol-wm",
+    "gpt-5.4-mini", "gpt-6.1-terra", "gpt-5.4", "gpt-6.2-sol", "unreviewed-model", "gpt-6.2-astra", "gpt-6.2-astra-law"];
   const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
     fetchRef: async (_url, init) => {
       requests.push(JSON.parse(init.body));
@@ -1739,8 +1740,20 @@ test("model filter uses shared identity order and sends the exact selected ID", 
     await settleMountedView();
     const picker = findMounted(root, node => node.classList.contains("model-picker"))[0];
     assert.deepEqual(picker.options.map(option => option.value),
-      ["", "gpt-6-astra", "gpt-5.6-sol-wm", "gpt-6.1-terra", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "unreviewed-model"]);
-    const astra = picker.options[1];
+      ["", "gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.2-astra-law", "gpt-6-astra", "gpt-5.6-sol-wm", "gpt-6.1-terra",
+        "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "unreviewed-model"]);
+    for (const [id, label] of [["gpt-6.2-astra", "GPT-6.2 Astra"], ["gpt-6.2-sol", "GPT-6.2 Sol"],
+      ["gpt-6.2-astra-law", "GPT-6.2 Astra for Law"]]) {
+      const option = picker.options.find(option => option.value === id);
+      assert.equal(option.textContent, label);
+      assert.equal(option.title, id);
+      picker.value = id;
+      picker.dispatchEvent({ type: "change" });
+      await settleMountedView();
+      assert.equal(requests.at(-1).model, id);
+      assert.equal(picker.value, id);
+    }
+    const astra = picker.options[4];
     assert.equal(astra.textContent, "GPT-6 Astra");
     assert.equal(astra.children[0].getAttribute("aria-hidden"), "true");
     assert.equal(astra.title, "gpt-6-astra");

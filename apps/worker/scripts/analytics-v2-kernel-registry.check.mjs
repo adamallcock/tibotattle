@@ -116,6 +116,9 @@ const REGISTRY_PINS = Object.freeze([
   // Kernel 22: this line's Terra catalog/pricing and scientific-plan successor,
   // with the exact retained-preview compatibility patch and compute closure.
   "4d97cafbcd47b3426a0af21122c728b1d56ee2678b05df00a10587b25bc58f3d",
+  // Kernel 23: GPT-6.2 in shared telemetry and the authored preview.
+  // The pinned owner kernels keep their v0.10 prices and source commit.
+  "a3f5659dcc61cd878f79a1b87bb5663f5aed06cc766c2d5194d1a3ad9d938da6",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];

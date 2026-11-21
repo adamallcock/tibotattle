@@ -107,13 +107,22 @@ allowance. Unknown labels are withheld or fingerprinted at the existing export
 boundary, never copied into admin labels. Legacy telemetry enum positions remain
 stable; newly reviewed values append.
 
-The export registry advances to `telemetry-v0.1-registry-2026-09-29.1` with its
-closed schema and generated compatibility dictionary. Disabled legacy upload
-contracts remain disabled; this vocabulary change does not enable contribution
-or alter consent. Reparse retained source before claiming to recover a model that
-an older extractor normalized to unknown. Admin model history has an independent,
-versioned compact projection; historical absence is not zero observations for a
-newly added model.
+The export registry `telemetry-v0.1-registry-2026-11-17.1` appends the exact
+`gpt-6.2-astra`, `gpt-6.2-sol`, and `gpt-6.2-astra-law` model IDs. Each maps to
+its own price identity. GPT-6.2 Astra and GPT-6.2 Sol support Low, Medium, High,
+Extra High, Max, and Ultra in Codex. The request projection maps Ultra to `xhigh`
+while cache comparison retains the distinct Ultra configuration. See the
+[Codex CLI model catalog](https://github.com/openai/codex/blob/rust-v0.170.0/codex-rs/models-manager/models.json).
+GPT-6.2 Astra for Law records usage under its exact ID when observed. OpenAI
+requires Trusted Access approval for this configuration and lists Standard mode
+at launch. See the [Enterprise rate card](https://help.openai.com/en/articles/20001415-chatgpt-rate-card-enterprise-token-based-pricing).
+
+The v1.1 and v1.2 usage records already accept these IDs under their bounded
+token grammar. The existing legacy and performance model allowlists append the
+three exact identities. Contribution gates and consent retain their existing
+versions. Reparse retained source to recover an identity an older extractor
+normalized to unknown. Admin history preserves the October 26 catalog's 44
+model configuration and tuple coverage alongside the November 17 catalog.
 
 ### Performance speed vocabulary and retained authorization
 

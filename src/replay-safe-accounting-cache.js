@@ -1526,11 +1526,16 @@ function transitionUsageProjection(event, projection) {
   ));
   const costUsd = Number(projection.priced.totalUsd);
   const multiplier = FAST_MODE_QUOTA_MULTIPLIERS[projection.fastModeFamily] ?? null;
-  // The scenario retains the owner-approved assumed ratio when Priority
-  // context/date evidence is missing. The period crossing reports that
-  // Standard cost separately in the explicit unsupported/assumed bucket.
-  const fastWeightedEquivalentUsd =
-    costUsd * (multiplier ?? FAST_MODE_ASSUMED_MULTIPLIER);
+  // The scenario retains the disclosed assumed ratio when Priority
+  // context/date evidence is missing. For Astra for Law, the pricing policy
+  // keeps unpublished Fast rates unavailable.
+  const fastMultiplier = projection.model === "gpt-6.2-astra-law"
+    ? quotaWeightedApiPriceEquivalent({
+      apiPriceEquivalentUsd: costUsd, model: projection.model, mode: "fast",
+      eventTime: event.timestamp, standardPriceCardIds: projection.priced.selectedPriceCardIds,
+    }).multiplier
+    : multiplier ?? FAST_MODE_ASSUMED_MULTIPLIER;
+  const fastWeightedEquivalentUsd = fastMultiplier === null ? null : costUsd * fastMultiplier;
   const effectiveSpeed = ["standard", "fast", "ultrafast"].includes(projection.speed)
     ? projection.speed
     : ["standard", "fast", "ultrafast"].includes(projection.declaredSpeed)

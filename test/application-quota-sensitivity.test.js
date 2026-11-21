@@ -314,6 +314,44 @@ test("Ultrafast remains unavailable for unsupported models or incomplete event e
   assert.deepEqual(mixed.scenarios.ultrafast.modelMultipliers, { "gpt-6-astra": 6, "gpt-6.1-sol": null });
 });
 
+test("GPT-6.2 Ultrafast sensitivity requires event evidence and respects the API price cutover", () => {
+  for (const model of ["gpt-6.2-astra", "gpt-6.2-sol"]) {
+    for (const [eventTime, ratio] of [
+      [undefined, null],
+      ["2026-11-16T23:59:59.999Z", null],
+      ["2026-11-17T12:00:00.000Z", 3],
+      ["2027-03-01T07:59:59.999Z", 3],
+      ["2027-03-01T08:00:00.000Z", 6],
+    ]) {
+      const result = application.subscriptionSpeedSensitivity({
+        [model]: { costUsd: 2, priceEvidence: { eventTime, totalInputContextTokens: 1000 } },
+      }, "ultrafast");
+      const scenario = result.scenarios.ultrafast;
+      assert.equal(scenario.modelMultipliers[model], ratio);
+      assert.equal(scenario.complete, ratio !== null);
+      assert.equal(scenario.weightedStandardApiEquivalentUsd, ratio === null ? null : 2 * ratio);
+    }
+  }
+});
+
+test("Astra Law sensitivity retains Standard cost without applying the Fast fallback", () => {
+  const model = "gpt-6.2-astra-law";
+  const result = application.subscriptionSpeedSensitivity({
+    [model]: {
+      costUsd: 2,
+      priceEvidence: { eventTime: "2026-11-17T12:00:00.000Z", totalInputContextTokens: 1_000 },
+    },
+  }, "fast", {
+    speedWeightingByModel: { [model]: { unknown: { [model]: { events: 1, apiPriceEquivalentUsd: 2 } } } },
+  });
+  assert.equal(result.scenarios.standard.weightedStandardApiEquivalentUsd, 2);
+  assert.equal(result.scenarios.fast.weightedStandardApiEquivalentUsd, null);
+  assert.equal(result.scenarios.fast.unweightedStandardApiEquivalentUsd, 2);
+  assert.equal(result.scenarios.fast.assumedRatioStandardApiEquivalentUsd, 0);
+  assert.equal(result.scenarios.fast.complete, false);
+  assert.equal(result.modelMultipliers[model], null);
+});
+
 test("production modules no longer depend on the legacy tier shim", async () => {
   const productionRoots = ["apps", "packages", "src"].map((directory) =>
     resolve(REPOSITORY_ROOT, directory)

@@ -219,6 +219,7 @@ const DECIMAL = /^(?:0|[1-9]\d*)(?:\.\d+)?$/u;
 const INTEGER_STRING = /^(?:0|[1-9]\d{0,17})$/u;
 const DAY = /^\d{4}-\d{2}-\d{2}$/u;
 const INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/u;
+const CARD_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 const LABEL = /^[^\p{C}]{1,80}$/u;
 const NOTE = /^[^\p{C}]{1,1024}$/u;
 const MAX_URL_LENGTH = 512;
@@ -288,6 +289,19 @@ function isInstant(value: unknown): value is string {
   return Number.isFinite(parsed.getTime()) && `${parsed.toISOString().slice(0, 19)}Z` === value;
 }
 
+function isCardBoundary(value: unknown): value is string {
+  if (isDay(value)) return true;
+  if (typeof value !== "string" || !CARD_INSTANT.test(value)) return false;
+  const parsed = new Date(value);
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString() === value;
+}
+
+/** Date-only bounds cover the entire UTC day; instant bounds are inclusive. */
+function cardBound(value: string, side: "from" | "to"): string {
+  if (value.length !== 10) return value;
+  return `${value}${side === "from" ? "T00:00:00.000Z" : "T23:59:59.999Z"}`;
+}
+
 function httpsUrl(value: unknown, path: string): string {
   if (typeof value !== "string" || value.length > MAX_URL_LENGTH || /[\s\p{C}]/u.test(value)) cards(path);
   let parsed: URL;
@@ -346,9 +360,10 @@ function validateCardStructure(card: unknown, index: number, priceBasis: string)
   }
   const effective = closedKeys(value.effective, [], ["from", "to"], `${path}.effective`, cards);
   for (const key of ["from", "to"]) {
-    if (Object.hasOwn(effective, key) && !isDay(effective[key])) cards(`${path}.effective.${key}`);
+    if (Object.hasOwn(effective, key) && !isCardBoundary(effective[key])) cards(`${path}.effective.${key}`);
   }
-  if (typeof effective.from === "string" && typeof effective.to === "string" && effective.from > effective.to) {
+  if (typeof effective.from === "string" && typeof effective.to === "string"
+      && cardBound(effective.from, "from") > cardBound(effective.to, "to")) {
     cards(`${path}.effective`);
   }
 
@@ -386,7 +401,7 @@ function validateCardStructure(card: unknown, index: number, priceBasis: string)
   array(provenance.evidence_urls, 1, 32, `${path}.metadata.provenance.evidence_urls`, cards)
     .forEach((url, urlIndex) => httpsUrl(url, `${path}.metadata.provenance.evidence_urls[${urlIndex}]`));
   for (const key of ["vendor_effective_from", "vendor_effective_to"]) {
-    if (provenance[key] !== null && !isDay(provenance[key])) cards(`${path}.metadata.provenance.${key}`);
+    if (provenance[key] !== null && !isCardBoundary(provenance[key])) cards(`${path}.metadata.provenance.${key}`);
   }
   if (!HISTORICAL_VALIDITY.includes(provenance.historical_validity as string)) {
     cards(`${path}.metadata.provenance.historical_validity`);
@@ -423,9 +438,9 @@ function validateCardStructure(card: unknown, index: number, priceBasis: string)
 }
 
 function rangeOverlap(left: PriceCard, right: PriceCard): boolean {
-  const l = left.effective as { from?: string; to?: string };
-  const r = right.effective as { from?: string; to?: string };
-  return (l.from ?? "0000-00-00") <= (r.to ?? "9999-99-99") && (r.from ?? "0000-00-00") <= (l.to ?? "9999-99-99");
+  const l = normalizedEffectiveRange(left);
+  const r = normalizedEffectiveRange(right);
+  return l.from <= r.to && r.from <= l.to;
 }
 
 function sameContext(left: PriceCard, right: PriceCard): boolean {
@@ -434,9 +449,15 @@ function sameContext(left: PriceCard, right: PriceCard): boolean {
 }
 
 function sameEffective(left: PriceCard, right: PriceCard): boolean {
-  const l = left.effective as { from?: string; to?: string };
-  const r = right.effective as { from?: string; to?: string };
-  return (l.from ?? null) === (r.from ?? null) && (l.to ?? null) === (r.to ?? null);
+  const l = normalizedEffectiveRange(left);
+  const r = normalizedEffectiveRange(right);
+  return l.from === r.from && l.to === r.to;
+}
+
+function normalizedEffectiveRange(card: PriceCard) {
+  const { from, to } = card.effective as { from?: string; to?: string };
+  return { from: from === undefined ? "" : cardBound(from, "from"),
+    to: to === undefined ? "\uffff" : cardBound(to, "to") };
 }
 
 function bandOf(card: PriceCard): "short" | "long" | null {

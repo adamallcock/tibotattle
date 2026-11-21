@@ -86,13 +86,13 @@ Compare the copy with the current constants in `src/local-unified-index.js`:
 
 - schema family `local-unified-index-v2`;
 - `user_version`, format, minimum reader and minimum writer versions 12;
-- parser `unified-rollout-typed-v21`; and
+- parser `unified-rollout-typed-v22`; and
 - source identity `codex-immutable-rollout-v1`.
 
 Version 12 is a forward-only interpretation fence: it changes no columns or
 tables, but older applications must refuse the new semantics. Recognized
 versions 10 and 11 migrate on a staged copy. Still-present older-parser sources
-are rescanned under v21; facts whose sources have rotated away retain their
+are rescanned under v22; facts whose sources have rotated away retain their
 original classification and parser provenance. A matching format does not prove
 a completed parser refresh.
 
@@ -139,19 +139,21 @@ event's timestamp, inclusive from `2026-10-06T00:00:00.000Z`; that UTC boundary
 is a product convention. Tokens and API-price evidence remain retained. Missing
 source metadata cannot retroactively prove separate-allowance eligibility.
 
-Parser v21 recognizes exact GPT-6.1 Terra declarations from sources that are
-still present. Reprocessing preserves occurrence identities and token totals;
-rotated or absent sources keep their original unknown-model evidence and parser
-stamps. Physical format 12 and the source-identity contract remain unchanged.
-Never relabel stored unknown rows to Terra or infer a speed/timing observation.
+Parser v21 added exact GPT-6.1 Terra declarations. Parser v22 adds exact
+GPT-6.2 Astra, Sol, and Astra for Law declarations from sources that are still
+present.
+Reprocessing preserves occurrence identities and token totals. Rotated or absent
+sources keep their original model evidence and parser stamps. Physical format 12
+and the source-identity contract still apply. Speed and timing depend on their
+own source evidence.
 
 These parser changes preserve the `codex-immutable-rollout-v1` source-identity
 contract. The separate format-12 fence prevents older readers from silently
 reinterpreting auto-review; never relabel retained facts to the new parser.
 
 The companion grants the bounded four-hour cold-refresh deadline only to the
-reviewed published v10 through v20 to v21 parser transitions. The target is
-pinned to v21; a future parser must review its predecessor set explicitly. Physical
+reviewed published v10 through v21 to v22 parser transitions. The target is
+pinned to v22; a future parser must review its predecessor set explicitly. Physical
 schema, reader/writer compatibility, source identity, and telemetry contracts
 must match, and the published generation must be complete or one of the
 already supported quarantine/tool-provenance partial states. Only the current

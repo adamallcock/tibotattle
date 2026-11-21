@@ -42,7 +42,7 @@ const ingest = value => ingestLocalUnifiedIndexIncrement({ codexHome: value.code
   contractVersion: TELEMETRY_SCHEMA_VERSION });
 
 test('fixed historical fixture is Standard short context at the reviewed effective interval and has visible nonzero cost', () => {
-  assert.equal(LOCAL_UNIFIED_INDEX_PARSER_VERSION, 'unified-rollout-typed-v21',
+  assert.equal(LOCAL_UNIFIED_INDEX_PARSER_VERSION, 'unified-rollout-typed-v22',
     'advancing the qualification successor requires explicit review');
   const components = { input_uncached_tokens: 10_000, input_cache_read_tokens: 90_000,
     input_cache_write_tokens: 0, output_text_tokens: 10_000, output_reasoning_tokens: 0 };
@@ -69,8 +69,8 @@ test('actual public APIs repair once, replay safely and preserve priced history 
       JOIN source_cursor c ON c.source_local=u.source_local JOIN ingest_run r ON r.id=c.ingest_run_id
       JOIN parser_version cp ON cp.id=r.parser_version_id ORDER BY m.model_id`).all();
     assert.deepEqual(rows.map(row => ({ ...row })), [
-      { model: 'gpt-5.6-sol', parser: 'unified-rollout-typed-v21', cursorParser: 'unified-rollout-typed-v21' },
-      { model: 'gpt-5.6-sol', parser: 'unified-rollout-typed-v21', cursorParser: 'unified-rollout-typed-v21' },
+      { model: 'gpt-5.6-sol', parser: 'unified-rollout-typed-v22', cursorParser: 'unified-rollout-typed-v22' },
+      { model: 'gpt-5.6-sol', parser: 'unified-rollout-typed-v22', cursorParser: 'unified-rollout-typed-v22' },
       { model: 'unknown', parser: 'unified-rollout-typed-v18', cursorParser: 'unified-rollout-typed-v18' },
     ]);
   } finally { seeded.close(); }
@@ -218,7 +218,8 @@ test('persisted occurrence identity, token totals and parser repair are mandator
     database.prepare('UPDATE usage_event SET source_offset=? WHERE event_key=?').run(selected.source_offset, selected.event_key);
     const cursor = database.prepare('SELECT ingest_run_id FROM source_cursor WHERE source_local=?').get(selected.source_local);
     for (const parser of ['unified-rollout-typed-v18', 'unified-rollout-typed-v19',
-      'unified-rollout-typed-v20', 'unified-rollout-typed-v22', 'unified-rollout-typed-v21-partial']) {
+      'unified-rollout-typed-v20', 'unified-rollout-typed-v21', 'unified-rollout-typed-v23',
+      'unified-rollout-typed-v22-partial']) {
       database.prepare('INSERT OR IGNORE INTO parser_version(parser_version,contract_version) VALUES (?,?)')
         .run(parser, TELEMETRY_SCHEMA_VERSION);
       const parserId = database.prepare('SELECT id FROM parser_version WHERE parser_version=? AND contract_version=?')

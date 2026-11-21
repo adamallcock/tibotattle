@@ -93,11 +93,17 @@ function syntheticCard(model = "synthetic-unseen-model-km1"): PriceCard {
 }
 
 describe("baseline projection (manifest version 1)", () => {
-  it("preserves the immutable cutover file while current Worker and vendored packages agree", async () => {
+  it("preserves the immutable cutover file and the exact vendored registry predecessor", async () => {
     const fromPackages = compiledBaselineCatalogManifest();
     expect(canonicalCatalogPayloadText(fromPackages)).toBe(JSON.stringify(committedBaseline));
-    expect(JSON.stringify(vendoredRegistry.APP_OFFICIAL_PRICE_CARDS)).toBe(JSON.stringify(APP_OFFICIAL_PRICE_CARDS));
-    expect(vendoredRegistry.APP_PRICE_REGISTRY_MANIFEST.sha256).toBe(APP_PRICE_REGISTRY_MANIFEST.sha256);
+    expect(vendoredRegistry.APP_PRICE_REGISTRY_MANIFEST.version).toBe("app-official-api-prices-v0.10");
+    expect(vendoredRegistry.APP_PRICE_REGISTRY_MANIFEST.sha256)
+      .toBe("206544769b43e4b9645284258edd38f7c07a226022db10f5ec0181335df236ab");
+    expect(await webCryptoSha256Hex(JSON.stringify(vendoredRegistry.APP_OFFICIAL_PRICE_CARDS)))
+      .toBe(vendoredRegistry.APP_PRICE_REGISTRY_MANIFEST.sha256);
+    const retainedIds = new Set(vendoredRegistry.APP_OFFICIAL_PRICE_CARDS.map(({ id }) => id));
+    expect(APP_OFFICIAL_PRICE_CARDS.filter(({ id }) => retainedIds.has(id)))
+      .toEqual(vendoredRegistry.APP_OFFICIAL_PRICE_CARDS);
     expect(fromPackages.version).toBe(CATALOG_BASELINE_RELEASE.version);
     expect(fromPackages.projectedFromCommit).toBe("d43c8f92a059d9c577776f7eca8a331eb305b8a6");
     // Current compiled packages may advance; version 1 never changes identity.
@@ -105,13 +111,14 @@ describe("baseline projection (manifest version 1)", () => {
     expect(await webCryptoSha256Hex(JSON.stringify(committedBaseline))).toBe(CATALOG_BASELINE_DIGEST);
   });
 
-  it("reproduces the historical v0.8 registry SHA without relabeling current v0.10", async () => {
+  it("reproduces the historical v0.8 registry SHA alongside current v0.11", async () => {
     const manifest = await validateCatalogManifest(clone(committedBaseline), webCryptoSha256Hex);
     expect(manifest.compat.registrySha256).toBe("48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9");
     expect(await webCryptoSha256Hex(JSON.stringify(activeCatalogPriceCards(manifest))))
       .toBe(manifest.compat.registrySha256);
     expect(manifest.compat.registryVersion).toBe("app-official-api-prices-v0.8");
-    expect(APP_PRICE_REGISTRY_MANIFEST.version).toBe("app-official-api-prices-v0.10");
+    expect(APP_PRICE_REGISTRY_MANIFEST.version).toBe("app-official-api-prices-v0.11");
+    expect(APP_PRICE_REGISTRY_MANIFEST.sha256).toBe("eca860219a79a24a2cc1ba07471e2ecc321281508dc7e8d48412deef77609c77");
     expect(APP_PRICE_REGISTRY_MANIFEST.sha256).not.toBe(manifest.compat.registrySha256);
     assertCatalogCompiledAssertions(manifest, COMPILED_CATALOG_INPUTS);
   });
@@ -133,6 +140,8 @@ describe("baseline projection (manifest version 1)", () => {
     expect(current.compat.registrySha256).toBe(APP_PRICE_REGISTRY_MANIFEST.sha256);
     expect(current.models.some((model) => model.id === "gpt-6.1-sol")).toBe(true);
     expect(current.models.some((model) => model.id === "gpt-6.1-terra")).toBe(true);
+    expect(current.models.slice(-3).map(({ id }) => id))
+      .toEqual(["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.2-astra-law"]);
     expect(current.plans.some((plan) => plan.id === "promax")).toBe(true);
     const signer = await syntheticSigner();
     const { envelopeText } = await signer.sign(current);
@@ -144,10 +153,11 @@ describe("baseline projection (manifest version 1)", () => {
     const context = { priceEpochBasis: "event_time_when_registry_has_effective_evidence" } as const;
     let events = 0;
     let priced = 0;
-    const days = (card: PriceCard) => {
+    const eventTimes = (card: PriceCard) => {
       const effective = card.effective as { from?: string; to?: string };
       return [...new Set([effective.from, effective.to, "2026-03-01", "2026-08-01", "2026-09-15", "2026-10-02"]
-        .filter((day): day is string => day !== undefined))];
+        .filter((time): time is string => time !== undefined)
+        .map((time) => time.length === 10 ? `${time}T12:00:00.000Z` : time))];
     };
     for (const card of [...APP_OFFICIAL_PRICE_CARDS, syntheticCard()] as PriceCard[]) {
       const metadata = card.metadata as Record<string, unknown>;
@@ -156,13 +166,13 @@ describe("baseline projection (manifest version 1)", () => {
       const contexts = band === "short" ? [conditions.max_total_input_tokens, "1000"]
         : band === "long" ? [conditions.min_total_input_tokens, "400000"] : ["1000", "300000"];
       for (const name of [card.model, ...((card.aliases ?? []) as string[])]) {
-        for (const day of days(card)) {
+        for (const pricedAt of eventTimes(card)) {
           for (const totalInputContextTokens of contexts) {
             const event = {
               provider: card.provider,
               model: name,
               apiTier: card.service_tier,
-              pricedAt: `${day}T12:00:00.000Z`,
+              pricedAt,
               totalInputContextTokens,
               components: card.provider === "openai"
                 ? { inputUncachedTokens: 1234, inputCacheReadTokens: 5678, inputCacheWriteTokens: 91,
@@ -299,6 +309,33 @@ describe("closed schema", () => {
       .toBe("CATALOG_PAYLOAD_NOT_CANONICAL");
     expect(await codeOf(() => parseCanonicalCatalogPayload(text.replace('"version":1,', '"version":1,"version":1,'))))
       .toBe("CATALOG_PAYLOAD_NOT_CANONICAL");
+  });
+
+  it("validates inclusive UTC card windows across full days and exact instants", async () => {
+    const instant = "2027-03-01T08:00:00.000Z";
+    const build = (from: string, to: string) => {
+      const manifest = compiledBaselineCatalogManifest();
+      const first = { ...syntheticCard(), effective: { from: "2027-02-28", to } };
+      const second = { ...syntheticCard(), id: `${first.id}:next`, effective: { from } };
+      manifest.priceCards.push(first, second);
+      return manifest;
+    };
+    expect(await codeOf(() => validateCatalogManifestPayload(build(instant, "2027-03-01T07:59:59.999Z"))))
+      .toBe("NO_ERROR");
+    for (const to of ["2027-03-01", instant]) {
+      expect(await codeOf(() => validateCatalogManifestPayload(build(instant, to))))
+        .toBe("CATALOG_PRICE_CARDS_INVALID");
+    }
+    for (const from of ["2027-03-01T00:00:00.000-08:00", "2027-02-29T08:00:00.000Z", "2027-03-01T08:00:00Z"]) {
+      expect(await codeOf(() => validateCatalogManifestPayload(build(from, "2027-02-28"))))
+        .toBe("CATALOG_PRICE_CARDS_INVALID");
+    }
+    const manifest = compiledBaselineCatalogManifest();
+    const card = { ...syntheticCard(), effective: { from: instant, to: "2027-03-01" } };
+    manifest.priceCards.push(card);
+    expect(await codeOf(() => validateCatalogManifestPayload(manifest))).toBe("NO_ERROR");
+    card.effective.to = "2027-03-01T07:59:59.999Z";
+    expect(await codeOf(() => validateCatalogManifestPayload(manifest))).toBe("CATALOG_PRICE_CARDS_INVALID");
   });
 
   it("refuses a manifest whose registry SHA does not match its active cards", async () => {

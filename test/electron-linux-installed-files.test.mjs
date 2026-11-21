@@ -29,11 +29,12 @@ test('ZIP extraction refuses unexpected, duplicate and symlink entries before wr
   }
 });
 
-for (const [route, version, buildNumber] of [['v1', '0.1.27', '2026100301'], ['v2', '0.1.28', '2026100901'], ['v3', '0.1.29', '2026102601']])
+for (const [route, version, buildNumber] of [['v1', '0.1.27', '2026100301'], ['v2', '0.1.28', '2026100901'],
+  ['v3', '0.1.29', '2026102601'], ['v4', '0.1.30', '2026112101']])
   test(`${version} runner admission proves ancestry and same-version source without implying execution`, async t => {
-  const { preflightLinuxFinalIntake, LINUX_FINAL_SCHEMA, LINUX_FINAL_SCHEMA_V2, LINUX_FINAL_SCHEMA_V3, LINUX_FINAL_CONFIRMATION } = await import('../scripts/lib/linux-final-artifact-intake.mjs');
+  const { preflightLinuxFinalIntake, LINUX_FINAL_CONFIRMATION } = await import('../scripts/lib/linux-final-artifact-intake.mjs');
   const { productionElectronCandidatePlan } = await import('../scripts/package-electron-production.mjs');
-  const schemaVersion = route === 'v1' ? LINUX_FINAL_SCHEMA : route === 'v2' ? LINUX_FINAL_SCHEMA_V2 : LINUX_FINAL_SCHEMA_V3;
+  const schemaVersion = `tibotattle-linux-final-lifecycle-intake-${route}`;
   const root = await mkdtemp(join(await realpath(tmpdir()), 'linux-final-ancestry-')); t.after(() => rm(root, { recursive: true, force: true }));
   const git = args => {
     const result = spawnSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });

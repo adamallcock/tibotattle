@@ -1350,7 +1350,7 @@ describe("community allowance from the v1.0 chunk corpus", () => {
     await seedV1Device(participantId, "v1-device-solo", "v1-session-solo");
     await seedThreeV1Resets(participantId, "v1-device-solo", 5, "solo");
 
-    const fits = await collectCommunityAllowanceFits(db());
+    const fits = await collectCommunityAllowanceFits(db(), SCALE_NOW);
     expect(fits.length).toBeGreaterThanOrEqual(3);
     for (const one of fits) {
       expect(one.participantId).toBe(participantId);
@@ -1387,7 +1387,7 @@ describe("community allowance from the v1.0 chunk corpus", () => {
       });
     }
 
-    const fits = await collectCommunityAllowanceFits(db());
+    const fits = await collectCommunityAllowanceFits(db(), SCALE_NOW);
     expect(fits.length).toBeGreaterThanOrEqual(3);
     for (const one of fits) expect(one.capacityNanousd).toBeGreaterThan(0);
     const summary = summarizeCommunityAllowanceDay(fits, "2026-07-27");
@@ -1403,7 +1403,7 @@ describe("community allowance from the v1.0 chunk corpus", () => {
     // step 3pp over nine snapshots => 24pp displayed span: calibrates, but is
     // below the community floor, so it publishes an honest null.
     await seedThreeV1Resets(participantId, "v1-device-shortspan", 3, "short");
-    expect(await collectCommunityAllowanceFits(db())).toHaveLength(0);
+    expect(await collectCommunityAllowanceFits(db(), SCALE_NOW)).toHaveLength(0);
   });
 
   it("admits a span the previous 40pp floor refused", async () => {
@@ -1417,7 +1417,7 @@ describe("community allowance from the v1.0 chunk corpus", () => {
     await seedV1Device(participantId, "v1-device-midspan",
       "v1-session-midspan");
     await seedThreeV1Resets(participantId, "v1-device-midspan", 4, "mid");
-    const fits = await collectCommunityAllowanceFits(db());
+    const fits = await collectCommunityAllowanceFits(db(), SCALE_NOW);
     expect(fits.length).toBeGreaterThan(0);
     expect(fits.every((fit) => fit.capacityNanousd > 0)).toBe(true);
   });
@@ -1466,7 +1466,7 @@ describe("community allowance from the v1.0 chunk corpus", () => {
       ],
     });
 
-    const fits = await collectCommunityAllowanceFits(db());
+    const fits = await collectCommunityAllowanceFits(db(), SCALE_NOW);
     expect(fits.length).toBeGreaterThanOrEqual(3);
     for (const one of fits) expect(one.participantId).toBe(participantId);
   });
@@ -1479,12 +1479,12 @@ describe("community allowance from the v1.0 chunk corpus", () => {
     await seedThreeV1Resets(participantId, "v1-device-unpriceable", 5,
       "unpriced", true);
 
-    expect(await collectCommunityAllowanceFits(db())).toHaveLength(0);
+    expect(await collectCommunityAllowanceFits(db(), SCALE_NOW)).toHaveLength(0);
 
     // The reset is refused at the calibration boundary (its source evidence
     // was refused for incomplete_server_pricing), never fabricated into an
     // estimate.
-    const analysis = await accountScopedQuotaAnalysisV1(db(), participantId) as {
+    const analysis = await accountScopedQuotaAnalysisV1(db(), participantId, { nowMs: SCALE_NOW }) as {
       status: string;
       tracks: Array<{
         calibration: {
@@ -1511,7 +1511,7 @@ describe("community allowance from the v1.0 chunk corpus", () => {
     await seedV1Device(participantId, "v1-device-cache", "v1-session-cache");
     await seedThreeV1Resets(participantId, "v1-device-cache", 5, "cache");
 
-    const first = await collectCommunityAllowanceFits(db());
+    const first = await collectCommunityAllowanceFits(db(), SCALE_NOW);
     expect(first.length).toBeGreaterThanOrEqual(3);
 
     // Delete the record view but leave the chunk journal untouched: the cache
@@ -1520,7 +1520,7 @@ describe("community allowance from the v1.0 chunk corpus", () => {
     await db().prepare(
       "DELETE FROM telemetry_v1_records WHERE participant_id = ?",
     ).bind(participantId).run();
-    const second = await collectCommunityAllowanceFits(db());
+    const second = await collectCommunityAllowanceFits(db(), SCALE_NOW);
     expect(second).toEqual(first);
 
     // A chunk-journal change (newer created_at) invalidates the cache; the
@@ -1528,7 +1528,7 @@ describe("community allowance from the v1.0 chunk corpus", () => {
     await db().prepare(
       "UPDATE telemetry_v1_chunks SET created_at = ? WHERE participant_id = ?",
     ).bind("2027-06-01T00:00:00.000Z", participantId).run();
-    expect(await collectCommunityAllowanceFits(db())).toHaveLength(0);
+    expect(await collectCommunityAllowanceFits(db(), SCALE_NOW)).toHaveLength(0);
   });
 
   it("retains a dual-source participant's valid v0.2 fit when its v1 fragment cannot fit", async () => {
@@ -1558,7 +1558,7 @@ describe("community allowance from the v1.0 chunk corpus", () => {
       }],
     });
 
-    const fits = await collectCommunityAllowanceFits(db());
+    const fits = await collectCommunityAllowanceFits(db(), SCALE_NOW);
     expect(fits).toHaveLength(1);
     expect(fits[0]!.participantId).toBe(participant.participantId);
     expect(fits[0]!.lastObservedAt).toBe("2026-07-25T12:40:00.000Z");
@@ -2780,7 +2780,7 @@ describe("per-model composition from the v1.0 chunk corpus", () => {
     await seedV1Device(participantId, "v1-device-composition", "v1-session-composition");
     await seedThreeV1Resets(participantId, "v1-device-composition", 5, "composition");
 
-    const result = await accountScopedModelCompositionV1(db(), participantId, {});
+    const result = await accountScopedModelCompositionV1(db(), participantId, { nowMs: SCALE_NOW });
     expect(result.status).toBe("ready");
     if (result.status !== "ready") return;
     expect(result.planType).toBe("pro");
@@ -2806,7 +2806,7 @@ describe("per-model composition from the v1.0 chunk corpus", () => {
     await seedV1Device(participantId, "v1-device-composition-cache", "v1-session-composition-cache");
     await seedThreeV1Resets(participantId, "v1-device-composition-cache", 5, "ccache");
 
-    const first = await collectCommunityModelCompositions(db());
+    const first = await collectCommunityModelCompositions(db(), SCALE_NOW);
     expect(first.v1ParticipantCount).toBe(1);
     expect(first.unsupportedSourceParticipantCount).toBe(0);
     expect(first.compositions).toHaveLength(1);
@@ -2815,7 +2815,7 @@ describe("per-model composition from the v1.0 chunk corpus", () => {
     ).bind(participantId).first<{ cache_key: string; computed_at: string }>();
     expect(cached).not.toBeNull();
 
-    const second = await collectCommunityModelCompositions(db());
+    const second = await collectCommunityModelCompositions(db(), SCALE_NOW);
     expect(second.compositions).toHaveLength(1);
     const reread = await db().prepare(
       "SELECT cache_key, computed_at FROM community_model_composition_cache WHERE participant_id = ?",
@@ -2980,7 +2980,7 @@ describe("per-model composition from the v1.0 chunk corpus", () => {
       tag: "cmp-plus",
       planType: "plus",
     });
-    const result = await accountScopedModelCompositionV1(db(), participantId, {});
+    const result = await accountScopedModelCompositionV1(db(), participantId, { nowMs: SCALE_NOW });
     expect(result.status).toBe("not_testable");
     if (result.status === "not_testable") {
       expect(result.reason).toBe("multi_plan_window_unsupported");
@@ -2992,7 +2992,7 @@ describe("per-model composition from the v1.0 chunk corpus", () => {
     await seedV1Session(participantId, "v1-session-composition-poisoned");
     await seedV1Device(participantId, "v1-device-composition-poisoned", "v1-session-composition-poisoned");
     await seedThreeV1Resets(participantId, "v1-device-composition-poisoned", 5, "cpo", true);
-    const result = await accountScopedModelCompositionV1(db(), participantId, {});
+    const result = await accountScopedModelCompositionV1(db(), participantId, { nowMs: SCALE_NOW });
     expect(result.status).toBe("ready");
     if (result.status !== "ready") return;
     // Every seeded event is unpriceable, so every carrying bin is voided:
@@ -3010,9 +3010,9 @@ describe("per-model composition from the v1.0 chunk corpus", () => {
     await seedThreeV1Resets(participantId, "v1-device-composition-preview", 5, "cprev");
     // Warm the blended fit cache first: the scheduled preview source reads
     // the corpus through it and fails closed otherwise.
-    await collectCommunityAllowanceFits(db());
+    await collectCommunityAllowanceFits(db(), SCALE_NOW);
 
-    const nowMs = Date.now();
+    const nowMs = SCALE_NOW;
     const today = new Date(nowMs).toISOString().slice(0, 10);
     const preview = await buildAdminCommunityAllowancePreviewFromSource(db(), nowMs);
     expect(preview).not.toBeNull();

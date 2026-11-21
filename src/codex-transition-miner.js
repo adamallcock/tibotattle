@@ -1,15 +1,11 @@
 import { localCodexLogScanner } from "./local-node-runtime.js";
 import { validAbortSignal } from "./valid-abort-signal.js";
-import {
-  fastQuotaMultiplier,
-  subscriptionSpeedSensitivity,
-} from "./application/index.js";
+import { subscriptionSpeedSensitivity } from "./application/index.js";
 import { unknownCodexTier } from "./providers/codex/logs.js";
 import {
   addUsdStrings,
   apiPriceResolutionSummary,
   costWarningCodes,
-  FAST_MODE_ASSUMED_MULTIPLIER,
   fastModeModelFamilyKey,
   quotaWeightedApiPriceEquivalent,
   priceCodexUsageEvent,
@@ -99,11 +95,13 @@ function roundUsd(value) {
 function priceUsageEvent(event, priceCards) {
   const ledger = priceCodexUsageEvent(event, { priceCards });
   const costUsd = Number(ledger.totalUsd);
-  const multiplier = fastQuotaMultiplier(event.model, {
-    eventTime: event.timestamp,
-    standardPriceCardIds: ledger.selectedPriceCardIds,
-  });
-  const fastWeightedEquivalentUsd = costUsd * (multiplier ?? FAST_MODE_ASSUMED_MULTIPLIER);
+  const speedPriceInput = {
+    apiPriceEquivalentUsd: costUsd, model: event.model,
+    eventTime: event.timestamp, standardPriceCardIds: ledger.selectedPriceCardIds,
+  };
+  const fastWeightedEquivalentUsd = quotaWeightedApiPriceEquivalent({
+    ...speedPriceInput, mode: "fast",
+  }).usd;
   const observedSpeedMode = event.tierSemantics?.codexSpeedMode ?? "unknown";
   const speedMode = ["standard", "fast", "ultrafast"].includes(observedSpeedMode)
     ? observedSpeedMode
@@ -111,8 +109,7 @@ function priceUsageEvent(event, priceCards) {
       ? event.declaredSpeed
       : "unknown";
   const ultrafastUsd = speedMode === "ultrafast" ? quotaWeightedApiPriceEquivalent({
-    apiPriceEquivalentUsd: costUsd, model: event.model, mode: speedMode,
-    eventTime: event.timestamp, standardPriceCardIds: ledger.selectedPriceCardIds,
+    ...speedPriceInput, mode: "ultrafast",
   }).usd : null;
   return {
     ...event,

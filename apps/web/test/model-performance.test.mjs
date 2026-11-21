@@ -12,17 +12,31 @@ function payload() {
     models: [{ id: 'gpt-5.6-sol', label: 'Sol', turns: 20, speedTurns: 10, ttftTurns: 15, timedResponses: 45, toolFreeTurns: 0, toolFree: [],
       speed: [{ method: 'speed', points: [point(), point(3 * DAY)] }], ttft: [point(), point(3 * DAY), point(4 * DAY)] }] };
 }
-test('GPT-6.1 Terra and Sol and older generations retain distinct DTO labels and refuse unreviewed suffixes', () => {
+const CURRENT_AND_PRIOR_DISPLAY_MODELS = [
+  ['gpt-6.2-astra', 'GPT-6.2 Astra'], ['gpt-6.2-sol', 'GPT-6.2 Sol'],
+  ['gpt-6.2-astra-law', 'GPT-6.2 Astra for Law'],
+  ['gpt-6-astra', 'Astra'], ['gpt-6.1-sol', 'GPT-6.1 Sol'],
+  ['gpt-6-sol', 'GPT-6 Sol'], ['gpt-6-luna', 'GPT-6 Luna'],
+  ['gpt-6.1-terra', 'GPT-6.1 Terra'], ['gpt-5.6-terra', 'Terra'], ['gpt-5.6-luna', 'Luna'],
+];
+test('performance DTO accepts all 18 reviewed model labels and refuses unreviewed suffixes', () => {
   const data = payload();
-  data.models.push(...[['gpt-6.1-sol', 'GPT-6.1 Sol'], ['gpt-6-sol', 'GPT-6 Sol'], ['gpt-6-luna', 'GPT-6 Luna'], ['gpt-6.1-terra', 'GPT-6.1 Terra'], ['gpt-5.6-terra', 'Terra'], ['gpt-5.6-luna', 'Luna']]
+  data.models.push(...[...CURRENT_AND_PRIOR_DISPLAY_MODELS,
+    ['gpt-5.5', 'GPT-5.5'], ['gpt-5.4', 'GPT-5.4'], ['gpt-5.4-mini', 'GPT-5.4 mini'],
+    ['gpt-5.3-codex-spark', 'Spark'], ['gpt-5.3-codex', 'GPT-5.3 Codex'],
+    ['gpt-5.2-codex', 'GPT-5.2 Codex'], ['gpt-5.2', 'GPT-5.2']]
     .map(([id, label]) => ({ ...structuredClone(data.models[0]), id, label })));
+  assert.equal(data.models.length, 18);
   assert.equal(normalizeModelPerformance(data), data);
-  for (const model of ['gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna', 'gpt-6.1-terra']) {
+  for (const [model, unqualifiedLabel] of [
+    ['gpt-6.2-astra', 'Astra'], ['gpt-6.2-sol', 'Sol'], ['gpt-6.2-astra-law', 'GPT-6.2 Astra'], ['gpt-6.1-sol', 'Sol'],
+    ['gpt-6-sol', 'Sol'], ['gpt-6-luna', 'Luna'], ['gpt-6.1-terra', 'Terra'],
+  ]) {
     const suffix = structuredClone(data);
     suffix.models.find(row => row.id === model).id += '-unreviewed';
     assert.equal(normalizeModelPerformance(suffix), null);
     const mislabeled = structuredClone(data);
-    mislabeled.models.find(row => row.id === model).label = model.endsWith('sol') ? 'Sol' : model.endsWith('terra') ? 'Terra' : 'Luna';
+    mislabeled.models.find(row => row.id === model).label = unqualifiedLabel;
     assert.equal(normalizeModelPerformance(mislabeled), null);
   }
 });
@@ -389,20 +403,25 @@ test('horizontal hover bins are calendar-aligned including unobserved days and e
 test('performance cards render separate GPT-6 generations with their shared family icons', async () => {
   const dom = focusHarness();
   const data = payload();
-  data.models.push(...[['gpt-6.1-sol', 'GPT-6.1 Sol'], ['gpt-6-sol', 'GPT-6 Sol'], ['gpt-6-luna', 'GPT-6 Luna'], ['gpt-6.1-terra', 'GPT-6.1 Terra'], ['gpt-5.6-terra', 'Terra'], ['gpt-5.6-luna', 'Luna']]
+  data.models.push(...CURRENT_AND_PRIOR_DISPLAY_MODELS
     .map(([id, label]) => ({ ...structuredClone(data.models[0]), id, label })));
   const controller = mountModelPerformance({ ...dom, client: { modelPerformance: async () => data },
     t: (key, values) => translate(key, values, 'en-US') });
   try {
     dom.show(); await controller.refresh();
-    for (const name of ['GPT-5.6 Sol', 'GPT-5.6 Luna', 'GPT-6 Sol', 'GPT-6 Luna', 'GPT-6.1 Sol', 'GPT-6.1 Terra', 'GPT-5.6 Terra']) {
+    for (const name of ['GPT-6.2 Astra', 'GPT-6.2 Sol', 'GPT-6.2 Astra for Law', 'GPT-6 Astra', 'GPT-6.1 Sol', 'GPT-6.1 Terra',
+      'GPT-6 Sol', 'GPT-6 Luna', 'GPT-5.6 Sol', 'GPT-5.6 Terra', 'GPT-5.6 Luna']) {
       assert.ok(dom.root.all().some(node => node.textContent === name), name);
     }
-    for (const family of ['sol', 'luna', 'terra']) {
+    for (const [family, expected] of [['astra', 3], ['sol', 4], ['luna', 2], ['terra', 2]]) {
       const buttons = dom.root.all().filter(node => node.tagName === 'button');
       assert.equal(buttons.filter(button => button.all().some(node => node.className ===
-        `allowance-model-icon performance-model-icon allowance-model-${family}`)).length, family === 'sol' ? 3 : 2);
+        `allowance-model-icon performance-model-icon allowance-model-${family}`)).length, expected);
     }
+    assert.equal(dom.find('model-gpt-6.2-astra').attributes['aria-selected'], 'true');
+    dom.find('model-gpt-6.2-sol').listeners.click();
+    assert.equal(dom.find('model-gpt-6.2-sol').attributes['aria-selected'], 'true');
+    assert.equal(dom.find('model-gpt-6.2-astra').attributes['aria-selected'], 'false');
   } finally { controller.destroy(); }
 });
 test('plot-area sweep works away from points, clears on exit, and keyboard order follows dates', async () => {

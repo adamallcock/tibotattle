@@ -2,6 +2,7 @@ import {
   FAST_MODE_ASSUMED_MULTIPLIER,
   fastModeModelFamilyKey,
   fastModeQuotaMultiplier,
+  quotaWeightedApiPriceEquivalent,
   speedModeApiMultiplier,
   summarizeQuotaWeightedAccounting,
 } from "@app-usagemonitor/accounting";
@@ -26,6 +27,8 @@ export function subscriptionSpeedSensitivity(byModel, observedSpeedMode = "unkno
   if (!isCodexSpeedMode(observedSpeedMode)) throw new Error("observedSpeedMode is invalid");
   let standardApiEquivalentUsd = 0;
   let fastWeightedEquivalentUsd = 0;
+  let fastUnweightedEquivalentUsd = 0;
+  let fastComplete = true;
   let assumedRatioStandardApiEquivalentUsd = 0;
   const modelMultipliers = {};
   let ultrafastWeightedEquivalentUsd = 0;
@@ -70,14 +73,22 @@ export function subscriptionSpeedSensitivity(byModel, observedSpeedMode = "unkno
     // A per-model total without event context cannot establish that every
     // dollar had an eligible Priority card. Keep that scenario an explicit
     // assumption instead of borrowing a short-context or later dated rate.
-    const multiplier = fastQuotaMultiplier(model, summary?.priceEvidence ?? {});
-    modelMultipliers[model] = multiplier;
+    const { multiplier, status } = quotaWeightedApiPriceEquivalent({
+      ...summary?.priceEvidence,
+      model,
+      mode: "fast",
+      apiPriceEquivalentUsd: costUsd,
+    });
+    modelMultipliers[model] = status === "fast_weighted" ? multiplier : null;
     if (multiplier === null) {
-      // No published Priority rate: include at the disclosed assumed ratio
-      // instead of leaving the scenario incomplete.
+      fastComplete = false;
+      fastUnweightedEquivalentUsd += costUsd;
+      continue;
+    }
+    if (status === "fast_weighted_assumed_ratio") {
       assumedRatioStandardApiEquivalentUsd += costUsd;
-      fastWeightedEquivalentUsd += costUsd * FAST_MODE_ASSUMED_MULTIPLIER;
-    } else fastWeightedEquivalentUsd += costUsd * multiplier;
+    }
+    fastWeightedEquivalentUsd += costUsd * multiplier;
   }
   const scenarios = {
     standard: {
@@ -87,11 +98,14 @@ export function subscriptionSpeedSensitivity(byModel, observedSpeedMode = "unkno
     },
     fast: {
       relativeQuotaWeight: "model_specific",
-      weightedStandardApiEquivalentUsd: roundUsd(fastWeightedEquivalentUsd),
+      weightedStandardApiEquivalentUsd: fastComplete ? roundUsd(fastWeightedEquivalentUsd) : null,
+      ...(!fastComplete && {
+        unweightedStandardApiEquivalentUsd: roundUsd(fastUnweightedEquivalentUsd),
+      }),
       assumedRatioStandardApiEquivalentUsd:
         roundUsd(assumedRatioStandardApiEquivalentUsd),
       assumedRatioMultiplier: FAST_MODE_ASSUMED_MULTIPLIER,
-      complete: true,
+      complete: fastComplete,
     },
   };
   // Unknown mode deliberately keeps the existing Standard/Fast sensitivities.

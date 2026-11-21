@@ -1692,8 +1692,13 @@ test("rendered model cards, icons and native legend buttons share order and pres
     assert.equal(unavailable.disabled, true);
     assert.equal(unavailable.getAttribute("aria-pressed"), "false");
     assert.equal(unavailable.title, "No qualifying fits in this range");
-    assert.equal(container.querySelectorAll(".admin-allowance-plan-summary").length, ADMIN_MODEL_CONFIG.length);
-    for (const id of ["gpt-6-sol", "gpt-6-luna"]) {
+    const restricted = "gpt-6.2-astra-law";
+    assert.equal(container.querySelectorAll(".admin-allowance-plan-summary").length,
+      ADMIN_MODEL_CONFIG.filter(model => model.modelId !== restricted).length);
+    assert.equal(container.querySelector(`button[data-allowance-model-focus="${restricted}"]`), null);
+    assert.equal(container.querySelector(".admin-allowance-model-filter select").children
+      .some(option => option.value === restricted), false);
+    for (const id of ["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6-sol", "gpt-6-luna"]) {
       const newModel = container.querySelector(`button[data-allowance-model-focus="${id}"]`);
       assert.equal(newModel.disabled, true, "new models do not invent qualifying fits");
     }

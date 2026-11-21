@@ -7075,33 +7075,36 @@ test("v20 reclassifies present guardian sources once while absent v19 facts and 
   }
 });
 
-test("v19 and v20 parser provenance variants remain qualified after the v21 upgrade", () => {
+test("v19 through v21 parser provenance variants remain qualified after the v22 upgrade", () => {
   for (const suffix of ["", "-partial", "-parent-model", "-parent-model-partial"]) {
     for (const assumption of ["", "-cache-write-zero"]) {
       assert.equal(isLocalUnifiedIndexBoundaryParserVersion(`unified-rollout-typed-v19${suffix}${assumption}`), true);
       assert.equal(isLocalUnifiedIndexBoundaryParserVersion(`unified-rollout-typed-v20${suffix}${assumption}`), true);
       assert.equal(isLocalUnifiedIndexBoundaryParserVersion(`unified-rollout-typed-v21${suffix}${assumption}`), true);
+      assert.equal(isLocalUnifiedIndexBoundaryParserVersion(`unified-rollout-typed-v22${suffix}${assumption}`), true);
     }
   }
-  assert.equal(isLocalUnifiedIndexBoundaryParserVersion("unified-rollout-typed-v22"), false);
+  assert.equal(isLocalUnifiedIndexBoundaryParserVersion("unified-rollout-typed-v23"), false);
   assert.equal(isLocalUnifiedIndexBoundaryParserVersion("unified-rollout-typed-v20-unreviewed"), false);
 });
 
-test("v21 reclassifies present Terra sources once while absent v20 facts retain exact provenance", async () => {
-  const presentName = "rollout-2026-07-25T00-00-00-present-terra.jsonl";
-  const absentName = "rollout-2026-07-25T01-00-00-absent-terra.jsonl";
+async function assertModelUpgradeReplay({ predecessor, day, models, tier, effort }) {
+  const presentName = `rollout-${day}T00-00-00-present-model.jsonl`;
+  const absentName = `rollout-${day}T01-00-00-absent-model.jsonl`;
   const { root, sessions } = await corpus({
     [presentName]: [
-      sessionMeta("synthetic-present-terra"),
-      turnContext("2026-07-25T00:00:00.000Z", "gpt-6.1-terra"),
-      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
-      threadSettings("2026-07-25T00:00:01.500Z", "priority"),
-      tokenCount("2026-07-25T00:00:02.000Z", usage(300, 30), usage(200, 20)),
+      sessionMeta("synthetic-present-model"),
+      turnContext(`${day}T00:00:00.000Z`, models[0], "ultra"),
+      tokenCount(`${day}T00:00:01.000Z`, usage(100, 10), usage(100, 10)),
+      threadSettings(`${day}T00:00:01.500Z`, tier),
+      turnContext(`${day}T00:00:01.700Z`, models[1], effort),
+      tokenCount(`${day}T00:00:02.000Z`, usage(300, 30), usage(200, 20)),
     ],
     [absentName]: [
-      sessionMeta("synthetic-absent-terra"),
-      turnContext("2026-07-25T01:00:00.000Z", "gpt-6.1-terra"),
-      tokenCount("2026-07-25T01:00:01.000Z", usage(50, 5), usage(50, 5)),
+      sessionMeta("synthetic-absent-model"),
+      turnContext(`${day}T01:00:00.000Z`, models[1]),
+      tokenCount(`${day}T01:00:01.000Z`, usage(50, 5), usage(50, 5)),
+      toolCall(`${day}T01:00:02.000Z`, { type: "function_call", name: "thread_spawn", call_id: "synthetic-retained-tool" }),
     ],
   });
   const indexFile = join(root, "index.sqlite");
@@ -7110,6 +7113,7 @@ test("v21 reclassifies present Terra sources once while absent v20 facts retain 
   });
   const facts = database => database.prepare(`SELECT hex(u.event_key) AS event_key,
     u.observed_at_ms, m.model_id, m.recognition, t.codex_speed_mode, t.tier_source,
+    t.api_service_tier, u.reasoning_effort,
     u.tokens_in_uncached, u.tokens_in_cache_read, u.tokens_in_cache_write,
     u.tokens_out_text, u.tokens_out_reasoning, u.tokens_out_combined,
     u.total_input_context, hex(u.source_local) AS source_local, u.source_offset,
@@ -7122,10 +7126,10 @@ test("v21 reclassifies present Terra sources once while absent v20 facts retain 
     const prior = openLocalUnifiedIndex(indexFile, { readOnly: false });
     prior.exec(`INSERT INTO model(model_id,recognition) VALUES('unknown','unrecognized') ON CONFLICT DO NOTHING;
       UPDATE usage_event SET model_id=(SELECT id FROM model WHERE model_id='unknown');
-      UPDATE parser_version SET parser_version=replace(parser_version,'unified-rollout-typed-v21','unified-rollout-typed-v20');`);
+      UPDATE parser_version SET parser_version=replace(parser_version,'${LOCAL_UNIFIED_INDEX_PARSER_VERSION}','unified-rollout-typed-${predecessor}');`);
     const before = facts(prior);
     assert.equal(before.length, 3);
-    assert.ok(before.every(row => row.model_id === "unknown" && row.parser_version === "unified-rollout-typed-v20"));
+    assert.ok(before.every(row => row.model_id === "unknown" && row.parser_version === `unified-rollout-typed-${predecessor}`));
     prior.close();
     await rm(join(sessions, absentName));
     const sourceBefore = await readFile(join(sessions, presentName));
@@ -7133,18 +7137,29 @@ test("v21 reclassifies present Terra sources once while absent v20 facts retain 
     await assert.rejects(ingest({ signal: controller.signal, onProgress: () => controller.abort() }),
       error => error?.code === "local_unified_index_aborted");
     const cancelled = openLocalUnifiedIndex(indexFile, { readOnly: true });
-    try { assert.deepEqual(facts(cancelled), before, "cancelled reparse preserves the published v20 generation"); }
+    try { assert.deepEqual(facts(cancelled), before, "cancelled reparse preserves the published predecessor generation"); }
     finally { cancelled.close(); }
     const upgraded = await ingest();
     assert.equal(upgraded.sourcesReparsedForParserVersion, 1);
     assert.equal(upgraded.totalUsageEvents, 3);
+    if (predecessor === "v21") {
+      assert.equal(upgraded.generation.status, "complete");
+      assert.equal(upgraded.generation.toolProvenanceComplete, true);
+      const projection = await readLocalUnifiedCompanionProjection({ indexFile, nowMs: Date.parse(`${day}T02:00:00.000Z`) });
+      assert.equal(projection.toolCoverageStatus, "complete");
+      assert.equal(projection.tools.total, 1);
+    }
     const current = openLocalUnifiedIndex(indexFile, { readOnly: true });
     let after;
     try {
       after = facts(current);
       assert.deepEqual(after, before.map((row, index) => index < 2 ? {
-        ...row, model_id: "gpt-6.1-terra", recognition: "recognized", parser_version: LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+        ...row, model_id: models[index], recognition: "recognized", parser_version: LOCAL_UNIFIED_INDEX_PARSER_VERSION,
       } : row));
+      assert.deepEqual(after.slice(0, 2).map(row => row.codex_speed_mode), ["unknown", tier]);
+      assert.deepEqual(after.slice(0, 2).map(row => row.api_service_tier), ["unknown", "unknown"]);
+      assert.deepEqual(after.slice(0, 2).map(row => row.reasoning_effort),
+        ["ultra", effort].map(reasoningEffortOrdinal));
       assert.equal(after.reduce((sum, row) => sum + row.tokens_in_uncached, 0), 350);
       assert.equal(after.reduce((sum, row) => sum + row.tokens_out_text, 0), 35);
       assert.equal(current.prepare("PRAGMA user_version").get().user_version, LOCAL_UNIFIED_INDEX_USER_VERSION);
@@ -7157,7 +7172,17 @@ test("v21 reclassifies present Terra sources once while absent v20 facts retain 
     try { assert.deepEqual(facts(settled), after); } finally { settled.close(); }
     assert.deepEqual(await readFile(join(sessions, presentName)), sourceBefore);
   } finally { await rm(root, { recursive: true }); }
-});
+}
+
+for (const fixture of [
+  { predecessor: "v20", day: "2026-10-26", models: ["gpt-6.1-terra", "gpt-6.1-terra"], tier: "ultrafast", effort: "max" },
+  { predecessor: "v21", day: "2026-11-17", models: ["gpt-6.2-astra", "gpt-6.2-sol"], tier: "ultrafast", effort: "max" },
+  { predecessor: "v21", day: "2026-11-17", models: ["gpt-6.2-astra", "gpt-6.2-astra-law"], tier: "standard", effort: "high" },
+]) {
+  const models = [...new Set(fixture.models)].join(" and ");
+  test(`replay recognizes ${models} once while absent ${fixture.predecessor} facts retain exact provenance`,
+    () => assertModelUpgradeReplay(fixture));
+}
 
 test("a parser-version bump heals unchanged content and dependent lineage quarantines exactly once", async () => {
   const parentName = canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE);

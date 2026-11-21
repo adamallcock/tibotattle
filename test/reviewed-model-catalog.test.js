@@ -10,6 +10,7 @@ import {
   codexCacheReasoningConfiguration,
 } from "@app-usagemonitor/telemetry-contract";
 import * as browser from "../apps/web/public/telemetry-shared.generated.js";
+import * as publicCatalog from "../apps/web/public/model-catalog.generated.js";
 import { recognizedCodexModelId, codexModelPricingStatus, codexModelAllowanceTrack } from "../src/export/registries.js";
 import { telemetryV01Golden } from "./fixtures/telemetry-contract-vectors.mjs";
 import { sha256Json } from "./helpers/pricing-hash.js";
@@ -20,8 +21,8 @@ test("reviewed identity catalog covers priced OpenAI models and explicit aliases
     && card.model !== "openai-provider-tools").flatMap((card) => [card.model, ...(card.aliases ?? [])]));
   assert.deepEqual(models.filter((entry) => entry.pricingStatus !== "unpriced").map((entry) => entry.id).sort(), [...priced].sort());
   assert.deepEqual(models.filter((entry) => entry.pricingStatus === "unpriced").map((entry) => entry.id), ["gpt-5.3-codex-spark", "gpt-6.1-astra"]);
-  assert.equal(models.length, 44);
-  for (const id of ["gpt-6.1-terra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"]) {
+  assert.equal(models.length, 47);
+  for (const id of ["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.2-astra-law", "gpt-6.1-terra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"]) {
     assert.equal(reviewedModelIdentity(id).priceModelId, id);
     assert.equal(reviewedModelIdentity(id).pricingStatus, "published");
   }
@@ -36,7 +37,14 @@ test("reviewed identity catalog covers priced OpenAI models and explicit aliases
   assert.notEqual(reviewedModelIdentity("gpt-5.5-codex"), reviewedModelIdentity("gpt-5.5"));
   assert.equal(reviewedModelIdentity("gpt-5.5-codex").pricingStatus, "assumed_alias");
   assert.equal(reviewedModelIdentity("gpt-5.3-codex-spark").priceModelId, null);
-  for (const value of ["gpt-6t", "gpt-6-astra-private", "gpt-6.1-sol-private", "gpt-6.1-terra-private", "gpt-6.1-terra-wm", "gpt-6-sol-private", "gpt-6-luna-wm", "openai-provider-tools", "gpt-5.6-sol/sensitive", null, {}]) {
+  for (const [id, label] of [
+    ["gpt-6.2-astra", "GPT-6.2 Astra"], ["gpt-6.2-sol", "GPT-6.2 Sol"],
+    ["gpt-6.2-astra-law", "GPT-6.2 Astra for Law"],
+  ]) {
+    assert.equal(reviewedModelIdentity(id).label, label);
+    assert.equal(publicCatalog.reviewedModelIdentity(id).label, label);
+  }
+  for (const value of ["gpt-6t", "gpt-6-astra-private", "gpt-6.1-sol-private", "gpt-6.1-terra-private", "gpt-6.1-terra-wm", "gpt-6-sol-private", "gpt-6-luna-wm", "gpt-6.2", "gpt-6.2-astra-preview", "gpt-6.2-sol-2026-11-17", "gpt-6.2-astra-law-preview", "openai-provider-tools", "gpt-5.6-sol/sensitive", null, {}]) {
     assert.equal(reviewedModelIdentity(value), null);
     assert.equal(recognizedCodexModelId(value), null);
   }
@@ -52,13 +60,13 @@ test("package, browser and closed upload schemas preserve all reviewed models an
     "claude-fable-5", "claude-haiku-4-5-20251001", "claude-opus-4-8",
     "claude-sonnet-4-6", "claude-sonnet-5",
   ]);
-  assert.deepEqual(TELEMETRY_MODEL_IDS.slice(-8), [
+  assert.deepEqual(TELEMETRY_MODEL_IDS.slice(-11), [
     "gpt-6-luna",
     "gpt-6.1-astra", "claude-fable-5-1", "claude-mythos-5-1",
-    "claude-opus-5", "claude-opus-5-5", "gpt-6.1-sol", "gpt-6.1-terra",
+    "claude-opus-5", "claude-opus-5-5", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.2-astra-law",
   ]);
-  assert.equal(sha256Json(TELEMETRY_MODEL_IDS.slice(0, -1)),
-    "2bb1478e6c69369c55e19ee7f299fa5111b8cd1cd8d30394d1d5066f9a92b8ab");
+  assert.equal(sha256Json(TELEMETRY_MODEL_IDS.slice(0, -3)),
+    "c2aba9916b92e2d79620ba9a745615b4cef9cdcf1df444c2c715c1a4d66b7898");
   const schema = JSON.parse(await readFile(new URL("../packages/telemetry-contract/schemas/v0.2/usage-event.schema.json", import.meta.url), "utf8"));
   assert.deepEqual([...schema.properties.modelId.enum].sort(), [...TELEMETRY_MODEL_IDS].sort());
   const validateId = new Ajv().compile(schema.properties.modelId);
@@ -93,6 +101,23 @@ test("requested effort mapping is model-specific and does not assert cache or ef
   assert.equal(codexCacheReasoningConfiguration("gpt-6.1-terra", "ultra"), "ultra");
   assert.equal(codexCacheReasoningConfiguration("gpt-6-astra", "unreviewed"), null);
   assert.equal(browser.codexCacheReasoningConfiguration("gpt-6-astra", "ultra"), "ultra");
+});
+
+test("GPT-6.2 retains every Codex thinking level and distinguishes Ultra from xhigh cache configuration", () => {
+  for (const api of [
+    { codexRequestReasoningEffort, codexCacheReasoningConfiguration }, browser, publicCatalog,
+  ]) {
+    for (const model of ["gpt-6.2-astra", "gpt-6.2-sol"]) {
+      for (const effort of ["low", "medium", "high", "xhigh", "max", "ultra"]) {
+        assert.equal(api.codexRequestReasoningEffort(model, effort), effort === "ultra" ? "xhigh" : effort);
+        assert.equal(api.codexCacheReasoningConfiguration(model, effort), effort);
+      }
+      assert.equal(api.codexRequestReasoningEffort(`${model}-preview`, "ultra"), "ultra");
+      assert.equal(api.codexRequestReasoningEffort(model, "private-custom-effort"), null);
+    }
+    assert.equal(api.codexRequestReasoningEffort("gpt-6.2-astra-law", "ultra"), "ultra");
+    assert.equal(api.codexCacheReasoningConfiguration("gpt-6.2-astra-law", "ultra"), "ultra");
+  }
 });
 
 test("the exported vocabulary contract accepts the shipped catalog and refuses broken identities", () => {

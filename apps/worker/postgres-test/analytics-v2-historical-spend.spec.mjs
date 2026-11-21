@@ -81,7 +81,7 @@ before(async () => {
   vite = await createServer({ root: ROOT, configFile: false, server: { middlewareMode: true }, appType: "custom",
     logLevel: "silent", plugins: [{ name: "historical-test-vendor", enforce: "pre", resolveId(source, importer) {
       return usesVendoredPackages(importer) ? VENDORED_PACKAGE_ENTRIES[source] ?? null : null;
-    } }], resolve: { mainFields: ["module", "main"] }, ssr: { noExternal: ["jsonc-parser"] } });
+    } }], resolve: { mainFields: ["module", "main"] }, ssr: { noExternal: ["jsonc-parser", ...Object.keys(VENDORED_PACKAGE_ENTRIES)] } });
   routeModule = await vite.ssrLoadModule("/src/analytics-v2/community-daily-route.ts");
   kernels = await vite.ssrLoadModule("/vendor/analytics-d43c8f92/entry.ts");
   // Baseline route regression can run without a product compatibility module.

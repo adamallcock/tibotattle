@@ -98,14 +98,16 @@ test('028 lifecycle v2 requires its exact route and cannot consume or relabel a 
   assert.equal(validateLinuxFinalLifecycleReceipt(original, pair), original);
 });
 
-test('029 lifecycle v3 requires its exact route and cannot consume or relabel a 027 v1 receipt', () => {
+for (const [route, version, buildNumber, predecessorVersion] of [
+  ['v3', '0.1.29', '2026102601', '0.1.28'],
+  ['v4', '0.1.30', '2026112101', '0.1.29'],
+]) test(`${version} lifecycle ${route} requires its exact route and rejects reused 027 proof`, () => {
   const selected = structuredClone(pair);
-  Object.assign(selected.intake, { schemaVersion: 'tibotattle-linux-final-lifecycle-intake-v3',
-    version: '0.1.29', buildNumber: '2026102601' });
+  Object.assign(selected.intake, { schemaVersion: `tibotattle-linux-final-lifecycle-intake-${route}`, version, buildNumber });
   const original = receipt();
   assert.equal(validateLinuxFinalLifecycleReceipt(original, selected), null);
-  const replacement = { ...original, schemaVersion: 'tibotattle-linux-final-installed-lifecycle-v3',
-    version: '0.1.29', buildNumber: '2026102601', publicPredecessorUpdate: 'exact_published_0.1.28_to_final_0.1.29' };
+  const replacement = { ...original, schemaVersion: `tibotattle-linux-final-installed-lifecycle-${route}`,
+    version, buildNumber, publicPredecessorUpdate: `exact_published_${predecessorVersion}_to_final_${version}` };
   assert.equal(validateLinuxFinalLifecycleReceipt(replacement, selected), replacement);
   assert.equal(validateLinuxFinalLifecycleReceipt(replacement, pair), null);
   for (const patch of [{ schemaVersion: original.schemaVersion }, { version: original.version },
@@ -113,7 +115,7 @@ test('029 lifecycle v3 requires its exact route and cannot consume or relabel a 
     { replacementAndAutomaticRestartVerified: false }, { physicalDesktop: 'qualified' }]) {
     assert.equal(validateLinuxFinalLifecycleReceipt({ ...replacement, ...patch }, selected), null);
   }
-  for (const patch of [{ schemaVersion: pair.intake.schemaVersion }, { version: '0.1.30' }, { buildNumber: '2026102602' }]) {
+  for (const patch of [{ schemaVersion: pair.intake.schemaVersion }, { version: predecessorVersion }, { buildNumber: '2026102602' }]) {
     assert.equal(validateLinuxFinalLifecycleReceipt(replacement, { ...selected, intake: { ...selected.intake, ...patch } }), null);
   }
   assert.equal(validateLinuxFinalLifecycleReceipt(original, pair), original);

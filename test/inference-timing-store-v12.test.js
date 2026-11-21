@@ -151,13 +151,13 @@ test('parser upgrade reclassifies initial settings without changing retained tim
   } finally { current.close(); }
 });
 
-test('v21 recognizes present Terra timing sources while absent v20 identities and measurements stay unchanged', async t => {
-  const root = await realpath(await mkdtemp(join(tmpdir(), 'timing-terra-replay-')));
+async function assertTimingModelUpgradeReplay(t, { model, previousVersion }) {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'timing-model-replay-')));
   t.after(() => rm(root, { recursive: true, force: true }));
   const presentFile = join(root, 'present.jsonl'), absentFile = join(root, 'absent.jsonl');
   const directory = join(root, 'timing');
   const present = fixture();
-  present.find(row => row.type === 'turn_context').payload.model = 'gpt-6.1-terra';
+  present.find(row => row.type === 'turn_context').payload.model = model;
   const absent = JSON.parse(JSON.stringify(present)
     .replaceAll('synthetic-session', 'synthetic-absent-session')
     .replaceAll('synthetic-turn', 'synthetic-absent-turn')
@@ -168,19 +168,19 @@ test('v21 recognizes present Terra timing sources while absent v20 identities an
   }
   await writeFile(presentFile, lines(present), { mode: 0o600 });
   await writeFile(absentFile, lines(absent), { mode: 0o600 });
-  const old = await openTimingStore(directory, { ...options, parserVersion: 20 });
+  const old = await openTimingStore(directory, { ...options, parserVersion: previousVersion });
   await ingestTimingFile(old, presentFile);
   await ingestTimingFile(old, absentFile);
-  // v20 could measure the receipts but did not recognize Terra or qualify its
-  // full-turn model proof. Seed those prior facts without an obsolete parser copy.
+  // Seed the previous parser's unrecognized model and unavailable full-turn
+  // duration without retaining an obsolete copy of that parser.
   old.db.exec('UPDATE turn SET model=NULL,turn_duration=NULL');
   const before = readTimingRows(old, { withRevision: true });
   const beforeRaw = old.db.prepare('SELECT * FROM turn ORDER BY at').all();
   assert.equal(beforeRaw.length, 2);
-  assert.ok(before.sources.every(source => source.parserVersion === 20));
+  assert.ok(before.sources.every(source => source.parserVersion === previousVersion));
   old.close();
   await rm(absentFile);
-  assert.equal(INFERENCE_TIMING_PARSER_VERSION, 21);
+  assert.equal(INFERENCE_TIMING_PARSER_VERSION, 22);
   let current = await openTimingStore(directory, { ...options, parserVersion: INFERENCE_TIMING_PARSER_VERSION });
   try {
     assert.deepEqual(readTimingRows(current, { withRevision: true }), before, 'opening does not relabel retained facts');
@@ -193,18 +193,28 @@ test('v21 recognizes present Terra timing sources while absent v20 identities an
     current = await openTimingStore(directory, { ...options, parserVersion: INFERENCE_TIMING_PARSER_VERSION });
     assert.equal((await ingestTimingFile(current, presentFile)).replayed, true);
     const afterRaw = current.db.prepare('SELECT * FROM turn ORDER BY at').all();
-    assert.deepEqual({ ...afterRaw[0] }, { ...beforeRaw[0], model: 'gpt-6.1-terra', turn_duration: 1000 });
+    assert.deepEqual({ ...afterRaw[0] }, { ...beforeRaw[0], model, turn_duration: 1000 });
     assert.deepEqual(afterRaw[1], beforeRaw[1], 'missing source keeps its original unknown identity and timing');
     assert.equal(afterRaw[0].speed_mode, 'unknown');
     assert.equal(afterRaw[0].speed_mode_source, 'unobserved');
     const sourceVersions = current.db.prepare('SELECT parser_version FROM source ORDER BY id').all();
-    assert.deepEqual(sourceVersions.map(source => source.parser_version), [21, 20]);
+    assert.deepEqual(sourceVersions.map(source => source.parser_version), [INFERENCE_TIMING_PARSER_VERSION, previousVersion]);
     const after = readTimingRows(current, { withRevision: true });
     await assert.rejects(ingestTimingFile(current, absentFile));
     assert.deepEqual(await ingestTimingFile(current, presentFile), { bytes: 0, unchanged: true });
     assert.deepEqual(readTimingRows(current, { withRevision: true }), after);
   } finally { current.close(); }
-});
+}
+
+for (const fixture of [
+  { model: 'gpt-6.1-terra', previousVersion: 20 },
+  { model: 'gpt-6.2-astra', previousVersion: 21 },
+  { model: 'gpt-6.2-sol', previousVersion: 21 },
+  { model: 'gpt-6.2-astra-law', previousVersion: 21 },
+]) {
+  test(`timing replays present ${fixture.model} without changing absent v${fixture.previousVersion} facts`,
+    t => assertTimingModelUpgradeReplay(t, fixture));
+}
 
 test('v19 replay repairs oversized-output Fast attribution atomically across cancellation and restart', async t => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'timing-speed-repair-')));

@@ -37,7 +37,13 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [Unreleased]
 
-## [0.1.29](./release-notes/0.1.29.md) - 2026-10-27
+**Candidate notes:** [0.1.30](./release-notes/0.1.30.md)
+
+- Recognize GPT-6.2 Astra and GPT-6.2 Sol throughout the desktop dashboard.
+  Price their supported API tiers at the time of each event, including the
+  scheduled change to Ultrafast pricing.
+
+## [0.1.29](./release-notes/0.1.29.md) - 2026-10-30
 
 **Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.29) ·
 [annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.29) ·

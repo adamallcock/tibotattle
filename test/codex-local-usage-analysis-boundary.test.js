@@ -161,14 +161,15 @@ async function scanSpeedFixture(events, priceCards = null) {
     await mkdir(sessions);
     for (const [index, event] of events.entries()) {
       const day = event.day ?? "2026-09-29";
-      const timestamp = (second) => `${day}T12:00:${String(second).padStart(2, "0")}.000Z`;
+      const hour = event.hour ?? "12";
+      const timestamp = (second) => `${day}T${hour}:00:${String(second).padStart(2, "0")}.000Z`;
+      const inputTokens = event.inputTokens === undefined ? 1_000 : event.inputTokens;
       const usage = {
-        input_tokens: event.inputTokens ?? 1_000,
+        ...(inputTokens === null ? {} : { input_tokens: inputTokens, total_tokens: inputTokens + 10 }),
         cached_input_tokens: 0,
         cache_write_input_tokens: 0,
         output_tokens: 10,
         reasoning_output_tokens: 0,
-        total_tokens: (event.inputTokens ?? 1_000) + 10,
       };
       const records = [
         { timestamp: timestamp(0), type: "session_meta", payload: { id: `synthetic-speed-${index}`, source: "cli" } },
@@ -181,11 +182,11 @@ async function scanSpeedFixture(events, priceCards = null) {
           total_token_usage: usage, last_token_usage: usage,
         } } },
       ];
-      await writeFile(join(sessions, `rollout-${day}T12-00-00-speed-${index}.jsonl`),
+      await writeFile(join(sessions, `rollout-${day}T${hour}-00-00-speed-${index}.jsonl`),
         `${records.map((record) => JSON.stringify(record)).join("\n")}\n`);
     }
     return await codexLocalUsageAnalysis.scanAndPriceCodexLogs({
-      codexHome, startAt: "2026-09-01T00:00:00.000Z", endAt: "2026-10-01T00:00:00.000Z", priceCards,
+      codexHome, startAt: "2026-09-01T00:00:00.000Z", endAt: "2027-03-02T00:00:00.000Z", priceCards,
     });
   } finally {
     await rm(codexHome, { recursive: true, force: true });
@@ -212,6 +213,39 @@ test("observed Ultrafast scanner sensitivity qualifies every event and excludes 
   assert.equal(sensitivity.scenarios.standard.weightedStandardApiEquivalentUsd, result.runcost.tokenCostUsd);
   assert.equal(sensitivity.scenarios.fast.weightedStandardApiEquivalentUsd,
     Math.round(result.runcost.tokenCostUsd * 2 * 1e12) / 1e12);
+});
+
+test("scanner long-context diagnostics follow selected price-card bands", async () => {
+  for (const [model, day, inputTokens, count, cost] of [
+    ["gpt-6.2-sol", "2026-11-18", 272_000, 0, 0.5441],
+    ["gpt-6.2-sol", "2026-11-18", 272_001, 1, 1.088154],
+    ["gpt-6.2-astra", "2026-11-18", 272_000, 0, 2.1764],
+    ["gpt-6.2-astra", "2026-11-18", 272_001, 1, 4.352616],
+    ["gpt-5.5", "2026-09-29", 272_000, 1, 2.72045],
+    ["gpt-6.2-sol", "2026-11-18", null, 0, 0],
+    ["gpt-test-unpriced", "2026-11-18", 300_000, 0, 0],
+  ]) {
+    const result = await scanSpeedFixture([{ model, day, inputTokens }]);
+    const label = `${model} with ${inputTokens} input tokens`;
+    assert.equal(result.eventCount, 1, label);
+    assert.equal(result.diagnostics.longContextEvents, count, label);
+    assert.equal(result.runcost.tokenCostUsd, cost, label);
+  }
+});
+
+test("Ultrafast scanner sensitivity preserves cost through the Pacific price cutover", async () => {
+  const event = { mode: "ultrafast", model: "gpt-6.2-sol", day: "2027-03-01" };
+  const result = await scanSpeedFixture([
+    { ...event, hour: "07" }, { ...event, hour: "08" }, { ...event, hour: "09" },
+  ]);
+  assert.equal(result.runcost.tokenCostUsd, 0.0063);
+  assert.deepEqual(result.runcost.subscriptionSpeedSensitivity.scenarios.ultrafast, {
+    relativeQuotaWeight: "model_specific",
+    weightedStandardApiEquivalentUsd: 0.0315,
+    unweightedStandardApiEquivalentUsd: 0,
+    complete: true,
+    modelMultipliers: { "gpt-6.2-sol": null },
+  });
 });
 
 test("Ultrafast scanner sensitivity withholds unsupported models, dates and non-registry cards", async () => {

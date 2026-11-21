@@ -31,7 +31,7 @@ one another:
 | Stable filename | `local-unified-index-v1.sqlite` | Machine path continuity across app releases. |
 | Schema-family metadata | `local-unified-index-v2` | Logical family stored in `meta.schema_version`. |
 | SQLite `PRAGMA user_version` | `12` | Table/index/migration and interpretation compatibility generation. |
-| Parser version | `unified-rollout-typed-v21` | Meaning and provenance of facts extracted from rollout sources, including exact guardian auto-review classification, reviewed GPT-6.1 Sol and Terra identities and Standard/Fast/Ultrafast tier observations, structural record classification, paginated history boundaries, and exact selected input/output totals. |
+| Parser version | `unified-rollout-typed-v22` | Meaning and provenance of facts extracted from rollout sources, including exact guardian auto-review classification, reviewed GPT-6.1 Sol and Terra and GPT-6.2 Astra, Sol, and Astra for Law identities, Standard/Fast/Ultrafast tier observations, structural record classification, paginated history boundaries, and exact selected input/output totals. |
 | Source identity version | `codex-immutable-rollout-v1` | Rules for physical rollout identity/generation. |
 
 The application id is a separate SQLite format guard. A file with the wrong
@@ -107,7 +107,7 @@ Tier, effort, cumulative counters and replay admission are unchanged.
 
 Parser v15 introduced the per-event `-parent-model` and
 `-parent-model-partial` suffixes to record the inherited assumption;
-other records use the base and `-partial` stamps. Parsers v16 through v21 retain these
+other records use the base and `-partial` stamps. Parsers v16 through v22 retain these
 suffixes with their own version prefixes. They do not reclassify legacy inline
 inheritance. These are local provenance variants, not new physical schemas or
 telemetry fields. Cursor/generation stamps use the base parser version so warm refresh does not
@@ -187,7 +187,7 @@ vocabulary is widened.
 
 The opt-in local contribution reader `readDayWithV12Evidence(day)` derives
 successor boundary masks and same-session/millisecond ranks from these existing
-index facts; it adds no physical columns. It uses the same exact v15 through v21 boundary
+index facts; it adds no physical columns. It uses the same exact v15 through v22 boundary
 parser qualification as local cache analysis. A completed event-key boundary
 join can prove absence; an unavailable join cannot. Source generation/cursor
 ambiguity withholds order. This reader supplies evidence to dormant preparation
@@ -213,12 +213,15 @@ no supported measured usage, not an observed zero-token request. Adopting those
 records requires a separate response identity, replay and overlap reconciliation
 contract; this release does not claim record-only accounting support.
 
-Parser v21 recognizes exact GPT-6.1 Terra declarations through the reviewed
-catalog. Present sources reparse under the existing staged generation boundary;
-usage occurrence identity, token counters, source identity, and physical format
-12 remain unchanged. Missing/rotated sources retain their existing unknown model
-and parser provenance. Recognition does not infer a speed tier, a timing result,
-or provider-authoritative billing, and no retained row is merely relabeled v21.
+Parser v21 added exact GPT-6.1 Terra declarations. Parser v22 adds exact
+GPT-6.2 Astra, Sol, and Astra for Law declarations through the same reviewed
+catalog. Present
+sources reparse under the existing staged generation boundary with the same
+occurrence identities, token counters, source identity, and physical format 12.
+Missing or rotated sources retain their original model evidence and parser
+provenance. Retained v21 typed-tool evidence still qualifies under v22 and
+recorded coverage gaps remain visible. Speed, timing, and billing each require
+their own evidence.
 
 The index's `reasoning_effort` remains the observed turn/request setting. The
 upstream [#42328](https://github.com/openai/codex/pull/42328) marker
@@ -230,7 +233,7 @@ effort. No effective-effort carry is inferred across compaction, fork or resume.
 Actual application/eligible-mode and installed-client evidence remains a
 qualification gate, separate from catalogue recognition.
 
-The foreground companion treats verified published v10 through v20 to v21
+The foreground companion treats verified published v10 through v21 to v22
 parser upgrades as cold work even when the format version is already 12. The
 target and predecessor set are deliberately closed; current, unknown, malformed
 and future parser evidence cannot obtain a longer deadline. That run receives

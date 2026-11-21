@@ -1,21 +1,22 @@
 ---
 title: Platform support and qualification
-date: 2026-10-09
+date: 2026-11-21
 type: reference
 status: maintained
 ---
 
 # Platform support and qualification
 
-The released Electron application is **0.1.28** across macOS Apple silicon,
-macOS Intel, Windows x64 and Linux x64. See [current status](../current-status.md)
-for the source, updater, Homebrew and hosted boundaries, and the
-[public release manifest](https://github.com/adamallcock/tibotattle/releases/download/v0.1.28/release-manifest.json)
-for exact artifact hashes and recorded assurances.
+The public Electron release is **0.1.29** for macOS Apple silicon,
+macOS Intel, Windows x64 and Linux x64. [Current status](../current-status.md) ·
+[0.1.29 artifact hashes and assurances](https://github.com/adamallcock/tibotattle/releases/download/v0.1.29/release-manifest.json)
 
 ## Status matrix
 
-| Platform | Current distribution | Proven final-artifact boundary | Acceptance limits |
+The platform tests below refer to the October 9 release and its exact
+[0.1.28 artifacts](https://github.com/adamallcock/tibotattle/releases/download/v0.1.28/release-manifest.json).
+
+| Platform | Tested distribution | Proven final-artifact boundary | Acceptance limits |
 |---|---|---|---|
 | macOS 14+ arm64 | Supported; 0.1.28 DMG | Developer ID signing, notarization, stapling, Gatekeeper, clean install, named existing-credential fixtures and production native Sparkle upgrade on the exact signed candidate; production Electron upgrade with discoverable Codex logs | See the retained-history limitation below; complete credential failure matrix remains unqualified |
 | macOS 14+ x86_64 | Supported; separate 0.1.28 Intel DMG | Separate native trust, clean install and production native Sparkle upgrade; production Electron upgrade with discoverable Codex logs | See the retained-history limitation below; existing-credential upgrade was not exercised on Intel; full failure matrix remains unqualified |

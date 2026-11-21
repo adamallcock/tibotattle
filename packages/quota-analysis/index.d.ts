@@ -2,15 +2,17 @@ export type IsoInstant = string;
 export type OpaqueId = string;
 
 export const CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY: Readonly<{
-  version: "codex-included-allowance-speed-v0.1";
+  version: "codex-included-allowance-speed-v0.2";
   basis: "documented_included_allowance_relative_to_standard";
   unit: "dimensionless";
   reviewedFrom: "2026-09-29";
   historicalApplicability: "unavailable_before_reviewed_from";
-  source: Readonly<{ publisher: "openai"; url: string; statement: string }>;
-  weights: Readonly<{ standard: 1; fast: 2.5; ultrafast: 8 }>;
-  supportedFastModels: readonly string[];
-  supportedUltrafastModels: readonly ["gpt-6-astra"];
+  source: Readonly<{ publisher: "openai"; url: string; launchDatesUrl: string; statement: string }>;
+  rules: readonly Readonly<{
+    models: readonly string[];
+    reviewedFrom: "2026-09-29" | "2026-10-08" | "2026-10-26" | "2026-11-17";
+    weights: Readonly<{ standard?: 1; fast?: 2 | 2.5; ultrafast?: 6 | 8 }>;
+  }>[];
   establishesModeAvailability: false;
   infersConsumptionBasis: false;
   changesCalibrationBasis: false;
@@ -20,7 +22,7 @@ export type IncludedAllowanceConsumptionBasis =
 export interface IncludedAllowanceSpeedWeight {
   readonly policyVersion: typeof CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY.version;
   readonly basis: typeof CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY.basis;
-  readonly reviewedFrom: typeof CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY.reviewedFrom;
+  readonly reviewedFrom: typeof CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY.rules[number]["reviewedFrom"];
   readonly unit: "dimensionless";
   readonly status: "documented" | "unavailable" | "not_applicable";
   readonly reasonCode:
@@ -34,7 +36,7 @@ export interface IncludedAllowanceSpeedWeight {
     | "speed_mode_unavailable"
     | "model_not_reviewed"
     | "model_speed_not_supported";
-  readonly weight: 1 | 2.5 | 8 | null;
+  readonly weight: 1 | 2 | 2.5 | 6 | 8 | null;
 }
 export function includedAllowanceSpeedWeight(input?: {
   provider?: string | null;

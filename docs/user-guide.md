@@ -92,8 +92,9 @@ corrections, and longer-term views.
 
 Historical model identification and pricing updates require a completed main
 **Refresh**. Desktop startup requests this refresh once local analysis is
-allowed. Retained session and archived-session logs let the app correct earlier
-unrecognized GPT-6.1 Sol records without changing token totals. An exact stored
+allowed. Retained session and archived-session logs let the app identify
+GPT-6.2 Astra and GPT-6.2 Sol in records first read by 0.1.29, preserving
+their token totals. The same recovery applies to earlier models. An exact stored
 model identity can also be repriced from sufficient preserved token, context
 and time evidence. If a record's model became `unknown` and its original log is
 gone, the app cannot safely reconstruct that identity; missing evidence and
@@ -101,6 +102,14 @@ unsupported historical prices remain explicit. These are local analysis
 updates. A repaired model identity does not automatically replace an already
 accepted hosted contribution; hosted synchronization requires a compatible
 correction contract.
+
+For GPT-6.2 Astra and GPT-6.2 Sol, the API-equivalent Ultrafast price uses
+the date of the activity. It is 3× Standard through February 28, 2027,
+Pacific time, and 6× beginning March 1. Included Codex allowance uses 6×
+for Ultrafast in both periods. Choose **Ultrafast** in Model performance to
+see that speed. A turn marked **Ultra** describes its reasoning effort and
+can occur at a different speed. [API prices](https://developers.openai.com/api/docs/pricing) ·
+[Codex speed multipliers](https://learn.chatgpt.com/docs/pricing#speed-multipliers)
 
 Explicitly identified auto-review usage from October 6, 2026 (UTC) appears
 separately from the main Codex allowance after a completed detailed refresh.

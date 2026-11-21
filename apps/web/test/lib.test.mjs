@@ -4,7 +4,7 @@ import { webcrypto } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { buildAllowanceTrends } from "../public/allowance-trends.js";
 import { createContext, runInContext } from "node:vm";
-import { FAST_MODE_QUOTA_MULTIPLIERS } from "@app-usagemonitor/accounting";
+import { FAST_MODE_QUOTA_MULTIPLIERS, SPEED_MODE_API_MULTIPLIERS, SPEED_MODE_MODEL_FAMILY_KEYS } from "@app-usagemonitor/accounting";
 import {
   SEMANTIC_OPEN_TARGET_PLACEHOLDER,
 } from "../../../config/product-brand.js";
@@ -9963,6 +9963,55 @@ test("GPT-6.1 Terra preserves its identity and published Fast ratio without inve
   assert.equal(Object.hasOwn(result.accounting.fastMode.appliedMultipliers, "ultrafast:gpt-6.1-terra"), false);
 });
 
+
+test("GPT-6.2 accounting preserves distinct models and both event-time Ultrafast API ratios", () => {
+  const models = ["gpt-6.2-astra", "gpt-6.2-sol"];
+  const result = normalizeDashboardPayload({ mode: "real_local_evidence", accounting: {
+    modelUsage: [...models, "gpt-6.2-astra-law"].map((model, index) => ({
+      model, allowanceTrack: "primary", pricingStatus: "priced", events: 1, totalTokens: 120,
+      apiPriceEquivalentUsd: index + 1, components: { input_uncached_tokens: 100, output_text_tokens: 20 },
+    })),
+    speedWeighting: {
+      standard: { "gpt-6.2-astra-law": { events: 1, apiPriceEquivalentUsd: 3 } },
+      ultrafast: Object.fromEntries(models.flatMap(model => [3, 6].map(ratio =>
+        [`${model}:${ratio}x`, { events: ratio, apiPriceEquivalentUsd: 10 * ratio }]))),
+    },
+    fastMode: {
+      appliedMultipliers: {
+        "gpt-6.2-astra": 999,
+        "gpt-6.2-sol": 999,
+        "ultrafast:gpt-6.2-astra:3x": 999,
+        "ultrafast:gpt-6.2-sol:3x": 999,
+        "ultrafast:gpt-6.2-astra:6x": 999,
+        "ultrafast:gpt-6.2-sol:6x": 999,
+        "ultrafast:gpt-6.2-sol": 999,
+        "gpt-6.2-astra-law": 999,
+        "ultrafast:gpt-6.2-astra-law": 999,
+      },
+    },
+  } });
+  assert.deepEqual(result.accounting.modelUsage.map(row => [row.model, row.apiPriceEquivalentUsd]),
+    [["gpt-6.2-astra", 1], ["gpt-6.2-sol", 2], ["gpt-6.2-astra-law", 3]]);
+  assert.deepEqual(Object.keys(result.accounting.speedWeighting.ultrafast).sort(), [...SPEED_MODE_MODEL_FAMILY_KEYS].sort());
+  assert.deepEqual(result.accounting.speedWeighting.standard["gpt-6.2-astra-law"], { events: 1, apiPriceEquivalentUsd: 3 });
+  assert.deepEqual(result.accounting.fastMode.ultrafastMultipliers, SPEED_MODE_API_MULTIPLIERS.ultrafast);
+  for (const model of models) {
+    assert.equal(result.accounting.fastMode.multipliers[model], 2);
+    for (const ratio of [3, 6]) {
+      assert.deepEqual(result.accounting.speedWeighting.ultrafast[`${model}:${ratio}x`],
+        { events: ratio, apiPriceEquivalentUsd: 10 * ratio });
+    }
+  }
+  assert.deepEqual(result.accounting.fastMode.appliedMultipliers, {
+    "gpt-6.2-astra": 2,
+    "gpt-6.2-sol": 2,
+    "ultrafast:gpt-6.2-astra:3x": 3,
+    "ultrafast:gpt-6.2-sol:3x": 3,
+    "ultrafast:gpt-6.2-astra:6x": 6,
+    "ultrafast:gpt-6.2-sol:6x": 6,
+  });
+  assert.match(result.accounting.fastMode.metricExplainer, /published API rates for the exact model, context, and date/u);
+});
 
 test("local model usage retains mixed primary and separate auto-review rows and the raw API quote", () => {
   const common = {

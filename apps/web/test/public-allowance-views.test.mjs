@@ -81,7 +81,7 @@ test("each plan's own-week chart gets a rounded positive floor", () => {
 
 test("public model order is exact across cards, legend and same-day inspection", () => {
   const data = series();
-  const preferred = ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna",
+  const preferred = ["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna",
     "gpt-6.1-terra", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"];
   const ids = ["gpt-5.4", ...preferred.toReversed()];
   data.breakdowns.modelConfig = ids.map(modelId => ({ modelId, label: modelId }));
@@ -92,7 +92,7 @@ test("public model order is exact across cards, legend and same-day inspection",
   assert.deepEqual(model.latestSummaries.map(item => item.seriesKey), preferred);
   assert.deepEqual(model.dots.filter(dot => dot.day === "2026-09-05").map(dot => dot.seriesKey), preferred);
   assert.deepEqual(model.legendSeries.map(item => item.theme),
-    ["astra", "sol", "sol", "luna", "terra", "terra", "sol", "luna"]);
+    ["astra", "sol", "astra", "sol", "sol", "luna", "terra", "terra", "sol", "luna"]);
   assert.deepEqual(data.breakdowns.modelConfig.map(item => item.modelId), ids, "catalog is never reordered in place");
 });
 
@@ -194,9 +194,10 @@ test("the closed public wire survives normalization into all three chart views",
   // New release-line models keep roster slots but remain held back until
   // a served publication carries an estimate or valid current metadata.
   assert.deepEqual(normalized.breakdowns.modelConfig.map(model => model.modelId),
-    ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-terra", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"]);
+    ["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna",
+      "gpt-6.1-terra", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"]);
   assert.deepEqual(normalized.breakdowns.modelConfig.filter(model => !model.pinned).map(model => model.modelId),
-    ["gpt-6.1-sol", "gpt-6.1-terra"]);
+    ["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-sol", "gpt-6.1-terra"]);
   assert.ok(normalized.breakdowns.modelConfig.every(model => model.modelId !== "gpt-5.3-codex-spark"));
   for (const view of ["aggregate", "plans", "models"]) {
     assert.ok(buildCommunityAllowanceChartModel(normalized, { view }).dots.length > 0);
@@ -1024,7 +1025,7 @@ test("a later catalog's primary model is charted without a page edit, while hidd
   ]);
   assert.deepEqual(charted.map(model => model.modelId),
     [...PUBLIC_ALLOWANCE_MODEL_CONFIG.map(model => model.modelId), "gpt-7-nova"]);
-  assert.equal(charted[0].label, "GPT-6 Astra", "the roster keeps its own label");
+  assert.equal(charted.find(model => model.modelId === "gpt-6-astra").label, "GPT-6 Astra", "the roster keeps its own label");
   assert.deepEqual(charted.at(-1), { modelId: "gpt-7-nova", label: "GPT-7 Nova" }, "charted, but not pinned");
   assert.ok(known.has("gpt-5.5"), "a hidden model's tuples stay valid on the wire");
   assert.equal(charted.some(model => model.modelId === "gpt-5.5"), false);
@@ -1320,6 +1321,54 @@ test("GPT-6.1 Terra publication preserves its own values and legacy metadata gat
   assert.equal(normalizeCommunityDailySeries(unnamed, { nowMs: NOW }).breakdowns.unrecognizedModelTuples, 1);
   assert.doesNotMatch(renderView(unnamed).text, /GPT-6\.1 Terra/u);
   assert.match(renderView(addTuples(v11Fixture(), "gpt-6.1-terra", 1)).text, /GPT-6\.1 Terra/u);
+});
+
+test("GPT-6.2 cards and estimates require current public metadata for each exact identity", () => {
+  const models = [
+    { id: "gpt-6.2-astra", label: "GPT-6.2 Astra", family: "astra", order: 0 },
+    { id: "gpt-6.2-sol", label: "GPT-6.2 Sol", family: "sol", order: 1 },
+  ];
+  const block = [...models, ...TERRA_MODEL_BLOCK.map(model => ({ ...model, order: model.order + models.length }))];
+  const empty = v15Fixture(block);
+  const emptyChart = buildCommunityAllowanceChartModel(normalizeCommunityDailySeries(empty, { nowMs: NOW }), { view: "models" });
+  assert.deepEqual(emptyChart.cardSeries.slice(0, 2).map(({ key, theme, latest }) => [key, theme, latest]),
+    models.map(model => [model.id, model.family, null]));
+  assert.ok(emptyChart.dots.every(dot => !models.some(model => model.id === dot.seriesKey)));
+  const renderedEmpty = renderView(empty);
+  assert.deepEqual(renderedEmpty.cards.slice(0, 2).map(({ label, value }) => [label, value]),
+    models.map(model => [model.label, "—"]));
+  assert.deepEqual(renderedEmpty.cards.slice(2), renderView(v15Fixture(TERRA_MODEL_BLOCK)).cards);
+
+  const estimates = models.map((model, index) => [model.id, 1200 + 100 * index, 2]);
+  const named = v15Fixture(block);
+  const unnamed = v15Fixture(TERRA_MODEL_BLOCK);
+  for (const payload of [named, unnamed]) payload.allowanceBreakdowns.days.at(-1).models.push(...estimates);
+  const normalized = normalizeCommunityDailySeries(named, { nowMs: NOW });
+  const chart = buildCommunityAllowanceChartModel(normalized, { view: "models" });
+  assert.deepEqual(chart.legendSeries.slice(0, 2).map(({ key, theme }) => [key, theme]),
+    models.map(model => [model.id, model.family]));
+  assert.deepEqual(chart.dots.filter(dot => models.some(model => model.id === dot.seriesKey))
+    .map(dot => [dot.seriesKey, dot.centralUsd, dot.participantCount]), estimates);
+  const retained = projectCommunityDailyPayloadForCache(named, { nowMs: NOW });
+  assert.deepEqual(normalizeCommunityDailySeries(retained, { nowMs: NOW, retained: true }).breakdowns.days,
+    normalized.breakdowns.days);
+  assert.equal(normalizeCommunityDailySeries(unnamed, { nowMs: NOW }).breakdowns.unrecognizedModelTuples, 2);
+  assert.doesNotMatch(renderView(unnamed).text, /GPT-6\.2/u);
+});
+
+test("Astra for Law enters the public comparison only with named metadata and an estimate", () => {
+  const modelId = "gpt-6.2-astra-law";
+  const label = "GPT-6.2 Astra for Law";
+  const withMetadata = () => v15Fixture([...TERRA_MODEL_BLOCK, {
+    id: modelId, label, family: "astra", order: TERRA_MODEL_BLOCK.length,
+  }]);
+  const empty = withMetadata();
+  assert.ok(renderView(empty).cards.every(card => card.label !== label));
+  assert.ok(renderView(addTuples(v15Fixture(TERRA_MODEL_BLOCK), modelId, 1)).cards.every(card => card.label !== label));
+  const named = renderView(addTuples(withMetadata(), modelId, 1, 1200, 2));
+  const card = named.cards.find(card => card.label === label);
+  assert.equal(card.value, "$1,200");
+  assert.match(card.className, /allowance-model-astra/u);
 });
 
 function v14WithoutProMax() {

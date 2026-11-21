@@ -16,7 +16,7 @@ const KNOWN_SOURCE = 'rollout-credential-synthetic.jsonl';
 const OLD_PARSER = 'unified-rollout-typed-v18';
 // Qualification admits only the reviewed successor. A future parser needs a
 // separate review; importing its label alone must not silently advance proof.
-const CURRENT_PARSER = 'unified-rollout-typed-v21';
+const CURRENT_PARSER = 'unified-rollout-typed-v22';
 const REFRESH_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const contexts = new WeakMap();
 const fail = stage => { throw Object.assign(new Error('MAC_HISTORICAL_SOL_QUALIFICATION_REFUSED'),

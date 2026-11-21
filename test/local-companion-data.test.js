@@ -32,7 +32,11 @@ import {
   readLocalCollectorAccountingCache,
   writeLocalCollectorAccountingCache,
 } from "../src/local-collector-state.js";
-import { emptySpeedWeightingCrossing, FAST_MODE_QUOTA_MULTIPLIERS } from "@app-usagemonitor/accounting";
+import {
+  emptySpeedWeightingCrossing,
+  FAST_MODE_MULTIPLIER_SOURCE,
+  FAST_MODE_QUOTA_MULTIPLIERS,
+} from "@app-usagemonitor/accounting";
 import {
   openLocalUnifiedIndex,
   readUnifiedIndexGenerationDescriptor,
@@ -416,7 +420,7 @@ test("local companion builds a closed real-data projection without identifiers o
     assert.equal(fastMode.logObservability.sessionBaselineRecorded, false);
     assert.equal(fastMode.metricLabel, "Speed-priced API-price equivalent");
     assert.deepEqual(fastMode.multipliers, { ...FAST_MODE_QUOTA_MULTIPLIERS });
-    assert.equal(fastMode.multiplierSource.recordedAt, "2026-10-26");
+    assert.equal(fastMode.multiplierSource.recordedAt, FAST_MODE_MULTIPLIER_SOURCE.recordedAt);
     assert.deepEqual(fastMode.coverage, {
       totalEvents: 2,
       observedEvents: 1,
@@ -1559,6 +1563,55 @@ test("a declared Codex baseline fills only the turns it actually covers", async 
       undeclared.overview.accounting.fastMode.coverage.assumedEvents,
       3,
     );
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("companion allowance accounting preserves observed and declared Ultrafast price epochs", async () => {
+  const root = await mkdtemp(join(tmpdir(), "local-companion-ultrafast-"));
+  try {
+    await mkdir(join(root, ".usage-monitor"));
+    const usage = (observedAt, codexSpeedMode) => JSON.stringify({
+      schemaVersion: "0.3",
+      kind: "codex_rollout_usage_snapshot",
+      observedAt,
+      model: "gpt-6.2-sol",
+      components: {
+        input_uncached_tokens: 100_000,
+        input_cache_read_tokens: 0,
+        input_cache_write_tokens: 0,
+        output_text_tokens: 0,
+        output_reasoning_tokens: 0,
+      },
+      tierSemantics: { codexSpeedMode },
+    });
+    await writeFile(join(root, ".usage-monitor", "collector-events.jsonl"), [
+      usage("2027-03-01T07:59:00.000Z", "ultrafast"),
+      usage("2027-03-01T08:00:00.000Z", "unknown"),
+    ].join("\n") + "\n", { mode: 0o600 });
+
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      codexSpeedBaselines: [{
+        mode: "ultrafast",
+        firstSeenAt: "2027-03-01T07:55:00.000Z",
+        lastSeenAt: "2027-03-01T08:01:00.000Z",
+      }],
+      now: () => Date.parse("2027-03-01T08:30:00.000Z"),
+    });
+
+    const accounting = snapshot.overview.accounting;
+    assert.equal(accounting.apiPriceEquivalentUsd, 0.4);
+    assert.equal(accounting.quotaWeightedApiPriceEquivalentUsd, 1.8);
+    assert.equal(accounting.fastMode.coverage.observedEvents, 1);
+    assert.equal(accounting.fastMode.coverage.declaredFromConfigEvents, 1);
+    assert.equal(accounting.fastMode.weightingStatus, "complete");
+    assert.deepEqual(accounting.fastMode.appliedMultipliers, {
+      "ultrafast:gpt-6.2-sol:3x": 3,
+      "ultrafast:gpt-6.2-sol:6x": 6,
+    });
+    assert.deepEqual(snapshot.overview.timeline.usage.map((row) => row.allowanceWeighting[1]), [0.6, 1.2]);
   } finally {
     await rm(root, { recursive: true });
   }
