@@ -72,8 +72,8 @@
     }
   },
   "registry": {
-    "sha256": "c6af6f120feb9e355d3516a37ebc93657b1eddd2033a95d6d7abf6f0e6915361",
-    "version": "telemetry-v0.1-registry-2026-10-26.2"
+    "sha256": "52dd0f4e9284ea8f9ea4586d9179edca3c2bb8d2d682027dcebdcb94d56cfd0e",
+    "version": "telemetry-v0.1-registry-2026-11-17.1"
   },
   "schemas": {
     "members": [

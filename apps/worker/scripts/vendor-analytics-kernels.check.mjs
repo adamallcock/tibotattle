@@ -32,7 +32,7 @@ import {
   assertSourcePatchSpecs, AUTHORED_FILES, buildManifest, filePatchKind, SOURCE_PATCHES,
   commitsNamedIn, EXPORT_PATCHES, foreignCommitsNamed, locateExportSymbol, main, MANIFEST_FILE, MANIFEST_SCHEMA, maskNonCode,
   PARITY_HELPERS, PARITY_SPECS, parseArguments, parseCommit, planExportPatches, reachableInputs, regenerateTypeStubs,
-  reportAtCommit, resolveExportPatches, SOURCE_COMMIT, VendorError, vendorLayout, VENDORED_PACKAGES, verifyExportPatches,
+  reportAtCommit, resolveExportPatches, sourcePatchesAt, SOURCE_COMMIT, VendorError, vendorLayout, VENDORED_PACKAGES, verifyExportPatches,
   verifyVendoredTree, WEB_ROOTS, STABLE_PARITY_RELATIVE, STABLE_VENDOR_RELATIVE, vocabulariesOfTree, workerIndexAt,
 } from "./vendor-analytics-kernels.mjs";
 import {
@@ -141,12 +141,12 @@ const occurrences = (text, part) => text.split(part).length - 1;
  * `replace` must occur exactly once and goes back to its `find`. The texts come
  * from the reviewed list and must match the recorded digest.
  */
-function reverseSourcePatches(path, bytes, sourcePatches) {
+function reverseSourcePatches(path, bytes, sourcePatches, commit) {
   const recorded = sourcePatches.filter((patch) => patch.path === path);
   if (!recorded.length) return bytes;
   let text = bytes.toString("utf8");
   for (const record of [...recorded].reverse()) {
-    const patch = SOURCE_PATCHES.find((candidate) => candidate.path === path && candidate.id === record.id);
+    const patch = sourcePatchesAt(commit).find((candidate) => candidate.path === path && candidate.id === record.id);
     assert.ok(patch, `${path}: no reviewed source patch ${record.id}`);
     assert.equal(hunksDigest(patch), record.sha256, `${path}: ${record.id} texts differ from the recorded digest`);
     assert.equal(patch.hunks.length, record.hunks);
@@ -195,7 +195,7 @@ function assertFilesMatchCommit(tree) {
   for (const file of manifest.files) {
     const bytes = readFileSync(join(layout.vendorRoot, file.path));
     assert.equal(digest(bytes), file.sha256, `${file.path} sha256 differs from the manifest`);
-    const original = stripExportTokens(file.path, reverseSourcePatches(file.path, bytes, sourcePatches), patches);
+    const original = stripExportTokens(file.path, reverseSourcePatches(file.path, bytes, sourcePatches, commit), patches);
     if (file.patch === "export") {
       const count = patches.filter((patch) => patch.path === file.path).length;
       assert.equal(bytes.length, original.length + TOKEN.length * count, `${file.path} has edits beyond its export tokens`);

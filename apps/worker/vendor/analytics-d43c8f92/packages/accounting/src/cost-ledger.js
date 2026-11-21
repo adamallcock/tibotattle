@@ -1,4 +1,5 @@
 import { aggregateCostLedgers, calculateCost, compilePriceCatalog } from "runcost/browser";
+import { APP_OFFICIAL_PRICE_CARDS, priceCardEffectiveBoundary } from "./price-registry.js";
 
 // Runtime-neutral accounting kernel. Platform adapters belong in consuming apps.
 
@@ -160,7 +161,46 @@ function effectivePriceCards(priceCards, serviceTier, inputContextUnavailable = 
   }));
 }
 
-function compiledTierCatalog(priceCards, serviceTier, inputContextUnavailable = false) {
+function compileTierCatalogs(cards) {
+  // RunCost matches inclusively by UTC day. Select precise windows here and
+  // pass the equivalent day ranges for the selected cards to its compiler.
+  const preciseCards = cards.filter((card) => (
+    card.effective?.from?.length > 10 || card.effective?.to?.length > 10
+  ));
+  if (preciseCards.length === 0) {
+    const compiled = compilePriceCatalog(cards);
+    return () => compiled;
+  }
+  const precise = new Map(preciseCards.map((card) => [card, {
+    from: card.effective.from?.length > 10 ? priceCardEffectiveBoundary(card, "from") : -Infinity,
+    to: card.effective.to?.length > 10 ? priceCardEffectiveBoundary(card, "to") : Infinity,
+    dayCard: {
+      ...card,
+      effective: Object.fromEntries(Object.entries(card.effective).map(([edge, value]) => (
+        [edge, value.slice(0, 10)]
+      ))),
+    },
+  }]));
+  const boundaries = [...new Set([...precise.values()]
+    .flatMap(({ from, to }) => [from, to + 1])
+    .filter(Number.isFinite))].sort((a, b) => a - b);
+  const catalogs = new Map();
+  return (pricedAt) => {
+    const instant = pricedAt === null ? null : Date.parse(pricedAt);
+    const nextBoundary = instant === null ? -2 : boundaries.findIndex((boundary) => boundary > instant);
+    if (!catalogs.has(nextBoundary)) {
+      catalogs.set(nextBoundary, compilePriceCatalog(cards.flatMap((card) => {
+        const window = precise.get(card);
+        if (window === undefined) return [card];
+        return instant !== null && window.from <= instant && instant <= window.to
+          ? [window.dayCard] : [];
+      })));
+    }
+    return catalogs.get(nextBoundary);
+  };
+}
+
+function compiledTierCatalog(priceCards, serviceTier, inputContextUnavailable, pricedAt) {
   let tiers = COMPILED_TIER_CATALOGS.get(priceCards);
   if (!tiers) {
     tiers = new Map();
@@ -168,9 +208,30 @@ function compiledTierCatalog(priceCards, serviceTier, inputContextUnavailable = 
   }
   const key = `${serviceTier}:${inputContextUnavailable ? "unknown-context" : "known-context"}`;
   if (!tiers.has(key)) {
-    tiers.set(key, compilePriceCatalog(effectivePriceCards(priceCards, serviceTier, inputContextUnavailable)));
+    tiers.set(key, compileTierCatalogs(effectivePriceCards(priceCards, serviceTier, inputContextUnavailable)));
   }
-  return tiers.get(key);
+  return tiers.get(key)(pricedAt);
+}
+
+function emptyOfficialOpenAiPriceWarning(identity, serviceTier, pricedAt, inputContextUnavailable) {
+  const cards = APP_OFFICIAL_PRICE_CARDS.filter((card) => cardMatchesIdentity(card, identity));
+  if (cards.length === 0) return null;
+  const metadata = { ...identity, serviceTier };
+  const exactTier = cards.filter((card) => card.service_tier === serviceTier);
+  if (exactTier.length === 0) {
+    return warning("service_tier_exact_card_missing", "No exact price card covers the requested tier.", metadata);
+  }
+  const instant = Date.parse(pricedAt);
+  const historical = exactTier.filter((card) => (
+    priceCardEffectiveBoundary(card, "from") <= instant && instant <= priceCardEffectiveBoundary(card, "to")
+  ));
+  if (historical.length === 0) {
+    return warning("historical_price_missing", "No exact price card covers the event time.", metadata);
+  }
+  if (inputContextUnavailable && historical.every((card) => card.components.every(hasInputContextCondition))) {
+    return warning("total_input_context_missing", "Input context was unavailable for the context-dependent price.", metadata);
+  }
+  return null;
 }
 
 function readSemanticQuantity(components, keys, consumed, informationalWarnings) {
@@ -471,8 +532,14 @@ export function priceUsageEvent(event, { priceCards = [], pricingContext = {} } 
   if (!Array.isArray(priceCards)) throw new TypeError("priceCards must be an array");
 
   const surface = String(event.surface ?? pricingContext.surface ?? defaultSurface(provider));
+  const identity = { provider, model, surface };
   const explicitTier = event.serviceTier ?? event.apiTier ?? pricingContext.serviceTier ?? pricingContext.apiTier;
-  const serviceTier = String(explicitTier ?? "standard").trim().toLowerCase();
+  const requestedTier = String(explicitTier ?? "standard").trim().toLowerCase();
+  // OpenAI renamed Priority to Fast and accepts both API service_tier values.
+  // Retain an exact caller-supplied Fast card where one exists.
+  const serviceTier = provider === "openai" && requestedTier === "fast"
+    && !priceCards.some((card) => cardMatchesIdentity(card, identity) && card.service_tier === "fast")
+    ? "priority" : requestedTier;
   const tierSource = explicitTier === undefined || explicitTier === null ? "assumed_standard_counterfactual" : "observed_or_caller_supplied";
   const historicalPricing = pricingContext.priceEpochBasis === "event_time_when_registry_has_effective_evidence";
   const rawPricedAt = event.pricedAt ?? event.timestamp ?? pricingContext.pricedAt ?? pricingContext.timestamp;
@@ -507,7 +574,6 @@ export function priceUsageEvent(event, { priceCards = [], pricingContext = {} } 
     ));
   }
 
-  const identity = { provider, model, surface };
   const exactTierCardExists = serviceTier === "standard" || priceCards.some((card) => (
     cardMatchesIdentity(card, identity) && card.service_tier === serviceTier
   ));
@@ -519,6 +585,14 @@ export function priceUsageEvent(event, { priceCards = [], pricingContext = {} } 
     || observation.unavailable.some(isInputComponent)
     || tokenResult.preUnpriced.some((component) => isInputComponent(component.name))
   );
+  // RunCost need not select a card when all observed quantities are zero.
+  // Historical coverage still requires a published tier, epoch and context.
+  const emptyEventPriceWarning = historicalPricing && pricedAt && provider === "openai"
+    && priceCards === APP_OFFICIAL_PRICE_CARDS && candidates.length === 0
+    && preUnpriced.length === 0 && observation.unavailable.length === 0
+    ? emptyOfficialOpenAiPriceWarning(identity, serviceTier, pricedAt, inputContextUnavailable)
+    : null;
+  if (emptyEventPriceWarning) coverageWarnings.push(emptyEventPriceWarning);
   const contextDependentComponents = new Set(inputContextUnavailable
     ? priceCards.filter((card) => cardMatchesIdentity(card, identity)
       && (card.service_tier ?? "standard") === serviceTier)
@@ -548,11 +622,19 @@ export function priceUsageEvent(event, { priceCards = [], pricingContext = {} } 
     metadata: { basis: BASIS, normalized_metadata_only: true },
   };
 
-  const ledger = calculateCost({
+  const calculatedLedger = calculateCost({
     usageLedger,
-    priceCards: compiledTierCatalog(priceCards, serviceTier, inputContextUnavailable),
+    priceCards: compiledTierCatalog(priceCards, serviceTier, inputContextUnavailable, pricedAt),
     mode: "compatibility",
   });
+  // Tier filtering can hide a known model from RunCost. The selected tier is
+  // still unpriceable, but model identity is established by the full registry.
+  const tierFilterHidKnownModel = !exactTierCardExists
+    && calculatedLedger.warnings.some((item) => item.code === "unknown_model")
+    && priceCards.some((card) => cardMatchesIdentity(card, identity));
+  const ledger = tierFilterHidKnownModel
+    ? { ...calculatedLedger, warnings: calculatedLedger.warnings.filter((item) => item.code !== "unknown_model") }
+    : calculatedLedger;
   const pricedByKey = new Map(ledger.components.map((component) => [component.metadata?.local_component_key, component]));
   const components = [];
   for (let index = 0; index < usageLedger.components.length; index += 1) {
@@ -660,7 +742,7 @@ export function priceUsageEvent(event, { priceCards = [], pricingContext = {} } 
         ? { historicalPriceReasonCode: pricingContext.historicalPriceReasonCode }
         : {}),
     },
-    coverageStatus: historicalPricing && !pricedAt
+    coverageStatus: (historicalPricing && !pricedAt) || emptyEventPriceWarning
       ? "unpriced"
       : coverageStatus(pricedPositiveCount, unpricedPositiveCount, unavailableCount),
     coverageCounts: {

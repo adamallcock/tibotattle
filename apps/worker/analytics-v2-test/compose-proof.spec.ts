@@ -281,7 +281,7 @@ describe("one-process composition over the reviewed vendored kernels", () => {
     for (const day of historicalIdentity.days) {
       const spend = day.payload.apiEquivalentSpend as Record<string, unknown>;
       expect(spend.pricingMethodVersion).toBe("server-api-price-equivalent-v0.6");
-      expect(spend.registrySha256).toBe("206544769b43e4b9645284258edd38f7c07a226022db10f5ec0181335df236ab");
+      expect(spend.registrySha256).toBe("eca860219a79a24a2cc1ba07471e2ecc321281508dc7e8d48412deef77609c77");
       spend.pricingMethodVersion = "server-api-price-equivalent-v0.5";
       spend.registrySha256 = HISTORICAL_REGISTRY_SHA256;
     }
@@ -295,11 +295,13 @@ describe("one-process composition over the reviewed vendored kernels", () => {
     // Sol and then Terra were appended to the model catalog. Restoring only
     // each exact predecessor prefix/catalog stamp must preserve every original
     // estimate, supporting count, date and plan normalization byte.
-    expect(preview.models.modelConfig).toHaveLength(44);
+    expect(preview.models.modelConfig).toHaveLength(47);
+    expect(preview.models.modelConfig.slice(44).map(({ modelId }) => modelId))
+      .toEqual(["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.2-astra-law"]);
     expect(preview.models.modelConfig[42]!.modelId).toBe("gpt-6.1-sol");
     expect(preview.models.modelConfig[43]!.modelId).toBe("gpt-6.1-terra");
-    expect(preview.models.days.every((day) => day.catalogVersion === "reviewed-model-catalog-2026-10-26.1"
-      && day.values.every(([modelId]) => modelId !== "gpt-6.1-sol" && modelId !== "gpt-6.1-terra"))).toBe(true);
+    expect(preview.models.days.every((day) => day.catalogVersion === "reviewed-model-catalog-2026-11-17.1"
+      && day.values.every(([modelId]) => !["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.2-astra-law"].includes(modelId)))).toBe(true);
     const historicalCatalog = { ...preview, models: { ...preview.models,
       modelConfig: preview.models.modelConfig.slice(0, 42),
       days: preview.models.days.map((day) => ({ ...day, catalogVersion: "reviewed-model-catalog-2026-09-23.1" })),
@@ -312,8 +314,17 @@ describe("one-process composition over the reviewed vendored kernels", () => {
     } };
     expect(validCachedAdminCommunityAllowancePreview(september29Catalog, preview.generatedAt, NOW_MS)).toBe(true);
     expect(digest(september29Catalog)).toBe(SEPTEMBER29_PREVIEW_SHA256);
-    expect(digest(response)).toBe(COMPOSED_RESPONSE_SHA256);
-    expect(digest(preview)).toBe(COMPOSED_PREVIEW_SHA256);
+    const octoberResponse = structuredClone(response);
+    for (const day of octoberResponse.days) {
+      (day.payload.apiEquivalentSpend as Record<string, unknown>).registrySha256 = "206544769b43e4b9645284258edd38f7c07a226022db10f5ec0181335df236ab";
+    }
+    expect(digest(octoberResponse)).toBe(COMPOSED_RESPONSE_SHA256);
+    const octoberPreview = { ...preview, models: { ...preview.models,
+      modelConfig: preview.models.modelConfig.slice(0, 44),
+      days: preview.models.days.map((day) => ({ ...day, catalogVersion: "reviewed-model-catalog-2026-10-26.1" })),
+    } };
+    expect(validCachedAdminCommunityAllowancePreview(octoberPreview, preview.generatedAt, NOW_MS)).toBe(true);
+    expect(digest(octoberPreview)).toBe(COMPOSED_PREVIEW_SHA256);
     console.log(JSON.stringify({ composeProof: { responseSha256: digest(response), previewSha256: digest(preview),
       responseBytes: JSON.stringify(response).length } }));
   }, 240_000);

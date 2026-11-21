@@ -44,9 +44,13 @@ function initializeRegistry(): void {
       if (card.provider === "openai" && card.metadata?.total_input_context_band != null) nextContextModels.add(model);
     }
     for (const [edge, value] of Object.entries(card.effective ?? {})) {
-      // RunCost selects by calendar date, with an inclusive `to` day.
-      if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/u.test(value)) {
-        nextTimes.add(Date.parse(value) + (edge === "to" ? 86_400_000 : 0));
+      // Date-only upper bounds include the whole UTC day. An instant upper
+      // bound includes its last millisecond before the next cache cell.
+      if (typeof value === "string") {
+        const boundary = Date.parse(value);
+        if (Number.isFinite(boundary)) {
+          nextTimes.add(boundary + (edge === "to" ? (value.length === 10 ? 86_400_000 : 1) : 0));
+        }
       }
     }
     for (const component of card.components) {
@@ -107,6 +111,10 @@ function compilePlan(row: TelemetryUsageEvent, openai: boolean): Plan | null {
     reasoningEffort: "unknown", components: zero,
   };
   const base = referencePrice(template as TelemetryUsageEvent);
+  // An unavailable exact tier or epoch stays unpriced for zero-token events.
+  // Delegate those cells to the oracle rather than turning their metadata into
+  // the specialization's ordinary zero-cost result.
+  if (base.coverageStatus !== "fully_priced") return null;
   const rates: number[] = [], priced: boolean[] = [], reasons: string[][] = [];
   let cardId: string | null = null;
   for (let i = 0; i < KEYS.length; i += 1) {

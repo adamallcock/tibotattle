@@ -3,7 +3,7 @@
 // The published identities match the accounting package's reviewed text-model
 // cards; synthetic provider-tool cards are deliberately excluded. Explicit
 // aliases retain their own identity even when a caller shares a price card.
-export const REVIEWED_MODEL_CATALOG_VERSION = "reviewed-model-catalog-2026-10-26.1";
+export const REVIEWED_MODEL_CATALOG_VERSION = "reviewed-model-catalog-2026-11-17.1";
 
 const reviewedOpenAiModelRows = [
   ["codex-auto-review", "Codex Auto-review", "assumed_alias", "gpt-5.4"],
@@ -84,6 +84,18 @@ export const REVIEWED_MODEL_CATALOG = Object.freeze([
     id: "gpt-6.1-terra", label: "GPT-6.1 Terra", provider: "openai_codex",
     allowanceTrack: "primary", pricingStatus: "published", priceModelId: "gpt-6.1-terra",
   }),
+  Object.freeze({
+    id: "gpt-6.2-astra", label: "GPT-6.2 Astra", provider: "openai_codex",
+    allowanceTrack: "primary", pricingStatus: "published", priceModelId: "gpt-6.2-astra",
+  }),
+  Object.freeze({
+    id: "gpt-6.2-sol", label: "GPT-6.2 Sol", provider: "openai_codex",
+    allowanceTrack: "primary", pricingStatus: "published", priceModelId: "gpt-6.2-sol",
+  }),
+  Object.freeze({
+    id: "gpt-6.2-astra-law", label: "GPT-6.2 Astra for Law", provider: "openai_codex",
+    allowanceTrack: "primary", pricingStatus: "published", priceModelId: "gpt-6.2-astra-law",
+  }),
 ]);
 
 export const REVIEWED_CODEX_MODEL_IDS = Object.freeze(
@@ -101,29 +113,29 @@ export function reviewedModelIdentity(value) {
   return reviewedModelById.get(value.toLowerCase()) ?? null;
 }
 
-// Requested API effort is not effective effort, configuration-update evidence,
-// or proof of cache compatibility. Codex Astra Ultra requests xhigh and enables
-// delegation; legacy reviewed Codex models retain the existing Ultra -> Max
-// request mapping. Unknown/custom identities cannot inherit that equivalence.
-// Upstream source: openai/codex 5cc1c94b8e3226c5a343b2f4fe77bf0585234f50,
-// codex-rs/core/src/client.rs and codex-rs/models-manager/models.json.
+// Codex Ultra enables delegation and requests each model's configured
+// multi_agent_reasoning_effort. Keep the configured effort separate from
+// request and effective effort. These mappings are reviewed for exact IDs.
+// Upstream model catalogs: openai/codex 5cc1c94b8e3226c5a343b2f4fe77bf0585234f50
+// and rust-v0.170.0, codex-rs/models-manager/models.json.
+const codexUltraXhighModelIds = new Set(["gpt-6-astra", "gpt-6.2-astra", "gpt-6.2-sol"]);
+const codexUnreviewedUltraModelIds = new Set(["gpt-6.1-astra", "gpt-6.1-terra", "gpt-6.2-astra-law"]);
+
 export function codexRequestReasoningEffort(modelId, effort) {
   if (!["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "unknown"].includes(effort)) return null;
   if (effort !== "ultra") return effort;
   const model = reviewedModelIdentity(modelId);
   if (model?.provider !== "openai_codex") return effort;
-  // Terra supports max API effort, but no reviewed Codex Ultra mapping is
-  // established for it. Recognition alone must not claim cache equivalence.
-  if (model.id === "gpt-6.1-astra" || model.id === "gpt-6.1-terra") return effort;
-  return model.id === "gpt-6-astra" ? "xhigh" : "max";
+  if (codexUnreviewedUltraModelIds.has(model.id)) return effort;
+  return codexUltraXhighModelIds.has(model.id) ? "xhigh" : "max";
 }
 
 // A matching API effort alone does not imply matching cache configuration.
-// Astra Ultra also enables proactive delegation, so keep it distinct from
-// ordinary xhigh for continuity comparisons even though both request xhigh.
+// For the reviewed xhigh mappings, preserve Ultra's delegation configuration
+// for continuity comparisons.
 export function codexCacheReasoningConfiguration(modelId, effort) {
   const requested = codexRequestReasoningEffort(modelId, effort);
   return requested !== null && effort === "ultra"
-      && reviewedModelIdentity(modelId)?.id === "gpt-6-astra"
+      && codexUltraXhighModelIds.has(reviewedModelIdentity(modelId)?.id)
     ? "ultra" : requested;
 }

@@ -136,6 +136,8 @@ const REGISTRY_PINS = Object.freeze([
   // Kernel 25: bounded current-owner-day correction with new-version provenance;
   // prior registry entries, vendor and price catalog remain unchanged.
   "01e8207c8f36afc40b20fe1368531afb99a04adceb029debff53a70d469e8e85",
+  // Kernel 26: the live job line adopts reviewed GPT-6.2 prices and exact time boundaries.
+  "6e66db8933cabf629a29017555688f90f224b3f867219630c1a44c0c37e3a332",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];

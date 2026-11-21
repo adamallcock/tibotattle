@@ -1,5 +1,5 @@
 // Reviewed provider price evidence shared by local and edge accounting adapters.
-export const APP_PRICE_REGISTRY_OBSERVED_AT = "2026-10-26T22:25:14Z";
+export const APP_PRICE_REGISTRY_OBSERVED_AT = "2026-11-21T14:12:40Z";
 // First official-page review. This is the review boundary, not a lower bound
 // on the reviewed model rates: recognized OpenAI/Codex events before this date
 // remain priceable unless a card has an explicit vendor-effective boundary.
@@ -10,7 +10,7 @@ export const OPENAI_PRICE_EVIDENCE_START_DATE = OPENAI_FIRST_OBSERVED_DATE;
 // lower bound on the reviewed model rates.
 const ANTHROPIC_OBSERVED_AT = "2026-07-25T14:18:33Z";
 const PER_MILLION = "1000000";
-export const APP_PRICE_REGISTRY_VERSION = "app-official-api-prices-v0.10";
+export const APP_PRICE_REGISTRY_VERSION = "app-official-api-prices-v0.11";
 
 export const OFFICIAL_PRICE_SOURCE_URLS = Object.freeze({
   openai: "https://developers.openai.com/api/docs/pricing",
@@ -111,13 +111,49 @@ const SOURCE_DEFINITIONS = Object.freeze({
     provider: "openai",
     name: "openai-official-terra61-api-pricing",
     url: OFFICIAL_PRICE_SOURCE_URLS.openai,
-    observedAt: APP_PRICE_REGISTRY_OBSERVED_AT,
+    observedAt: "2026-10-26T22:25:14Z",
     evidenceVersion: "openai-terra61-api-pricing-reviewed-2026-10-26",
     evidenceUrls: Object.freeze([
       OFFICIAL_PRICE_SOURCE_URLS.openai,
       "https://developers.openai.com/api/docs/models/gpt-6.1-terra",
       "https://developers.openai.com/api/docs/changelog",
       "https://openai.com/index/introducing-gpt-6-1-terra/",
+    ]),
+  }),
+  openaiGpt62: Object.freeze({
+    provider: "openai",
+    name: "openai-official-gpt62-api-pricing",
+    url: OFFICIAL_PRICE_SOURCE_URLS.openai,
+    observedAt: APP_PRICE_REGISTRY_OBSERVED_AT,
+    evidenceVersion: "openai-gpt62-api-pricing-reviewed-2026-11-21",
+    evidenceUrls: Object.freeze([
+      OFFICIAL_PRICE_SOURCE_URLS.openai,
+      "https://developers.openai.com/api/docs/models/gpt-6.2-astra",
+      "https://developers.openai.com/api/docs/models/gpt-6.2-sol",
+      "https://developers.openai.com/api/docs/changelog",
+    ]),
+  }),
+  openaiSol61UltrafastLaunch: Object.freeze({
+    provider: "openai",
+    name: "openai-official-sol61-ultrafast-launch-api-pricing",
+    url: OFFICIAL_PRICE_SOURCE_URLS.openai,
+    observedAt: APP_PRICE_REGISTRY_OBSERVED_AT,
+    evidenceVersion: "openai-sol61-ultrafast-launch-api-pricing-reviewed-2026-11-21",
+    evidenceUrls: Object.freeze([
+      OFFICIAL_PRICE_SOURCE_URLS.openai,
+      "https://developers.openai.com/api/docs/models/gpt-6.1-sol",
+      "https://developers.openai.com/api/docs/changelog",
+    ]),
+  }),
+  openaiGpt62Law: Object.freeze({
+    provider: "openai",
+    name: "openai-official-gpt62-law-api-pricing",
+    url: OFFICIAL_PRICE_SOURCE_URLS.openai,
+    observedAt: APP_PRICE_REGISTRY_OBSERVED_AT,
+    evidenceVersion: "openai-gpt62-law-api-pricing-reviewed-2026-11-21",
+    evidenceUrls: Object.freeze([
+      "https://developers.openai.com/api/docs/pricing#legal-model-configurations",
+      "https://openai.com/index/astra-law-6-2/",
     ]),
   }),
 });
@@ -187,6 +223,54 @@ const OPENAI_TERRA61_ROWS = Object.freeze([
   ["gpt-6.1-terra", "flex", "1", "0.05", "1.25", "3.75", "long", "from-2026-10-26"],
   ["gpt-6.1-terra", "priority", "2", "0.1", "2.5", "10", "short", "from-2026-10-26"],
   ["gpt-6.1-terra", "priority", "4", "0.2", "5", "15", "long", "from-2026-10-26"],
+]);
+
+// The long band applies its rates to the full request above 272,000 input
+// tokens. The Ultrafast launch price ends at midnight Pacific on March 1.
+const OPENAI_GPT62_LAUNCH_DATE = "2026-11-17";
+const OPENAI_GPT62_ULTRAFAST_LIST_AT = "2027-03-01T08:00:00.000Z";
+const OPENAI_GPT62_ULTRAFAST_PROMO_LAST_AT = "2027-03-01T07:59:59.999Z";
+const OPENAI_GPT62_ROWS = Object.freeze([
+  ["gpt-6.2-astra", "standard", "8", "0.4", "10", "40", "short", "from-2026-11-17"],
+  ["gpt-6.2-astra", "standard", "16", "0.8", "20", "60", "long", "from-2026-11-17"],
+  ["gpt-6.2-astra", "batch", "4", "0.2", "5", "20", "short", "from-2026-11-17"],
+  ["gpt-6.2-astra", "batch", "8", "0.4", "10", "30", "long", "from-2026-11-17"],
+  ["gpt-6.2-astra", "priority", "16", "0.8", "20", "80", "short", "from-2026-11-17"],
+  ["gpt-6.2-astra", "priority", "32", "1.6", "40", "120", "long", "from-2026-11-17"],
+  ["gpt-6.2-astra", "ultrafast", "24", "1.2", "30", "120", "short", "gpt62-ultrafast-promo"],
+  ["gpt-6.2-astra", "ultrafast", "48", "2.4", "60", "180", "long", "gpt62-ultrafast-promo"],
+  ["gpt-6.2-astra", "ultrafast", "48", "2.4", "60", "240", "short", "gpt62-ultrafast-list"],
+  ["gpt-6.2-astra", "ultrafast", "96", "4.8", "120", "360", "long", "gpt62-ultrafast-list"],
+  ["gpt-6.2-sol", "standard", "2", "0.1", "2.5", "10", "short", "from-2026-11-17"],
+  ["gpt-6.2-sol", "standard", "4", "0.2", "5", "15", "long", "from-2026-11-17"],
+  ["gpt-6.2-sol", "batch", "1", "0.05", "1.25", "5", "short", "from-2026-11-17"],
+  ["gpt-6.2-sol", "batch", "2", "0.1", "2.5", "7.5", "long", "from-2026-11-17"],
+  ["gpt-6.2-sol", "priority", "4", "0.2", "5", "20", "short", "from-2026-11-17"],
+  ["gpt-6.2-sol", "priority", "8", "0.4", "10", "30", "long", "from-2026-11-17"],
+  ["gpt-6.2-sol", "ultrafast", "6", "0.3", "7.5", "30", "short", "gpt62-ultrafast-promo"],
+  ["gpt-6.2-sol", "ultrafast", "12", "0.6", "15", "45", "long", "gpt62-ultrafast-promo"],
+  ["gpt-6.2-sol", "ultrafast", "12", "0.6", "15", "60", "short", "gpt62-ultrafast-list"],
+  ["gpt-6.2-sol", "ultrafast", "24", "1.2", "30", "90", "long", "gpt62-ultrafast-list"],
+]);
+
+// Include the exact period bounds in the hashed source evidence.
+const OPENAI_GPT62_PERIODS = Object.freeze({
+  "gpt62-ultrafast-promo": Object.freeze({ from: OPENAI_GPT62_LAUNCH_DATE, to: OPENAI_GPT62_ULTRAFAST_PROMO_LAST_AT }),
+  "gpt62-ultrafast-list": Object.freeze({ from: OPENAI_GPT62_ULTRAFAST_LIST_AT }),
+  "gpt62-law-reviewed-promo": Object.freeze({ from: OPENAI_GPT62_LAUNCH_DATE, to: "2026-12-31" }),
+});
+
+// OpenAI only commits to the Law promotional price through December 31.
+// Bound the evidence at that date until a later window is published.
+const OPENAI_GPT62_LAW_ROWS = Object.freeze([
+  ["gpt-6.2-astra-law", "standard", "8", "0.4", "10", "40", "short", "gpt62-law-reviewed-promo"],
+  ["gpt-6.2-astra-law", "standard", "16", "0.8", "20", "60", "long", "gpt62-law-reviewed-promo"],
+]);
+
+// OpenAI added this API tier on October 8, after the model itself launched.
+const OPENAI_SOL61_ULTRAFAST_LAUNCH_ROWS = Object.freeze([
+  ["gpt-6.1-sol", "ultrafast", "12", "0.6", "15", "60", "short", "from-2026-10-08"],
+  ["gpt-6.1-sol", "ultrafast", "24", "1.2", "30", "90", "long", "from-2026-10-08"],
 ]);
 
 const OPENAI_ROWS = Object.freeze([
@@ -427,12 +511,21 @@ export const NORMALIZED_PRICE_EVIDENCE_ROWS = deepFreeze({
   anthropicLatest: [ANTHROPIC_LATEST_ROWS],
   openaiSol61Ultrafast: [OPENAI_SOL61_ULTRAFAST_ROWS],
   openaiTerra61: [OPENAI_TERRA61_ROWS],
+  openaiGpt62: [OPENAI_GPT62_ROWS, {
+    "gpt62-ultrafast-promo": OPENAI_GPT62_PERIODS["gpt62-ultrafast-promo"],
+    "gpt62-ultrafast-list": OPENAI_GPT62_PERIODS["gpt62-ultrafast-list"],
+  }],
+  openaiSol61UltrafastLaunch: [OPENAI_SOL61_ULTRAFAST_LAUNCH_ROWS],
+  openaiGpt62Law: [OPENAI_GPT62_LAW_ROWS, OPENAI_GPT62_PERIODS["gpt62-law-reviewed-promo"]],
 });
 
 // These hashes are generated from the normalized reviewed rows during an
 // evidence refresh and checked independently in Node-side registry tests. They
 // are constants here so the production registry has no Node crypto dependency.
 const EVIDENCE_HASHES = Object.freeze({
+  openaiGpt62: "4d1952e9a19e41f7b9d10c7f34de1d7bf6083214398eebd28279bde1e403f5b0",
+  openaiSol61UltrafastLaunch: "0312d9eaa05e4867fcd179975ef01b58d06c36b55dd1eaf28e8081eb7aeef0de",
+  openaiGpt62Law: "41b0f25ddacfbf51b1ffb4067b831ef205d2b31984edad1f6cd2ccd5ebf4a320",
   openaiTerra61: "5c35b00c326c91a16533625e0be5d242795030e3ad7160eeb47561d04ec5c7c1",
   openaiSolLuna: "1b5bbf4e02b450b689dbd0d5208dabd79363c75aaa9b0a10eab4354a4510aca7",
   openai: "ec99367fb7d91dc68f1501e325384eda7a5cf885c763deebd28e1eff594dad57",
@@ -503,6 +596,15 @@ function cardId(provider, model, tier, suffix = "current") {
 // so all reviewed history stays priceable as far back as events go.
 
 function openAiEffective(period) {
+  if (Object.hasOwn(OPENAI_GPT62_PERIODS, period)) {
+    const effective = OPENAI_GPT62_PERIODS[period];
+    return {
+      effective,
+      vendorEffectiveFrom: effective.from,
+      vendorEffectiveTo: effective.to ?? null,
+      suffix: period,
+    };
+  }
   const through = typeof period === "string" && /^through-(\d{4}-\d{2}-\d{2})$/.exec(period);
   if (through) {
     return {
@@ -559,7 +661,8 @@ const OPENAI_ALIAS_ASSUMPTIONS = Object.freeze({
 
 function hasStrictAbove272KBoundary(model) {
   return model === "gpt-6-astra" || model === "gpt-6-sol" || model === "gpt-6-luna"
-    || model === "gpt-6.1-sol" || model === "gpt-6.1-terra";
+    || model === "gpt-6.1-sol" || model === "gpt-6.1-terra"
+    || model === "gpt-6.2-astra" || model === "gpt-6.2-sol" || model === "gpt-6.2-astra-law";
 }
 
 function openAiCard([model, tier, input, cacheRead, cacheWrite, output, contextBand = null, period = null]) {
@@ -567,8 +670,13 @@ function openAiCard([model, tier, input, cacheRead, cacheWrite, output, contextB
   const isSolLuna = model === "gpt-6-sol" || model === "gpt-6-luna";
   const isSol61 = model === "gpt-6.1-sol";
   const isTerra61 = model === "gpt-6.1-terra";
+  const isGpt62 = model === "gpt-6.2-astra" || model === "gpt-6.2-sol";
+  const isGpt62Law = model === "gpt-6.2-astra-law";
   const strictAbove272K = hasStrictAbove272KBoundary(model);
-  const sourceKey = isTerra61 ? "openaiTerra61" : isSol61 || (isAstra && tier === "ultrafast")
+  const sourceKey = isGpt62Law ? "openaiGpt62Law"
+    : isGpt62 ? "openaiGpt62"
+    : isSol61 && tier === "ultrafast" ? "openaiSol61UltrafastLaunch"
+    : isTerra61 ? "openaiTerra61" : isSol61 || (isAstra && tier === "ultrafast")
     ? "openaiSol61Ultrafast"
     : isAstra ? "openaiAstra" : isSolLuna ? "openaiSolLuna" : "openai";
   const contextConditions = contextBand === "short"
@@ -611,6 +719,10 @@ function openAiCard([model, tier, input, cacheRead, cacheWrite, output, contextB
       ...(contextBand ? {
         coverage_note: isTerra61
           ? "GPT-6.1 Terra short-context prices apply through 272,000 total request input tokens; above 272,000, long prices apply to the entire request. Cache-write pricing assumes the existing 30-minute OpenAI component; 12-hour retention and regional processing are not represented."
+          : isGpt62Law
+          ? "GPT-6.2 Astra for Law Standard promotional prices are documented at least through December 31, 2026. This card uses the 30-minute cache-write rate; long-context prices apply to the full request above 272,000 input tokens."
+          : isGpt62
+          ? "GPT-6.2 long-context prices apply to the full request above 272,000 input tokens. This card uses the 30-minute cache-write rate for API-equivalent comparisons. Retention-specific prices, regional pricing and discounted background windows are outside its coverage."
           : isAstra
           ? "Astra short-context prices apply through 272,000 total request input tokens; above 272,000, long prices apply to the entire request."
           : isSol61
@@ -728,6 +840,8 @@ function providerToolCard(provider, model, rows) {
 export const OPENAI_OFFICIAL_PRICE_CARDS = deepFreeze([
   ...OPENAI_ROWS, ...OPENAI_ASTRA_ROWS, ...OPENAI_SOL_LUNA_ROWS,
   ...OPENAI_SOL61_ULTRAFAST_ROWS, ...OPENAI_TERRA61_ROWS,
+  ...OPENAI_GPT62_ROWS, ...OPENAI_SOL61_ULTRAFAST_LAUNCH_ROWS,
+  ...OPENAI_GPT62_LAW_ROWS,
 ].map(openAiCard));
 export const ANTHROPIC_OFFICIAL_PRICE_CARDS = deepFreeze([
   ...ANTHROPIC_ROWS.map((row) => anthropicCard(row)),
@@ -744,7 +858,7 @@ export const APP_OFFICIAL_PRICE_CARDS = deepFreeze([
 ]);
 
 export const APP_PRICE_REGISTRY_SHA256 =
-  "206544769b43e4b9645284258edd38f7c07a226022db10f5ec0181335df236ab";
+  "eca860219a79a24a2cc1ba07471e2ecc321281508dc7e8d48412deef77609c77";
 
 export const APP_PRICE_REGISTRY_MANIFEST = deepFreeze({
   version: APP_PRICE_REGISTRY_VERSION,
@@ -767,16 +881,17 @@ const ALLOWED_TIERS = Object.freeze({
   anthropic: new Set(["standard", "batch", "fast"]),
 });
 
-function rangeBoundary(card, boundary, fallback) {
-  return card.effective?.[boundary] || fallback;
+// Both endpoints are inclusive. A date-only upper endpoint covers the full
+// UTC day, while an instant represents the exact recorded millisecond.
+export function priceCardEffectiveBoundary(card, edge) {
+  const value = card.effective?.[edge];
+  if (value === undefined) return edge === "from" ? -Infinity : Infinity;
+  return Date.parse(value) + (edge === "to" && value.length === 10 ? 86_399_999 : 0);
 }
 
-function rangesOverlap(left, right) {
-  const leftFrom = rangeBoundary(left, "from", "0000-00-00");
-  const leftTo = rangeBoundary(left, "to", "9999-99-99");
-  const rightFrom = rangeBoundary(right, "from", "0000-00-00");
-  const rightTo = rangeBoundary(right, "to", "9999-99-99");
-  return leftFrom <= rightTo && rightFrom <= leftTo;
+export function priceCardEffectiveRangesOverlap(left, right) {
+  return priceCardEffectiveBoundary(left, "from") <= priceCardEffectiveBoundary(right, "to")
+    && priceCardEffectiveBoundary(right, "from") <= priceCardEffectiveBoundary(left, "to");
 }
 
 function sameContext(left, right) {
@@ -815,6 +930,18 @@ export function validateOfficialPriceRegistry(cards = APP_OFFICIAL_PRICE_CARDS) 
     }
     if (!card.source?.url || !card.source?.retrieved_at || !card.source?.version) {
       throw new TypeError(`${card.id} must include official URL, observed timestamp, and evidence version.`);
+    }
+    for (const edge of ["from", "to"]) {
+      const value = card.effective?.[edge];
+      if (value === undefined) continue;
+      const parsed = Date.parse(value);
+      if (typeof value !== "string" || !Number.isFinite(parsed)
+          || ![new Date(parsed).toISOString(), new Date(parsed).toISOString().slice(0, 10)].includes(value)) {
+        throw new TypeError(card.id + " has a malformed effective price boundary.");
+      }
+    }
+    if (priceCardEffectiveBoundary(card, "from") > priceCardEffectiveBoundary(card, "to")) {
+      throw new TypeError(card.id + " has an inverted effective price window.");
     }
     const cardProvenance = card.metadata?.provenance;
     if (!cardProvenance?.observed_at || !cardProvenance?.evidence_version
@@ -860,7 +987,7 @@ export function validateOfficialPriceRegistry(cards = APP_OFFICIAL_PRICE_CARDS) 
     for (let rightIndex = leftIndex + 1; rightIndex < cards.length; rightIndex += 1) {
       const left = cards[leftIndex];
       const right = cards[rightIndex];
-      if (sameContext(left, right) && rangesOverlap(left, right) && contextBandsOverlap(left, right)) {
+      if (sameContext(left, right) && priceCardEffectiveRangesOverlap(left, right) && contextBandsOverlap(left, right)) {
         throw new TypeError(`${left.id} and ${right.id} overlap in the same pricing context.`);
       }
     }
