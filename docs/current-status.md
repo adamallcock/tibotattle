@@ -9,10 +9,11 @@ observation_date: 2026-11-21
 
 # Current product and release status
 
-The latest public release is **0.1.29**, published on October 30, 2026 for
-macOS Apple silicon, macOS Intel, Windows x64, and Linux x64. The
-[0.1.30 candidate](../release-notes/0.1.30.md) adds the November GPT-6.2
-models. [Published 0.1.29 installers and manifest](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.29)
+The public release page lists the current installers for macOS Apple silicon,
+macOS Intel, Windows x64 and Linux x64. Version 0.1.29 was published on
+October 30, 2026. The 0.1.30 release notes describe the November GPT-6.2
+models and their speed-dependent prices. [Latest public release](https://github.com/adamallcock/tibotattle/releases/latest) ·
+[0.1.30 release notes](../release-notes/0.1.30.md)
 
 ## October 9 release record for 0.1.28
 

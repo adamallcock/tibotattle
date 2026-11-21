@@ -7,9 +7,10 @@ status: maintained
 
 # Platform support and qualification
 
-The public Electron release is **0.1.29** for macOS Apple silicon,
-macOS Intel, Windows x64 and Linux x64. [Current status](../current-status.md) ·
-[0.1.29 artifact hashes and assurances](https://github.com/adamallcock/tibotattle/releases/download/v0.1.29/release-manifest.json)
+TiboTattle publishes Electron installers for macOS Apple silicon, macOS Intel,
+Windows x64 and Linux x64. The latest release manifest lists the exact hashes
+and native checks for each installer. [Current status](../current-status.md) ·
+[Latest release manifest](https://github.com/adamallcock/tibotattle/releases/latest/download/release-manifest.json)
 
 ## Status matrix
 
@@ -50,7 +51,7 @@ or updater integrity.
 
 ## macOS
 
-Both Mac installers use bundle version `1036` and build number
+Both 0.1.28 Mac installers used bundle version `1036` and build number
 `2026100901`. The signed [Apple silicon clean-install](https://github.com/adamallcock/tibotattle/actions/runs/37881967388)
 and [Intel clean-install](https://github.com/adamallcock/tibotattle/actions/runs/37882729563)
 runs passed. The native Sparkle 0.1.18-to-0.1.28 upgrade passed through the
@@ -61,8 +62,8 @@ preferences, salt and opt-out; and passed restart without duplicates while
 leaving the native source untouched and stopping owned processes. Neither used
 a feed override, a runner-copied candidate or an existing-credential fixture.
 
-All four Electron stable feeds and both native Sparkle feeds advertise 0.1.28
-with exact public readback. Production Electron 0.1.26-to-0.1.28 updates passed
+At publication, all four Electron stable feeds and both native Sparkle feeds
+advertised 0.1.28 in public readback. Production Electron 0.1.26-to-0.1.28 updates passed
 on [Apple silicon](https://github.com/adamallcock/tibotattle/actions/runs/37942774119)
 and [Intel](https://github.com/adamallcock/tibotattle/actions/runs/37949180932),
 using authentic predecessor fixtures with discoverable Codex logs. Both
@@ -112,7 +113,7 @@ credential protection to avoid them. Use the
 migration and updater contracts.
 
 The [Homebrew cask workflow](https://github.com/adamallcock/homebrew-tap/actions/runs/37930525017)
-passed all four jobs. The exact cask readback resolves 0.1.28 with the published
+passed all four jobs. The cask readback resolved 0.1.28 with the published
 arm64 and x64 DMG hashes. Cask resolution is separate from an installed upgrade.
 
 ## Windows

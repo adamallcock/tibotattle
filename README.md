@@ -36,14 +36,14 @@ Native Mac version 0.1.18 retains its default-off, review-and-send behavior.
 - **Timelines** — hourly/daily/weekly usage against allowance, entirely from
   local evidence.
 - **Speed-mode pricing** — reports distinguish observed Standard, Fast and
-  Ultrafast usage. Supported API-equivalent prices include GPT-6.1 Sol;
-  unsupported model and speed combinations remain explicitly unpriced. These
-  estimates are not subscription charges or quota formulas. See the
-  [0.1.28 release notes](release-notes/0.1.28.md) for the model and plan changes.
+  Ultrafast usage. API-equivalent prices use the model, input size and event
+  date. For GPT-6.2 Astra and Sol, the Ultrafast API promotion and the included
+  Codex allowance rate have different multipliers. Unsupported combinations
+  show an unknown price.
   Codex records the speed mode only when it is applied or
   changed, so turns before the first change in a session are attributed to
   Standard as a visible assumption unless a timestamped configuration reading
-  covers them.
+  covers them. [GPT-6.2 prices and speed modes](release-notes/0.1.30.md)
 - **A menu bar item** — where the allowance stands without opening the app,
   including a Check for Updates entry in builds that ship the updater.
 

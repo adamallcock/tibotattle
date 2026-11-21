@@ -37,11 +37,16 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [Unreleased]
 
-**Candidate notes:** [0.1.30](./release-notes/0.1.30.md)
+## [0.1.30](./release-notes/0.1.30.md) - 2026-11-21
 
-- Recognize GPT-6.2 Astra and GPT-6.2 Sol throughout the desktop dashboard.
-  Price their supported API tiers at the time of each event, including the
-  scheduled change to Ultrafast pricing.
+**Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.30) ·
+[annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.30) ·
+[changes since 0.1.29](https://github.com/adamallcock/tibotattle/compare/v0.1.29...v0.1.30)
+
+- Recognize GPT-6.2 Astra, Sol and Astra for Law in local usage, model performance and exports.
+- Apply the API price in effect on the event date, including the Astra and Sol Ultrafast promotion. Included Codex allowance uses its own speed rates.
+- Recover model identities and prices from retained Codex logs during a detailed refresh, preserving event IDs and totals.
+- Retry optional daily performance reports after a refused upload and record delivery when the service acknowledges the matching revision. [Desktop changes](https://github.com/adamallcock/tibotattle/pull/317)
 
 ## [0.1.29](./release-notes/0.1.29.md) - 2026-10-30
 
