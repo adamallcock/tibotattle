@@ -7,14 +7,39 @@ status: maintained
 
 # Platform support and qualification
 
-TiboTattle publishes Electron installers for macOS Apple silicon, macOS Intel,
-Windows x64 and Linux x64. The latest release manifest lists the exact hashes
-and native checks for each installer. [Current status](../current-status.md) ·
-[Latest release manifest](https://github.com/adamallcock/tibotattle/releases/latest/download/release-manifest.json)
+[TiboTattle 0.1.30](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.30)
+ships Electron installers for macOS Apple silicon, macOS Intel, Windows x64 and
+Linux x86_64. [Current status](../current-status.md) ·
+[0.1.30 artifact hashes and assurances](https://github.com/adamallcock/tibotattle/releases/download/v0.1.30/release-manifest.json)
 
 ## Status matrix
 
-The platform tests below refer to the October 9 release and its exact
+### 0.1.30 artifact qualification
+
+These runs qualified the exact 0.1.30 installers built from
+`0bb1fa31932a56adeb54d8abbb17118d2e1d434f`. Both Mac installers used bundle
+version `1038` and packaging build `2026112101`.
+
+| Platform | Tested distribution | Proven final-artifact boundary | Qualification limits |
+|---|---|---|---|
+| macOS 14+ arm64 | 0.1.30 Apple silicon DMG | Developer ID signing, hardened runtime, notarization, stapling and Gatekeeper. [Clean install](https://github.com/adamallcock/tibotattle/actions/runs/44946175161), [existing Keychain fixture](https://github.com/adamallcock/tibotattle/actions/runs/44946174986) and [isolated native Sparkle upgrade](https://github.com/adamallcock/tibotattle/actions/runs/44946175344) passed. | Credential qualification covers the named Apple silicon fixtures. The prerelease Sparkle run used an isolated signed feed. |
+| macOS 14+ x86_64 | 0.1.30 Intel DMG | Developer ID signing, hardened runtime, notarization, stapling and Gatekeeper. [Clean install](https://github.com/adamallcock/tibotattle/actions/runs/44946291329) and [isolated native Sparkle upgrade](https://github.com/adamallcock/tibotattle/actions/runs/44946291019) passed. | The prerelease Sparkle run used an isolated signed feed. Existing Keychain credential scenarios remain unqualified on Intel. |
+| Windows x64 | 0.1.30 NSIS installer | [Authenticode signature, timestamp and clean install](https://github.com/adamallcock/tibotattle/actions/runs/44945169607) passed. [Signed 0.1.29 to 0.1.30 installer replacement](https://github.com/adamallcock/tibotattle/actions/runs/44946260235) retained synthetic history, projects, threads, settings and opt-out through cold restart. | The run used direct NSIS replacement. Automatic updater replacement, credential continuity, hosted enrollment and notifications remain unqualified by this run. |
+| Linux x86_64 | 0.1.30 AppImage | [Final package and extracted runtime](https://github.com/adamallcock/tibotattle/actions/runs/44945169678) and [native Xvfb/FUSE lifecycle](https://github.com/adamallcock/tibotattle/actions/runs/44945652662) passed. The latter exercised clean install, isolated update from 0.1.29, cold restart, continuity and cleanup. | The lifecycle used a disposable Ubuntu runner and an isolated feed. Physical desktop behavior, production-feed installed updating and native signing remain outside this evidence. |
+
+The installed production updater tests passed on both Mac architectures.
+The native Sparkle path upgraded 0.1.18 to the published 0.1.30 app through the
+retained native feeds on [Apple silicon](https://github.com/adamallcock/tibotattle/actions/runs/44948896128)
+and [Intel](https://github.com/adamallcock/tibotattle/actions/runs/44948895989).
+The Electron path upgraded the exact public 0.1.29 predecessor to 0.1.30 through
+the stable Electron feeds on [Apple silicon](https://github.com/adamallcock/tibotattle/actions/runs/44948563976)
+and [Intel](https://github.com/adamallcock/tibotattle/actions/runs/44948682354).
+All four runs exercised the production feeds without a feed override.
+[Public feed readback](../receipts/2026-11-21-v0-1-30-release-publication.md#stable-updater-feeds)
+
+### October 9, 2026 qualification for 0.1.28
+
+The following historical tests refer to the October 9 release and its exact
 [0.1.28 artifacts](https://github.com/adamallcock/tibotattle/releases/download/v0.1.28/release-manifest.json).
 
 | Platform | Tested distribution | Proven final-artifact boundary | Acceptance limits |

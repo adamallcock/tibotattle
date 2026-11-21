@@ -3,24 +3,54 @@ title: Current product and release status
 date: 2026-11-21
 type: status
 status: current
-source_commit: 905d9f9682ef472671eb87281fb35ead38711561
+source_commit: 0bb1fa31932a56adeb54d8abbb17118d2e1d434f
 observation_date: 2026-11-21
 ---
 
 # Current product and release status
 
-The public release page lists the current installers for macOS Apple silicon,
-macOS Intel, Windows x64 and Linux x64. Version 0.1.29 was published on
-October 30, 2026. The 0.1.30 release notes describe the November GPT-6.2
-models and their speed-dependent prices. [Latest public release](https://github.com/adamallcock/tibotattle/releases/latest) ·
-[0.1.30 release notes](../release-notes/0.1.30.md)
+TiboTattle 0.1.30 was published on November 21, 2026 at **20:44:46 UTC** for
+macOS Apple silicon, macOS Intel, Windows x64 and Linux x86_64. It was the latest
+GitHub release at readback.
+[Published release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.30) ·
+[Release notes](../release-notes/0.1.30.md) ·
+[Platform qualification](./reference/platform-support.md#status-matrix)
+
+## 0.1.30 release record
+
+The immutable GitHub release binds all four installers to application source
+`0bb1fa31932a56adeb54d8abbb17118d2e1d434f` and packaging build `2026112101`.
+Public verification matched all 20 assets. The release manifest has SHA-256
+`55e976ef04b8193530d6a33580b16ae0cf1f35ac12bb643054dfbbe9965d6cfe`.
+[Versioned release manifest](https://github.com/adamallcock/tibotattle/releases/download/v0.1.30/release-manifest.json)
+
+All four stable Electron feeds and both native Sparkle feeds passed public
+readback at **20:57:35 UTC**, including the exact downloadable objects. Both
+Mac architectures passed production native Sparkle upgrades from 0.1.18 and
+production Electron updates from 0.1.29.
+[Publication and six feed readbacks](./receipts/2026-11-21-v0-1-30-release-publication.md) ·
+[Installed Mac updater runs](./reference/platform-support.md#0130-artifact-qualification)
+
+The Homebrew cask readback matched both published Mac DMG hashes. Native
+cask audit, install and uninstall passed on both architectures.
+[Homebrew workflow](https://github.com/adamallcock/homebrew-tap/actions/runs/44948865676) ·
+[Verified cask revision](https://github.com/adamallcock/homebrew-tap/blob/6e490e8129ff2ec396d329f0eccdd864a45f50c2/Casks/tibotattle.rb)
+
+The public website deployed from `523621293197eedf931e3495df9c80d9eef75209`.
+Readback at **21:05:55 UTC** verified the live manifest, the 38 generated site
+files and all four 0.1.30 installer links. Desktop, 360 px mobile and Spanish
+rendering were checked. The release left the sampled public spend rows
+unchanged, with the published-data refresh deferred.
+[Website](https://tibotattle.com/) ·
+[Website deployment review](https://github.com/adamallcock/tibotattle/pull/319) ·
+[Website readback](./receipts/2026-11-21-v0-1-30-release-publication.md#website-downloads)
 
 ## October 9 release record for 0.1.28
 
 [TiboTattle 0.1.28](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.28)
 was published for macOS Apple silicon, macOS Intel, Windows x64 and Linux x64.
 The installers, all six stable updater feeds,
-Homebrew cask and website downloads have been published and verified. Both native
+Homebrew cask and website downloads were published and verified that day. Both native
 Sparkle production upgrades passed. Electron 0.1.26-to-0.1.28 production
 updates also passed on both Mac architectures with discoverable Codex logs.
 Qualification is platform-specific; the
@@ -38,7 +68,7 @@ last public 0.1.26 release. See the [release notes](../release-notes/0.1.28.md).
 
 The immutable GitHub release was published on **2026-10-09 at 12:19:26 UTC**.
 Its 20 assets and [canonical release manifest](https://github.com/adamallcock/tibotattle/releases/download/v0.1.28/release-manifest.json)
-were read back and hash-verified; GitHub latest resolves to this release.
+were read back and hash-verified. GitHub latest resolved to 0.1.28 on October 9.
 The manifest SHA-256 is
 `459b89538461b4249dc38e9bbcb5f7c6eb8f49b202856f3cc4f1db8a57650f89`;
 all four installers bind to tagged source
@@ -61,8 +91,7 @@ from parser 18 to 20 without changing tokens or duplicating replayed usage.
 This is local installed evidence, not a hosted historical correction result or
 the complete credential-failure matrix.
 
-All four stable Electron feeds advertise 0.1.28; their fourteen immutable and
-feed objects passed public readback at **12:26:55 UTC**. Both native Sparkle
+All four stable Electron feeds advertised 0.1.28 on October 9. Their fourteen immutable and feed objects passed public readback at **12:26:55 UTC**. Both native Sparkle
 feeds and their DMGs passed public readback by **12:29:31 UTC**. The native
 Sparkle 0.1.18-to-0.1.28 journeys then passed through both production feeds,
 including update, relaunch, migration, retained rows, preferences, salt, opt-out
@@ -93,7 +122,7 @@ of deleted rows. The passed journeys with discoverable logs do not resolve
 this case.
 
 The [Homebrew update](https://github.com/adamallcock/homebrew-tap/actions/runs/37930525017)
-passed all four jobs and its exact 0.1.28 cask readback matches the published Mac
+passed all four jobs. The exact 0.1.28 cask readback matched the published Mac
 DMG hashes. Feed metadata, installed updater runs and cask resolution remain
 distinct evidence.
 
