@@ -364,6 +364,88 @@ describe("server pricing", () => {
     }
   });
 
+  it.each([
+    { modelId: "gpt-6.2-astra" as const, standard: ["5.559992", "5.56", "9.120016"],
+      batch: ["2.779996", "2.78", "4.560008"], priority: ["11.119984", "11.12", "18.240032"],
+      ultrafast: ["16.679976", "16.68", "27.360048"], list: ["33.359952", "33.36", "54.720096"] },
+    { modelId: "gpt-6.2-sol" as const, standard: ["1.389998", "1.39", "2.280004"],
+      batch: ["0.694999", "0.695", "1.140002"], priority: ["2.779996", "2.78", "4.560008"],
+      ultrafast: ["4.169994", "4.17", "6.840012"], list: ["8.339988", "8.34", "13.680024"] },
+  ])("prices admitted $modelId by tier, context, and exact promotion cutover", ({ modelId, list, ...expected }) => {
+    for (const [index, totalInputContextTokens] of [271_999, 272_000, 272_001].entries()) {
+      const baseline = fixture({ modelId, eventTime: "2026-11-17T00:00:00.000Z", totalInputContextTokens,
+        speedMode: "standard", components: { ...fixture().components,
+          inputUncachedTokens: totalInputContextTokens - 172_000,
+          inputCacheReadTokens: 100_000, inputCacheWriteTokens: 72_000,
+          outputTextTokens: 40_000, outputReasoningTokens: 60_000,
+        } });
+      for (const apiServiceTier of ["standard", "batch", "priority", "ultrafast"] as const) {
+        const event = validateIngestibleEvent({ ...baseline, billingSurface: "openai_api", apiServiceTier });
+        const price = priceTelemetryUsageEvent(event);
+        const local = priceCodexUsageEvent({ model: modelId, timestamp: event.eventTime,
+          totalInputContextTokens, components: event.components,
+        }, { apiServiceTier, priceEpochBasis: "event_time" });
+        expect(price).toMatchObject({ exactCostUsd: expected[apiServiceTier][index], coverageStatus: "fully_priced",
+          apiServiceTier, tierBasis: "observed_api_service_tier", selectedPriceCardIds: local.selectedPriceCardIds,
+          registrySha256: local.registry?.sha256 });
+        expect(priceTelemetryUsageEvent({ ...event, eventTime: "2026-11-16T23:59:59.999Z" }).coverageStatus).toBe("unpriced");
+        expect(priceTelemetryUsageEvent({ ...event, totalInputContextTokens: null }).unpricedReasonCodes)
+          .toEqual(["total_input_context_missing"]);
+      }
+      const flex = validateIngestibleEvent({ ...baseline, billingSurface: "openai_api", apiServiceTier: "flex" });
+      expect(priceTelemetryUsageEvent(flex)).toMatchObject({ coverageStatus: "unpriced", selectedPriceCardIds: [] });
+      for (const billingSurface of ["chatgpt_subscription", "openai_api"] as const) {
+        const promo = validateIngestibleEvent({ ...baseline, billingSurface, speedMode: "ultrafast",
+          apiServiceTier: billingSurface === "openai_api" ? "ultrafast" : "unknown" });
+        expect(priceTelemetryUsageEvent({ ...promo, eventTime: "2027-03-01T07:59:59.999Z" }))
+          .toMatchObject({ exactCostUsd: expected.ultrafast[index], speedMultiplier: null });
+        expect(priceTelemetryUsageEvent({ ...promo, eventTime: "2027-03-01T08:00:00.000Z" }))
+          .toMatchObject({ exactCostUsd: list[index], coverageStatus: "fully_priced", speedMultiplier: null });
+      }
+      const fast = validateIngestibleEvent({ ...baseline, speedMode: "fast", apiServiceTier: "unknown" });
+      expect(priceTelemetryUsageEvent(fast)).toMatchObject({ exactCostUsd: expected.priority[index],
+        coverageStatus: "fully_priced", speedMultiplier: 2, tierBasis: "subscription_speed_priority_price_ratio" });
+    }
+  });
+
+  it("prices the exact GPT-6.2 Astra for Law identity only at the reviewed Standard rate", () => {
+    const event = validateIngestibleEvent(fixture({ modelId: "gpt-6.2-astra-law", speedMode: "standard",
+      eventTime: "2026-11-17T00:00:00.000Z", billingSurface: "openai_api", apiServiceTier: "standard" }));
+    const standard = priceTelemetryUsageEvent(event);
+    expect(standard).toMatchObject({ exactCostUsd: "0.00416", coverageStatus: "fully_priced" });
+    expect(standard.selectedPriceCardIds).toHaveLength(1);
+    expect(standard.selectedPriceCardIds[0]).toContain(":gpt-6.2-astra-law:");
+    expect(priceTelemetryUsageEvent({ ...event, eventTime: "2026-12-31T23:59:59.999Z" }).exactCostUsd).toBe("0.00416");
+    for (const eventTime of ["2026-11-16T23:59:59.999Z", "2027-01-01T00:00:00.000Z"]) {
+      expect(priceTelemetryUsageEvent({ ...event, eventTime }).coverageStatus).toBe("unpriced");
+    }
+    for (const apiServiceTier of ["batch", "flex", "priority", "ultrafast"] as const) {
+      expect(priceTelemetryUsageEvent({ ...event, apiServiceTier })).toMatchObject({
+        coverageStatus: "unpriced", selectedPriceCardIds: [],
+      });
+    }
+    for (const speedMode of ["fast", "ultrafast"] as const) {
+      expect(priceTelemetryUsageEvent({ ...event, billingSurface: "chatgpt_subscription", speedMode })).toMatchObject({
+        coverageStatus: "unpriced", selectedPriceCardIds: [], speedMultiplier: null,
+      });
+    }
+  });
+
+  it("keeps unsupported GPT-6.2 prices unpriced when observed units are all zero", () => {
+    const baseline = validateIngestibleEvent(fixture({ modelId: "gpt-6.2-sol", speedMode: "standard",
+      eventTime: "2026-11-17T00:00:00.000Z", billingSurface: "openai_api", apiServiceTier: "standard",
+      components: { ...fixture().components, inputUncachedTokens: 0, inputCacheReadTokens: 0,
+        outputTextTokens: 0, outputReasoningTokens: 0 }, totalInputContextTokens: 0 }));
+    expect(priceTelemetryUsageEvent(baseline)).toMatchObject({ exactCostUsd: "0", coverageStatus: "fully_priced" });
+    for (const event of [
+      { ...baseline, eventTime: "2026-11-16T23:59:59.999Z" },
+      { ...baseline, apiServiceTier: "flex" as const },
+      { ...baseline, modelId: "gpt-6.2-astra-law" as const, eventTime: "2027-01-01T00:00:00.000Z" },
+    ]) {
+      expect(priceTelemetryUsageEvent(event)).toMatchObject({ coverageStatus: "unpriced", selectedPriceCardIds: [] });
+    }
+  });
+
   it("keeps unsupported Ultrafast models, pre-release epochs and unknown contexts unpriced", () => {
     for (const billingSurface of ["openai_api", "chatgpt_subscription"] as const) {
       const baseline = fixture({ billingSurface, modelId: "gpt-6-astra", eventTime: "2026-09-29T00:00:00.000Z",
@@ -427,6 +509,8 @@ describe("server pricing", () => {
     let checked = 0;
     let checkedAstra = 0;
     let checkedTerra = 0;
+    let checkedGpt62Astra = 0;
+    let checkedGpt62Sol = 0;
     for (const card of APP_OFFICIAL_PRICE_CARDS.filter(
       (entry) => entry.provider === "openai" && entry.service_tier === "priority",
     )) {
@@ -463,12 +547,16 @@ describe("server pricing", () => {
         checked += 1;
         if (card.model === "gpt-6-astra") checkedAstra += 1;
         if (card.model === "gpt-6.1-terra") checkedTerra += 1;
+        if (card.model === "gpt-6.2-astra") checkedGpt62Astra += 1;
+        if (card.model === "gpt-6.2-sol") checkedGpt62Sol += 1;
       }
     }
     expect(checkedAstra).toBe(2);
     expect(checkedTerra).toBe(2);
-    expect(checked - checkedAstra - checkedTerra).toBe(32);
-    expect(checked).toBe(36);
+    expect(checkedGpt62Astra).toBe(2);
+    expect(checkedGpt62Sol).toBe(2);
+    expect(checked - checkedAstra - checkedTerra - checkedGpt62Astra - checkedGpt62Sol).toBe(32);
+    expect(checked).toBe(40);
     const provenance: SpeedModeProvenance = "assumed_fast_scenario";
     expect(resolveEffectiveSpeedMode({ unresolvedScenario: "unresolved_as_fast" }).provenance).toBe(provenance);
   });

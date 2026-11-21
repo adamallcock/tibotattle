@@ -31,7 +31,9 @@ export interface PriceCard {
   service_tier?: string;
   region?: string;
   effective?: {
+    /** Inclusive UTC day or canonical UTC instant. */
     from?: string;
+    /** Inclusive UTC day or canonical UTC instant. */
     to?: string;
   };
   components: readonly PriceComponent[];
@@ -239,10 +241,13 @@ export type FastModeModelFamily =
   | "gpt-5" | "gpt-5-mini" | "gpt-5.1" | "gpt-5.1-codex" | "gpt-5.2"
   | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.5"
   | "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-6-astra"
-  | "gpt-6-sol" | "gpt-6-luna" | "gpt-6.1-sol" | "gpt-6.1-terra";
-export type FastModeModelFamilyKey = FastModeModelFamily | "unsupported";
-export type UltrafastModeModelFamily = "gpt-6-astra";
-export type SpeedModeModelFamily = FastModeModelFamily | UltrafastModeModelFamily;
+  | "gpt-6-sol" | "gpt-6-luna" | "gpt-6.1-sol" | "gpt-6.1-terra"
+  | "gpt-6.2-astra" | "gpt-6.2-sol";
+export type FastModeModelFamilyKey = FastModeModelFamily | "gpt-6.2-astra-law" | "unsupported";
+export type UltrafastModeModelFamily =
+  | "gpt-6-astra" | "gpt-6.1-sol"
+  | "gpt-6.2-astra:3x" | "gpt-6.2-astra:6x" | "gpt-6.2-sol:3x" | "gpt-6.2-sol:6x";
+export type SpeedModeModelFamily = FastModeModelFamily | UltrafastModeModelFamily | "gpt-6.2-astra-law";
 export type SpeedModeModelFamilyKey = SpeedModeModelFamily | "unsupported";
 export type PremiumSpeedMode = "fast" | "ultrafast";
 export type KnownSpeedMode = "standard" | PremiumSpeedMode;

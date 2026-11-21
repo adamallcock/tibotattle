@@ -1,9 +1,8 @@
 // API-price-equivalent accounting for observed Codex speed modes. Published
 // Fast/Priority and Ultrafast API ratios are proved against exact token cards,
 // then qualified by event date and context. These are comparison prices, not
-// subscription allowance consumption: the separately documented included-
-// allowance factors (Fast 2.5x and Astra Ultrafast 8x) do not belong in this
-// money series. Historical API-equivalent prices retain their original meaning.
+// subscription allowance consumption. For example, GPT-6.2 Astra and Sol use
+// included allowance at 6x Standard throughout the 3x Ultrafast API promotion.
 //
 // Supported rollouts can record tier changes in thread_settings_applied and
 // a per-turn service_tier in turn_context. Older logs may omit the baseline;
@@ -12,19 +11,23 @@
 // resulting observation or a timestamp-covered config declaration. Only the
 // remaining unknown events use the explicit Standard/Fast sensitivity choice.
 import {
+  APP_PRICE_REGISTRY_OBSERVED_AT,
   APP_PRICE_REGISTRY_VERSION,
   OPENAI_OFFICIAL_PRICE_CARDS,
+  priceCardEffectiveBoundary,
+  priceCardEffectiveRangesOverlap,
 } from "./price-registry.js";
 
 const FAST_MODE_MULTIPLIER_RECORDED_AT = "2026-08-30";
 const API_TIER_BY_SPEED_MODE = Object.freeze({ fast: "priority", ultrafast: "ultrafast" });
+const STANDARD_ONLY_SPEED_MODELS = new Set(["gpt-6.2-astra-law"]);
 
 export const FAST_MODE_MULTIPLIER_SOURCE = Object.freeze({
   publisher: "openai",
   basis: "published_api_speed_price_ratio_relative_to_standard",
   statement:
-    "Published Fast/Priority and Ultrafast API ratios are derived for exact registered models and reviewed aliases, then checked against the event's context and price epoch. Fast without an eligible Priority card retains its disclosed assumed 2x. Ultrafast without an eligible card remains unweighted. These API-equivalent comparisons do not measure included subscription allowance consumption.",
-  recordedAt: "2026-10-26",
+    "Fast and Ultrafast API ratios use the event's exact registered model, context, and effective prices. Fast can use a disclosed 2x assumption when no Priority card applies. A model restricted to Standard has no premium estimate. Ultrafast always requires a published eligible card.",
+  recordedAt: APP_PRICE_REGISTRY_OBSERVED_AT.slice(0, 10),
   priceRegistryVersion: APP_PRICE_REGISTRY_VERSION,
   appliesTo: "api_price_equivalent_only",
   observability: "rollout_thread_settings_and_supported_turn_context",
@@ -94,27 +97,14 @@ function matchingContext(left, right) {
       === (right.metadata?.total_input_context_band ?? null);
 }
 
-function effectiveRangesOverlap(left, right) {
-  const from = (card) => card.effective?.from ?? "0000-00-00";
-  const to = (card) => card.effective?.to ?? "9999-99-99";
-  return from(left) <= to(right) && from(right) <= to(left);
-}
-
-/**
- * Canonical model -> published Fast or Ultrafast API price relative to Standard,
- * proven uniform across every token component, eligible context band, and
- * dated price epoch of that exact model before it is used. A non-uniform registry
- * throws here rather than shipping a wrong multiplier.
- */
-export function deriveSpeedModeApiRatiosFromRegistry(
-  mode,
-  cards = OPENAI_OFFICIAL_PRICE_CARDS,
-) {
+function deriveSpeedModePriceBuckets(mode, cards) {
   if (!Object.hasOwn(API_TIER_BY_SPEED_MODE, mode)) {
     throw new TypeError("Unsupported API speed mode.");
   }
   const serviceTier = API_TIER_BY_SPEED_MODE[mode];
   const ratios = {};
+  const bucketByCardId = new Map();
+  const models = new Set();
   const openAiCards = cards.filter((card) => card.provider === "openai");
   const priorityModels = [...new Set(openAiCards.filter(
     (card) => card.service_tier === serviceTier,
@@ -123,9 +113,10 @@ export function deriveSpeedModeApiRatiosFromRegistry(
     const priorityCards = openAiCards.filter(
       (card) => card.model === model && card.service_tier === serviceTier,
     );
-    let reference = null;
-    let referenceLabel = null;
+    const modelRatios = new Map();
     for (const priorityCard of priorityCards) {
+      let reference = null;
+      let referenceLabel = null;
       const priorityComponents = tokenComponents(priorityCard);
       if (new Set(priorityComponents.map((component) => component.usage_component)).size
           !== priorityComponents.length) {
@@ -134,7 +125,7 @@ export function deriveSpeedModeApiRatiosFromRegistry(
       const standardCards = openAiCards.filter((card) => (
         card.service_tier === "standard"
         && matchingContext(card, priorityCard)
-        && effectiveRangesOverlap(card, priorityCard)
+        && priceCardEffectiveRangesOverlap(card, priorityCard)
       ));
       if (standardCards.length === 0) {
         throw new TypeError(
@@ -186,10 +177,36 @@ export function deriveSpeedModeApiRatiosFromRegistry(
           }
         }
       }
+      modelRatios.set(priorityCard, ratioNumber(reference));
     }
-    ratios[model] = ratioNumber(reference);
+    for (const [card, ratio] of modelRatios) {
+      for (const [other, otherRatio] of modelRatios) {
+        if (ratio !== otherRatio && (mode === "fast" || priceCardEffectiveRangesOverlap(card, other))) {
+          throw new TypeError(
+            serviceTier + "/Standard price ratio is not uniform for " + model
+            + ": " + card.id + " vs " + other.id + ".",
+          );
+        }
+      }
+    }
+    const datedRatio = new Set(modelRatios.values()).size > 1;
+    models.add(model);
+    for (const [card, ratio] of modelRatios) {
+      const key = datedRatio ? model + ":" + ratio + "x" : model;
+      ratios[key] = ratio;
+      bucketByCardId.set(card.id, key);
+    }
   }
-  return Object.freeze(ratios);
+  return { ratios: Object.freeze(ratios), bucketByCardId, models };
+}
+
+/**
+ * Published premium/Standard ratios proved against every token component and
+ * overlapping context/epoch. Ultrafast can use multiple multipliers for one
+ * model across disjoint epochs; each distinct multiplier gets its own bucket.
+ */
+export function deriveSpeedModeApiRatiosFromRegistry(mode, cards = OPENAI_OFFICIAL_PRICE_CARDS) {
+  return deriveSpeedModePriceBuckets(mode, cards).ratios;
 }
 
 export function deriveFastModePriorityRatiosFromRegistry(cards = OPENAI_OFFICIAL_PRICE_CARDS) {
@@ -199,10 +216,14 @@ export function deriveFastModePriorityRatiosFromRegistry(cards = OPENAI_OFFICIAL
 // Canonical model -> published Priority (Fast) API price ratio over Standard,
 // derived from the price registry on load. Any family absent from this map
 // is priced with the disclosed assumed multiplier below, never a silent 1.0.
-export const FAST_MODE_QUOTA_MULTIPLIERS = deriveFastModePriorityRatiosFromRegistry();
+const SPEED_MODE_PRICE_BUCKETS = {
+  fast: deriveSpeedModePriceBuckets("fast", OPENAI_OFFICIAL_PRICE_CARDS),
+  ultrafast: deriveSpeedModePriceBuckets("ultrafast", OPENAI_OFFICIAL_PRICE_CARDS),
+};
+export const FAST_MODE_QUOTA_MULTIPLIERS = SPEED_MODE_PRICE_BUCKETS.fast.ratios;
 export const SPEED_MODE_API_MULTIPLIERS = Object.freeze({
   fast: FAST_MODE_QUOTA_MULTIPLIERS,
-  ultrafast: deriveSpeedModeApiRatiosFromRegistry("ultrafast"),
+  ultrafast: SPEED_MODE_PRICE_BUCKETS.ultrafast.ratios,
 });
 
 // Owner-approved default for Fast usage on a model without a published
@@ -225,10 +246,12 @@ export const FAST_MODE_ASSUMED_MULTIPLIER_SOURCE = Object.freeze({
 // rate there; Ultrafast remains unweighted.
 export const FAST_MODE_MODEL_FAMILY_KEYS = Object.freeze([
   ...Object.keys(FAST_MODE_QUOTA_MULTIPLIERS),
+  ...STANDARD_ONLY_SPEED_MODELS,
   "unsupported",
 ]);
 export const SPEED_MODE_MODEL_FAMILY_KEYS = Object.freeze([
   ...new Set(Object.values(SPEED_MODE_API_MULTIPLIERS).flatMap(Object.keys)),
+  ...STANDARD_ONLY_SPEED_MODELS,
   "unsupported",
 ]);
 
@@ -292,7 +315,7 @@ export const QUOTA_WEIGHTED_API_PRICE_METRIC = Object.freeze({
   standardMetricKey: "apiPriceEquivalentUsd",
   standardMetricLabel: "Standard-rate API-price equivalent",
   explainer:
-    "Standard-rate API prices, with Fast and Ultrafast priced at the published API rate for the exact model, context, and date. Fast without an eligible Priority rate uses a disclosed assumed 2x; unsupported Ultrafast remains unweighted. This is an API comparison, not a bill or included-allowance formula.",
+    "Fast and Ultrafast use published API rates for the exact model, context, and date. Configurations with only a Standard price stay unpriced in Fast and Ultrafast. Other Fast usage without an eligible Priority rate uses a disclosed assumed 2x Standard. Unsupported Ultrafast remains unweighted. Subscription allowance uses a separate basis.",
 });
 
 // Named thresholds for the secondary residual inference. Every one of these is
@@ -324,12 +347,17 @@ export const FAST_MODE_RESIDUAL_INFERENCE_REASON_CODES = Object.freeze([
 ]);
 
 const REGISTERED_MODEL_NAMES = new Map();
+const REGISTERED_CARD_WINDOWS = new Map();
 const REGISTERED_STANDARD_CARDS = new Map();
 const REGISTERED_STANDARD_CARDS_BY_MODEL = new Map();
 const REGISTERED_SPEED_CARDS = Object.fromEntries(
   Object.keys(API_TIER_BY_SPEED_MODE).map((mode) => [mode, new Map()]),
 );
 for (const card of OPENAI_OFFICIAL_PRICE_CARDS) {
+  REGISTERED_CARD_WINDOWS.set(card, [
+    priceCardEffectiveBoundary(card, "from"),
+    priceCardEffectiveBoundary(card, "to"),
+  ]);
   for (const name of [card.model, ...(card.aliases ?? [])]) {
     const prior = REGISTERED_MODEL_NAMES.get(name);
     if (prior !== undefined && prior !== card.model) {
@@ -379,17 +407,16 @@ function median(values) {
 }
 
 /**
- * The exact registered model (including reviewed aliases), or null when no
- * card supports the requested premium mode. With event evidence, classification
- * additionally requires an eligible context and effective date. Omitting
- * evidence is a model-capability lookup only, not event-pricing authority.
+ * Select the model's published ratio bucket for the exact context and instant.
+ * Omitting evidence only resolves models with one uniform published ratio.
  */
 function speedModeModelFamily(model, mode, evidence = undefined) {
   if (typeof model !== "string"
       || !Object.hasOwn(SPEED_MODE_API_MULTIPLIERS, mode)) return null;
   const canonicalModel = REGISTERED_MODEL_NAMES.get(model);
-  if (!Object.hasOwn(SPEED_MODE_API_MULTIPLIERS[mode], canonicalModel ?? "")) return null;
-  if (evidence === undefined) return canonicalModel;
+  const { ratios, models, bucketByCardId } = SPEED_MODE_PRICE_BUCKETS[mode];
+  if (!models.has(canonicalModel)) return null;
+  if (evidence === undefined) return Object.hasOwn(ratios, canonicalModel) ? canonicalModel : null;
   if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)
       || Object.keys(evidence).some((key) => ![
         "eventTime", "totalInputContextTokens", "standardPriceCardIds",
@@ -398,10 +425,12 @@ function speedModeModelFamily(model, mode, evidence = undefined) {
   if (typeof eventTime !== "string" || eventTime.length > 32
       || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/u.test(eventTime)
       || !Number.isFinite(Date.parse(eventTime))) return null;
-  const day = new Date(eventTime).toISOString().slice(0, 10);
-  if (day !== eventTime.slice(0, 10)) return null;
-  const coversDay = (card) => (card.effective?.from ?? "0000-00-00") <= day
-    && day <= (card.effective?.to ?? "9999-99-99");
+  const instant = Date.parse(eventTime);
+  if (new Date(instant).toISOString().slice(0, 10) !== eventTime.slice(0, 10)) return null;
+  const coversInstant = (card) => {
+    const [from, to] = REGISTERED_CARD_WINDOWS.get(card);
+    return from <= instant && instant <= to;
+  };
   const context = evidence.totalInputContextTokens;
   const contextProvided = context !== null && context !== undefined;
   if (contextProvided && (!Number.isSafeInteger(context) || context < 0)) return null;
@@ -414,24 +443,29 @@ function speedModeModelFamily(model, mode, evidence = undefined) {
       && (conditions?.max_total_input_tokens === undefined || context <= Number(conditions.max_total_input_tokens))
     ));
   };
-  const speedCards = REGISTERED_SPEED_CARDS[mode].get(canonicalModel).filter(coversDay);
+  const speedCards = REGISTERED_SPEED_CARDS[mode].get(canonicalModel).filter(coversInstant);
+  const buckets = new Set();
   if (evidence.standardPriceCardIds !== undefined) {
     const ids = evidence.standardPriceCardIds;
     if (!Array.isArray(ids) || ids.length === 0 || ids.length > 8) return null;
     for (const id of ids) {
       const standard = REGISTERED_STANDARD_CARDS.get(id);
-      if (!standard || standard.model !== canonicalModel || !coversDay(standard)
-          || (contextProvided && !matchingBand(standard))
-          || !speedCards.some((card) => matchingContext(standard, card))) {
+      if (!standard || standard.model !== canonicalModel || !coversInstant(standard)
+          || (contextProvided && !matchingBand(standard))) {
         return null;
       }
+      const matching = speedCards.filter((card) => matchingContext(standard, card));
+      if (matching.length === 0) return null;
+      for (const card of matching) buckets.add(bucketByCardId.get(card.id));
     }
-    return canonicalModel;
+  } else {
+    for (const card of speedCards) {
+      if (matchingBand(card) && REGISTERED_STANDARD_CARDS_BY_MODEL.get(canonicalModel).some(
+        (standard) => coversInstant(standard) && matchingContext(standard, card),
+      )) buckets.add(bucketByCardId.get(card.id));
+    }
   }
-  return speedCards.some((card) => matchingBand(card)
-    && REGISTERED_STANDARD_CARDS_BY_MODEL.get(canonicalModel).some(
-      (standard) => coversDay(standard) && matchingContext(standard, card),
-    )) ? canonicalModel : null;
+  return buckets.size === 1 ? buckets.values().next().value : null;
 }
 
 export function fastModeModelFamily(model, evidence = undefined) {
@@ -440,7 +474,7 @@ export function fastModeModelFamily(model, evidence = undefined) {
 
 /**
  * API ratio, never an included-allowance weight. Omitting evidence only looks
- * up model capability. Event pricing must supply a date and eligible context
+ * up a uniform model ratio. Event pricing requires a date and eligible context
  * (or the exact Standard card ids already used to price that event).
  */
 export function speedModeApiMultiplier(model, mode, evidence = undefined) {
@@ -474,6 +508,7 @@ export function fastModeQuotaMultiplier(model, evidence = undefined) {
 }
 
 export function fastModeModelFamilyKey(model, evidence = undefined) {
+  if (STANDARD_ONLY_SPEED_MODELS.has(model)) return model;
   return fastModeModelFamily(model, evidence) ?? "unsupported";
 }
 
@@ -563,6 +598,9 @@ export function quotaWeightedApiPriceEquivalent({
         multiplier: null,
         status: "ultrafast_price_unavailable",
       });
+    }
+    if (STANDARD_ONLY_SPEED_MODELS.has(model)) {
+      return Object.freeze({ usd: null, multiplier: null, status: "fast_price_unavailable" });
     }
     return Object.freeze({
       usd: roundUsd(apiPriceEquivalentUsd * FAST_MODE_ASSUMED_MULTIPLIER),
@@ -697,7 +735,7 @@ export function summarizeQuotaWeightedAccounting({
       weightedUsd += cell.apiPriceEquivalentUsd;
       return;
     }
-    if (resolved.mode === "fast") {
+    if (resolved.mode === "fast" && !STANDARD_ONLY_SPEED_MODELS.has(family)) {
       hasWeightedAmount = true;
       const multiplier = family === "unsupported"
         ? null

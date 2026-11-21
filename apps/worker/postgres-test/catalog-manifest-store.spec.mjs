@@ -295,7 +295,7 @@ test("before any load the read APIs serve current compiled pricing with the reta
   assert.equal((await readPricing(bare)).source, "compiled_baseline");
 });
 
-test("the signed baseline loads once, idempotently, and prices byte-identically", { skip }, async () => {
+test("the signed baseline and the exact-window successor load idempotently and retain their price cards", { skip }, async () => {
   const schema = await createSchema();
   const baseline = store.compiledBaselineCatalogManifest();
   const envelope = await signer.sign(baseline);
@@ -321,6 +321,30 @@ test("the signed baseline loads once, idempotently, and prices byte-identically"
   assert.equal(pricing.registrySha256, frozenBaselineManifest.compat.registrySha256);
   assert.equal(JSON.stringify(pricing.priceCards), JSON.stringify(BASELINE_PRICE_CARDS));
   assertPricingIdentical(pricing.priceCards);
+
+  const compiled = store.COMPILED_CATALOG_INPUTS;
+  const successor = contract.projectCatalogManifest(compiled, {
+    version: 2, previousVersion: 1, previousDigest: receipt.digest, projectedFromCommit: null,
+    publishedAt: compiled.registryObservedAt, activateAt: compiled.registryObservedAt,
+  });
+  const signedSuccessor = await signer.sign(successor);
+  const successorReceipt = await load(schema, signedSuccessor);
+  assert.equal(successorReceipt.status, "loaded");
+  assert.equal(successorReceipt.version, 2);
+  assert.equal((await load(schema, signedSuccessor)).status, "already_loaded");
+  assert.equal((await readPricing(schema)).manifestDigest, receipt.digest);
+  const active = await readPricing(schema, Date.parse(successor.activateAt));
+  assert.equal(active.manifestDigest, successorReceipt.digest);
+  assert.equal(active.registryVersion, "app-official-api-prices-v0.11");
+  assert.equal(JSON.stringify(active.priceCards), JSON.stringify(APP_OFFICIAL_PRICE_CARDS));
+  for (const [pricedAt, expected] of [["2027-03-01T07:59:59.999Z", "0.000006"],
+    ["2027-03-01T08:00:00.000Z", "0.000012"]]) {
+    const { totalUsd, coverageStatus } = priceUsageEvent({ provider: "openai", model: "gpt-6.2-sol",
+      apiTier: "ultrafast", pricedAt, totalInputContextTokens: "1", components: { inputUncachedTokens: 1 } }, {
+      priceCards: active.priceCards, pricingContext: { priceEpochBasis: "event_time_when_registry_has_effective_evidence" },
+    });
+    assert.deepEqual([totalUsd, coverageStatus], [expected, "fully_priced"]);
+  }
 });
 
 test("a tampered signature, an untrusted key or a non-baseline version 1 inserts nothing", { skip }, async () => {

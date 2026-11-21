@@ -3,6 +3,8 @@ packages:
 
 overrides:
   app-builder-lib@26.15.7>@electron/get: 5.1.0
+  app-builder-lib@26.15.7>minimatch: 11.0.3
+  '@electron/universal@2.0.3>minimatch': 11.0.3
   '@electron/get@5.1.0>undici': 7.30.1
   brace-expansion@1.1.18: 1.1.21
   brace-expansion@2.1.4: 2.1.7

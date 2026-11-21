@@ -52,7 +52,15 @@ before(async () => {
   canonical = (await load("/src/canonical-json.ts")).canonicalJson;
   target = store.analyticsV2BaselineRunStamp(BUNDLED);
   old = store.analyticsV2BaselineRunStamp(store.analyticsV2KernelRegistry()[9]);
-  source = store.analyticsV2BaselineRunStamp(store.analyticsV2KernelRegistry().find(k => k.kernelId === 23));
+  // Kernel 26 is the registered v0.11 predecessor on the GCP compute line.
+  const sourceKernel = store.analyticsV2KernelRegistry().find(k => k.kernelId === 26);
+  assert.ok(sourceKernel);
+  assert.ok(sourceKernel.kernelId < target.kernel.kernelId);
+  assert.notEqual(sourceKernel.computeClosureSha256, target.kernel.computeClosureSha256);
+  assert.equal(sourceKernel.priceRegistrySha256, target.kernel.priceRegistrySha256);
+  assert.equal(sourceKernel.priceRegistryVersion, target.kernel.priceRegistryVersion);
+  assert.equal(sourceKernel.methodVersion, target.kernel.methodVersion);
+  source = store.analyticsV2BaselineRunStamp(sourceKernel);
   if (ENDPOINT) pool = new pg.Pool({ ...ENDPOINT, ssl: false, max: 4, connectionTimeoutMillis: 5000,
     application_name: "analytics-v2-current-correction-spec", options: "-c search_path=pg_catalog" });
 });
@@ -255,7 +263,7 @@ async function seedCurrentDay(schema, options = {}) {
         codec: p.codec,inputs: badArchive ? Buffer.from([255,1]) : p.inputs,inputs_sha256: p.inputs_sha256,
         source_inputs_sha256: p.inputs_sha256,input_events: p.input_events,run_id: c.run_id,kernel_id: c.price_kernel_id });
       const current = structuredClone(c.daily_values);
-      current.registrySha256 = target.kernel.priceRegistrySha256;
+      current.registrySha256 = source.kernel.priceRegistrySha256;
       current.pricingMethodVersion = kernels.createV11DailyProjectionValues(day).pricingMethodVersion;
       await client.query(`DELETE FROM ${q(schema,"analytics_v2_owner_day")} WHERE day=$1 AND owner_digest=$2`,[day,owner(n)]);
       await insert(client,schema,"analytics_v2_owner_day", { day,owner_digest: owner(n),daily: current,refusal: null,
@@ -272,13 +280,25 @@ test("PG correction: migration80 is required; planning is bounded read-only and 
     await expectCode(plan(schema),"ANALYTICS_V2_REPRICE_SCHEMA_UNAVAILABLE");
   },{ beforeVersion: 80 });
   await withSchema(async schema => {
-    await sourceInfrastructure(schema); await seedCurrentDay(schema);
+    await sourceInfrastructure(schema);
+    const incompatibleKernel = store.analyticsV2KernelRegistry().find(k => k.kernelId === 23);
+    assert.ok(incompatibleKernel);
+    assert.equal(incompatibleKernel.methodVersion, target.kernel.methodVersion);
+    assert.notEqual(incompatibleKernel.priceRegistrySha256, target.kernel.priceRegistrySha256);
+    await transaction(client => runStore.registerAnalyticsV2RunKernel(client, `"${schema}"`,
+      store.analyticsV2BaselineRunStamp(incompatibleKernel), RELEASED));
+    await seedCurrentDay(schema);
     const before = await snapshot(schema), first = await plan(schema);
     assert.equal(first.schema,"analytics-v2-current-correction-plan-v1");
-    assert.equal(first.inputSource,"current-owner-day"); assert.equal(first.sourceKernelId,23);
+    assert.equal(first.inputSource,"current-owner-day"); assert.equal(first.sourceKernelId,source.kernel.kernelId);
     assert.deepEqual(first,await plan(schema)); assert.deepEqual(await snapshot(schema),before);
     await expectCode(reprice.planAnalyticsV2CurrentCorrection(pool,{ ...options(schema),sourceKernelId: 0 }),"ANALYTICS_V2_REPRICE_INVALID");
     await expectCode(reprice.planAnalyticsV2CurrentCorrection(pool,{ ...options(schema),sourceKernelId: 32767 }),"ANALYTICS_V2_REPRICE_INVALID");
+    const sourceKernelId = incompatibleKernel.kernelId;
+    await expectCode(reprice.planAnalyticsV2CurrentCorrection(pool, { ...options(schema), sourceKernelId }),
+      "ANALYTICS_V2_REPRICE_INVALID");
+    await expectCode(execute(schema, first, { sourceKernelId }), "ANALYTICS_V2_REPRICE_INVALID");
+    assert.deepEqual(await snapshot(schema), before);
   });
 });
 test("PG correction: mixed archived/current/departed/quota/excluded saved members append atomically with honest provenance", { skip: SKIP }, async () => {
@@ -304,7 +324,7 @@ test("PG correction: mixed archived/current/departed/quota/excluded saved member
       const p = row.correction_provenance;
       assert.equal(row.run_id,runId); assert.equal(row.kernel_id,target.kernel.kernelId);
       assert.equal(p.priorVersion,1); assert.equal(p.sourceInputsSha256,row.source_inputs_sha256);
-      if (row.owner_digest===owner(1)) { assert.equal(p.inputSource,"current-owner-day"); assert.equal(p.sourceRunId,sourceRunId); assert.equal(p.sourceKernelId,23); }
+      if (row.owner_digest===owner(1)) { assert.equal(p.inputSource,"current-owner-day"); assert.equal(p.sourceRunId,sourceRunId); assert.equal(p.sourceKernelId,source.kernel.kernelId); }
       else { assert.equal(p.inputSource,"archive"); assert.equal(p.sourceKernelId,old.kernel.kernelId); }
       const decoded = await prices.decodeAnalyticsV2PriceInputs({ projectionVersion: row.projection_version,codec: row.codec,
         sha256: row.inputs_sha256,events: row.input_events,bytes: row.inputs });
@@ -560,7 +580,7 @@ test("PG correction: the real bundled CLI plans, executes and replays the same U
     const original = await headRow(schema);
     const reviewedPlan = await reprice.planAnalyticsV2CurrentCorrection(pool,{ ...options(schema),stamp: cliStamp });
     const beforePlan = await snapshot(schema);
-    const b = bounds(), inputSource = "current-owner-day", sourceKernelId = 23;
+    const b = bounds(), inputSource = "current-owner-day", sourceKernelId = source.kernel.kernelId;
     const args = [`--schema=${schema}`,`--from-day=${b.fromDay}`,`--through-day=${b.throughDay}`,
       `--max-days=${b.maxDays}`,`--max-members=${b.maxMembers}`,`--max-input-bytes=${b.maxInputBytes}`,
       `--input-source=${inputSource}`,`--source-kernel=${sourceKernelId}`,`--now=${NOW}`];

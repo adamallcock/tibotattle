@@ -131,6 +131,9 @@ export const TELEMETRY_MODEL_IDS: readonly [
   "claude-opus-5-5",
   "gpt-6.1-sol",
   "gpt-6.1-terra",
+  "gpt-6.2-astra",
+  "gpt-6.2-sol",
+  "gpt-6.2-astra-law",
 ];
 export type TelemetryModelId = typeof TELEMETRY_MODEL_IDS[number];
 
@@ -142,7 +145,7 @@ export interface ReviewedModelIdentity {
   readonly pricingStatus: "published" | "assumed_alias" | "unpriced";
   readonly priceModelId: Exclude<TelemetryModelId, "unknown"> | null;
 }
-export const REVIEWED_MODEL_CATALOG_VERSION: "reviewed-model-catalog-2026-10-26.1";
+export const REVIEWED_MODEL_CATALOG_VERSION: "reviewed-model-catalog-2026-11-17.1";
 export const REVIEWED_MODEL_CATALOG: readonly ReviewedModelIdentity[];
 export const REVIEWED_CODEX_MODEL_IDS: readonly Exclude<TelemetryModelId, "unknown">[];
 export const REVIEWED_CLAUDE_MODEL_IDS: readonly Exclude<TelemetryModelId, "unknown">[];
@@ -188,13 +191,14 @@ export const ADMIN_MODEL_CONFIG: readonly Readonly<{
   allowanceTrack: "primary" | "spark";
   pricingStatus: "published" | "assumed_alias" | "unpriced";
 }>[];
+type FrozenAdminModelConfig<ExcludedId extends TelemetryModelId> = readonly (Omit<
+  (typeof ADMIN_MODEL_CONFIG)[number], "modelId"
+> & { readonly modelId: Exclude<(typeof ADMIN_MODEL_CONFIG)[number]["modelId"], ExcludedId> })[];
+type November17AdminModelAddition = "gpt-6.2-astra" | "gpt-6.2-sol" | "gpt-6.2-astra-law";
+export const OCTOBER26_ADMIN_MODEL_HISTORY_CATALOG_VERSION: "reviewed-model-catalog-2026-10-26.1";
+export const OCTOBER26_ADMIN_MODEL_CONFIG: FrozenAdminModelConfig<November17AdminModelAddition>;
 export const SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION: "reviewed-model-catalog-2026-09-29.1";
-export const SEPTEMBER29_ADMIN_MODEL_CONFIG: readonly Readonly<{
-  modelId: Exclude<(typeof ADMIN_MODEL_CONFIG)[number]["modelId"], "gpt-6.1-terra">;
-  label: string;
-  allowanceTrack: "primary" | "spark";
-  pricingStatus: "published" | "assumed_alias" | "unpriced";
-}>[];
+export const SEPTEMBER29_ADMIN_MODEL_CONFIG: FrozenAdminModelConfig<"gpt-6.1-terra" | November17AdminModelAddition>;
 export const ADMIN_MODEL_HISTORY_CATALOG_VERSION: typeof REVIEWED_MODEL_CATALOG_VERSION;
 export const LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION: "admin-model-roster-v0.2";
 export function projectAdminModelHistoryDay(value: unknown): AdminModelHistoryDay | null;

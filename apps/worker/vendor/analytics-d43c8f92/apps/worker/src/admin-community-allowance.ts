@@ -1,6 +1,10 @@
 import {
   ADMIN_MODEL_CONFIG,
   ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+  OCTOBER26_ADMIN_MODEL_CONFIG,
+  OCTOBER26_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+  SEPTEMBER29_ADMIN_MODEL_CONFIG,
+  SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
   projectAdminModelHistoryDay,
 } from "@app-usagemonitor/telemetry-contract";
 import {
@@ -52,6 +56,13 @@ export const ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG =
 // Visibility is not fit eligibility or availability. Raw/custom model strings
 // cannot enter the dashboard through this shared reviewed identity catalog.
 export const ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG = ADMIN_MODEL_CONFIG;
+const SEPTEMBER23_ADMIN_MODEL_CONFIG = Object.freeze(SEPTEMBER29_ADMIN_MODEL_CONFIG.slice(0, 42));
+const REVIEWED_MODEL_CATALOGS = [
+  ["reviewed-model-catalog-2026-09-23.1", SEPTEMBER23_ADMIN_MODEL_CONFIG],
+  [SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION, SEPTEMBER29_ADMIN_MODEL_CONFIG],
+  [OCTOBER26_ADMIN_MODEL_HISTORY_CATALOG_VERSION, OCTOBER26_ADMIN_MODEL_CONFIG],
+  [ADMIN_MODEL_HISTORY_CATALOG_VERSION, ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG],
+] as const;
 
 export const ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS =
   "seven_day_codex_pro20x_equivalent_per_model_composition";
@@ -213,24 +224,11 @@ function validAdminCommunityAllowanceModels(
     return false;
   }
   if (!Array.isArray(models.modelConfig)) return false;
-  // Only the reviewed append-only September 29 and October 26 catalogs may
-  // admit these exact retained headers. A later catalog must review its own
-  // predecessor shapes instead of accepting an arbitrary roster prefix.
-  const september29Current = String(ADMIN_MODEL_HISTORY_CATALOG_VERSION) === "reviewed-model-catalog-2026-09-29.1"
-    && ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.length === 43
-    && String(ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG[42]?.modelId) === "gpt-6.1-sol";
-  const october26Current = String(ADMIN_MODEL_HISTORY_CATALOG_VERSION) === "reviewed-model-catalog-2026-10-26.1"
-    && ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.length === 44
-    && String(ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG[42]?.modelId) === "gpt-6.1-sol"
-    && String(ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG[43]?.modelId) === "gpt-6.1-terra";
-  const september23Catalog = (september29Current || october26Current) && models.modelConfig.length === 42;
-  const september29Catalog = october26Current && models.modelConfig.length === 43;
-  const historicalCatalog = september23Catalog || september29Catalog;
-  const expectedModels = historicalCatalog
-    ? ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.slice(0, models.modelConfig.length)
-    : ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG;
-  if (models.modelConfig.length !== expectedModels.length) return false;
-  for (const [index, expected] of expectedModels.entries()) {
+  const headerLength = models.modelConfig.length;
+  const header = REVIEWED_MODEL_CATALOGS.findIndex(([, config]) => config.length === headerLength);
+  if (header === -1) return false;
+  const september23Catalog = header === 0;
+  for (const [index, expected] of REVIEWED_MODEL_CATALOGS[header]![1].entries()) {
     const model = record(models.modelConfig[index]);
     if (model === null
         || !exactKeys(model, ["modelId", "label", "allowanceTrack", "pricingStatus"])
@@ -248,12 +246,11 @@ function validAdminCommunityAllowanceModels(
   }
   let previousDay = "";
   for (const candidate of models.days) {
-    if (!validModelCompositionDay(candidate)
-        // A retained header cannot claim a newer catalog, even when its
-        // sparse values omit the appended model. The shared reader validates
-        // each older day's exact frozen identity set independently.
-        || (historicalCatalog && candidate.catalogVersion === ADMIN_MODEL_HISTORY_CATALOG_VERSION)
-        || (september23Catalog && candidate.catalogVersion === "reviewed-model-catalog-2026-09-29.1")) return false;
+    if (!validModelCompositionDay(candidate)) return false;
+    // The shared reader also admits earlier compact history versions. Only
+    // the known roster transition could place newer evidence below this header.
+    const dayCatalog = REVIEWED_MODEL_CATALOGS.findIndex(([version]) => candidate.catalogVersion === version);
+    if (dayCatalog > header) return false;
     if (candidate.day <= previousDay || candidate.day > latestAllowedDay) {
       return false;
     }
@@ -891,8 +888,8 @@ export async function readCachedAdminCommunityAllowancePreview(
   }
   // Display copy is not analytical identity. Never echo a stored label when a
   // reviewed catalog rename can supply the current content-free presentation.
-  return { ...parsed, models: { ...parsed.models,
-    modelConfig: ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.slice(0, parsed.models.modelConfig.length) } };
+  const header = REVIEWED_MODEL_CATALOGS.find(([, config]) => config.length === parsed.models.modelConfig.length)!;
+  return { ...parsed, models: { ...parsed.models, modelConfig: header[1] } };
 }
 
 export interface AdminCommunityAllowancePreviewCacheResult {
