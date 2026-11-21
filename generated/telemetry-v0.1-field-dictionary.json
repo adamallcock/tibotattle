@@ -26,7 +26,7 @@
     {
       "schemaName": "compatibility.schema.json",
       "schemaId": "https://app-usagemonitor.local/schemas/telemetry-v0.1/compatibility.schema.json",
-      "schemaSha256": "fc420f82554d8dcad491536ebc1e3c8736a5e308180329364c45937c6c4060f7",
+      "schemaSha256": "58ad7a24de5e77adc5d770064ff6d8345f0ee2f00cb364c036bbe11f9595b542",
       "propertyCount": 66
     },
     {
@@ -44,7 +44,7 @@
     {
       "schemaName": "usage-event.schema.json",
       "schemaId": "https://app-usagemonitor.local/schemas/telemetry-v0.1/usage-event.schema.json",
-      "schemaSha256": "d26b6340104a7785078762cefc277481a6f29206908556a73a095c68612987e7",
+      "schemaSha256": "c5f5e0d6e0c7ee0f29777d642ce363caa17bec68f579291801e5b9383f961b8e",
       "propertyCount": 40
     }
   ],

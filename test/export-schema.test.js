@@ -185,15 +185,16 @@ test("arbitrary source-like fields cannot pass the strict usage schema", () => {
 
 test("reviewed registries and schemas expose the same closed model, limit, and diagnostic vocabularies", () => {
   const registry = exportRegistrySnapshot();
+  const appendedCodexModels = ["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.2-astra-law"];
   assert.deepEqual(
     exportSchemas.usageEvent.properties.modelId.enum,
     // New export identities append to the combined vocabulary so existing
     // Claude enum positions survive the addition of another Codex model.
     [
       "unknown",
-      ...registry.providers.openai_codex.modelIds.filter((model) => !["gpt-6.1-sol", "gpt-6.1-terra"].includes(model)),
+      ...registry.providers.openai_codex.modelIds.filter((model) => !appendedCodexModels.includes(model)),
       ...registry.providers.anthropic_claude_code.modelIds,
-      "gpt-6.1-sol", "gpt-6.1-terra",
+      ...appendedCodexModels,
     ],
   );
   assert.ok(registry.providers.openai_codex.modelIds.includes("gpt-6.1-sol"));
@@ -209,7 +210,7 @@ test("reviewed registries and schemas expose the same closed model, limit, and d
 });
 
 test("new reviewed Codex identities pass every recognized export schema branch", () => {
-  for (const modelId of ["gpt-6.1-sol", "gpt-6.1-terra"]) {
+  for (const modelId of ["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.2-astra-law"]) {
     const candidate = { ...usageEvent(), modelId };
     assert.equal(validateExportRecord("usageEvent", candidate).valid, true, modelId);
     assert.equal(validateExportRecord("usageEvent", { ...candidate, provider: "anthropic_claude_code" }).valid, false);
