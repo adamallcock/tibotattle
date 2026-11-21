@@ -119,6 +119,37 @@ describe("typed raw SQL compatibility and exact bounded JSON reader", () => {
       .bind("gpt-6.1-terra").first<number>("count")).toBe(1);
   });
 
+  it("round-trips all three GPT-6.2 models through the existing typed model dictionary", async () => {
+    const eventTime = "2026-11-17T00:00:00.000Z";
+    const observedDay = eventTime.slice(0, 10);
+    const rows = (["v1", "v11"] as const).flatMap((format) => [
+      { modelId: "gpt-6.2-astra", costNanousd: 14_400_000, speedMode: "ultrafast" },
+      { modelId: "gpt-6.2-sol", costNanousd: 3_600_000, speedMode: "ultrafast" },
+      { modelId: "gpt-6.2-astra-law", costNanousd: 4_800_000, speedMode: "standard" },
+    ].map(({ modelId, costNanousd, speedMode }, index) => ({
+      costNanousd,
+      row: source(format, index + 1, { ...usage(format, `event:v2:${String(index + 1).repeat(64)}`),
+        provider: "openai_codex", modelId, speedMode, apiServiceTier: speedMode,
+        billingSurface: "chatgpt_subscription", eventTime, totalInputContextTokens: 100,
+        components: { inputUncachedTokens: 100, inputCacheReadTokens: 0, inputCacheWriteTokens: 0,
+          outputTextTokens: 100, outputReasoningTokens: 0, outputCombinedTokens: null },
+      }, { chunkDay: observedDay, observedDay }),
+    })));
+    await persistTypedTelemetryBatch(db(), rows.map(({ row }) => row));
+    const { records } = await readTypedTelemetryCompatibilityPage(db(), options("usage"));
+    expect(records).toHaveLength(6);
+    for (const actual of records) {
+      const expected = rows.find(({ row }) => row.format === actual.format && row.sourceRowId === actual.source_row_id)!;
+      expectExact(actual, expected.row);
+      expect(priceChunkUsageRecord(actual.record_json, eventTime)).toEqual({
+        costNanousd: expected.costNanousd, pricingStatus: "fully_priced", modelId: actual.model_id,
+      });
+    }
+    const { results } = await db().prepare("SELECT value FROM typed_telemetry_dictionary WHERE value IN (?, ?, ?) ORDER BY value")
+      .bind("gpt-6.2-astra", "gpt-6.2-astra-law", "gpt-6.2-sol").all<{ value: string }>();
+    expect(results.map(({ value }) => value)).toEqual(["gpt-6.2-astra", "gpt-6.2-astra-law", "gpt-6.2-sol"]);
+  });
+
   it("round-trips scientific quota and attribution evidence through the existing dictionary", async () => {
     const rows = (["sci", "sci_plus"] as const).map((planType, index) => source("v11", index + 1, {
       ...quota("v11", `quota:scientific:${index}`), planType,

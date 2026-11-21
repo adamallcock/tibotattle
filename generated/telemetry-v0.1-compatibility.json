@@ -13,7 +13,7 @@
     "transportReady": false
   },
   "fieldContract": {
-    "sha256": "fed4986d7bb111e96551b31a267763fed84da9dcead077077b0ef0da2b53ce53",
+    "sha256": "e79b4b4af5ffd8f9671b4a88c2d72e2d5f076a28c46a29cc8e53a27cdfcd225a",
     "version": "telemetry-field-dictionary-v0.1"
   },
   "implementation": {
@@ -21,7 +21,7 @@
     "checkpointScanVersion": "codex-export-checkpoint-scan-v0.6",
     "exporterVersion": "0.3.0-draft.3",
     "packageName": "app-usagemonitor",
-    "packageVersion": "0.1.29",
+    "packageVersion": "0.1.30",
     "resourcePolicyVersion": "g1-r3-candidate-0.5"
   },
   "providerAdapters": {
@@ -72,8 +72,8 @@
     }
   },
   "registry": {
-    "sha256": "c6af6f120feb9e355d3516a37ebc93657b1eddd2033a95d6d7abf6f0e6915361",
-    "version": "telemetry-v0.1-registry-2026-10-26.2"
+    "sha256": "52dd0f4e9284ea8f9ea4586d9179edca3c2bb8d2d682027dcebdcb94d56cfd0e",
+    "version": "telemetry-v0.1-registry-2026-11-17.1"
   },
   "schemas": {
     "members": [
@@ -90,7 +90,7 @@
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/compatibility.schema.json",
         "name": "compatibility.schema.json",
-        "sha256": "8ad10e25ae5f5bdd8ab3ea9250570494bfefdb35743ced6d92ac1abf5e6732a1"
+        "sha256": "ee7f29796613fa99fda2c9b77fe76f32104eb2228b35fbddfb8e41384179c99b"
       },
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/privacy-receipt.schema.json",
@@ -105,10 +105,10 @@
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/usage-event.schema.json",
         "name": "usage-event.schema.json",
-        "sha256": "d26b6340104a7785078762cefc277481a6f29206908556a73a095c68612987e7"
+        "sha256": "c5f5e0d6e0c7ee0f29777d642ce363caa17bec68f579291801e5b9383f961b8e"
       }
     ],
-    "setSha256": "c5e95ac0ddaa33f080dcc9ccb42201f749e299bc5c05908e91d5f37e40c4c0b6"
+    "setSha256": "78c86457e3ab8df1d507e7f3e0edf26092af09098cb2144e6e4ae29821bdfe89"
   },
   "tupleVersion": "usage-export-compatibility-v0.1"
 }

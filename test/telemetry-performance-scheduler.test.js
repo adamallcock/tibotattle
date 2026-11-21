@@ -173,7 +173,11 @@ test("production client uses only the independent capability and encrypted repor
       if (init.method === "GET") return new Response(JSON.stringify({ accepted: true }), {
         headers: { "content-type": "application/json", "cache-control": "no-store" },
       });
-      return new Response(null, { status: 202 });
+      const { report } = JSON.parse(init.body);
+      return Response.json({ schemaVersion: "telemetry-performance-receipt-v1",
+        status: "accepted", reportId: "12345678-1234-4234-8234-123456789abc",
+        day: report.day, reportRevision: report.reportRevision, replayed: false },
+      { status: 202, headers: { "cache-control": "no-store" } });
     },
     sync: async options => {
       const capability = await options.readCapabilities();

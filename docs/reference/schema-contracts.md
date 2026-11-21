@@ -107,13 +107,22 @@ allowance. Unknown labels are withheld or fingerprinted at the existing export
 boundary, never copied into admin labels. Legacy telemetry enum positions remain
 stable; newly reviewed values append.
 
-The export registry advances to `telemetry-v0.1-registry-2026-09-29.1` with its
-closed schema and generated compatibility dictionary. Disabled legacy upload
-contracts remain disabled; this vocabulary change does not enable contribution
-or alter consent. Reparse retained source before claiming to recover a model that
-an older extractor normalized to unknown. Admin model history has an independent,
-versioned compact projection; historical absence is not zero observations for a
-newly added model.
+The export registry `telemetry-v0.1-registry-2026-11-17.1` appends the exact
+`gpt-6.2-astra`, `gpt-6.2-sol`, and `gpt-6.2-astra-law` model IDs. Each maps to
+its own price identity. GPT-6.2 Astra and GPT-6.2 Sol support Low, Medium, High,
+Extra High, Max, and Ultra in Codex. The request projection maps Ultra to `xhigh`
+while cache comparison retains the distinct Ultra configuration. See the
+[Codex CLI model catalog](https://github.com/openai/codex/blob/rust-v0.170.0/codex-rs/models-manager/models.json).
+GPT-6.2 Astra for Law records usage under its exact ID when observed. OpenAI
+requires Trusted Access approval for this configuration and lists Standard mode
+at launch. See the [Enterprise rate card](https://help.openai.com/en/articles/20001415-chatgpt-rate-card-enterprise-token-based-pricing).
+
+The v1.1 and v1.2 usage records already accept these IDs under their bounded
+token grammar. The existing legacy and performance model allowlists append the
+three exact identities. Contribution gates and consent retain their existing
+versions. Reparse retained source to recover an identity an older extractor
+normalized to unknown. Admin history preserves the October 26 catalog's 44
+model configuration and tuple coverage alongside the November 17 catalog.
 
 ### Performance speed vocabulary and retained authorization
 
@@ -351,6 +360,18 @@ capability and authorization routes, encrypted report delivery, typed cohort and
 bucket storage, idempotent per-device report revisions, and owner-erasure/restore
 coverage. Usage consent cannot authorize performance. Local timing source and
 scheduler integration are qualified separately from hosted chart publication.
+The client acknowledges a day only after receiving an HTTP 202 receipt with
+the matching day and report revision. Exact duplicates return an idempotent
+receipt with the `idempotency-replayed: true` header. HTTP 409 refusals and unreadable receipts leave
+the day unacknowledged and use paced, per-day retries while other eligible days
+continue. Ordinary delivery covers the current UTC day and seven completed days.
+A durable day marker precedes each new send, so an interrupted attempt remains
+eligible for retry. The client retries unresolved days through the tenth
+completed day, matching the PostgreSQL service's new-admission limit. On
+expiry, local state records the unresolved day and the local timing evidence
+remains available. The retry state is
+owner-only, scoped to the destination and device, and stored alongside the
+legacy cursor so older clients cannot overwrite it.
 Timing SQLite schemas advance to primary 6 and supplement 7 while parser methods remain 2/3. Source parser version 18 recognizes GPT-6.1 Sol and Ultrafast. Still-present, verified sources replay through bounded staging; completed old rows remain readable through cancellation and restart until the final verified chunk atomically replaces them. Missing or rewritten sources retain their last good rows and prior parser provenance. Older writers refuse the upgraded stores.
 Old rows retain existing TPS/TTFT
 with unavailable new fields. Receipt timing

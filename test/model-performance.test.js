@@ -92,6 +92,32 @@ test('GPT-6.1 Terra has a distinct validated population without relabeling unkno
     assert.equal(isModelPerformanceSnapshot(invalid), false);
   }
 });
+test('GPT-6.2 timing snapshots keep reviewed model identities and captured modes distinct', () => {
+  const modelIds = ['gpt-6.2-astra', 'gpt-6.2-sol', 'gpt-6-astra', 'gpt-6.1-sol'];
+  const rows = modelIds.flatMap((model, index) => [
+    row({ model, sample_tokens: 100 * (index + 1) }),
+    row({ model, speed_mode: 'ultrafast', sample_tokens: 200 * (index + 1) }),
+    row({ model: `${model}-unreviewed`, sample_tokens: 99999 }),
+  ]);
+  rows.push(row({ model: 'gpt-6.2-astra-law', sample_tokens: 500 }));
+  for (const [speedMode, scale] of [['standard', 100], ['ultrafast', 200]]) {
+    const snapshot = modelPerformanceProjection(rows, { now: NOW, speedMode });
+    assert.equal(isModelPerformanceSnapshot(snapshot), true);
+    const measurement = model => [model.label, model.turns, model.speed[0].points[0].median];
+    const byId = Object.fromEntries(snapshot.models.map(model => [model.id, measurement(model)]));
+    assert.deepEqual(byId, {
+      'gpt-6.2-astra': ['GPT-6.2 Astra', 1, scale],
+      'gpt-6.2-sol': ['GPT-6.2 Sol', 1, 2 * scale],
+      'gpt-6-astra': ['Astra', 1, 3 * scale],
+      'gpt-6.1-sol': ['GPT-6.1 Sol', 1, 4 * scale],
+      ...(speedMode === 'standard' ? { 'gpt-6.2-astra-law': ['GPT-6.2 Astra for Law', 1, 500] } : {}),
+    });
+    const invalid = structuredClone(snapshot);
+    invalid.models.find(model => model.id === 'gpt-6.2-sol').label = 'GPT-6.1 Sol';
+    assert.equal(isModelPerformanceSnapshot(invalid), false);
+  }
+});
+
 test('Windows supplemental timing store avoids the primary guard ancestors', () => {
   const timingRoot = join('/state', 'inference-timing-v2');
   const directory = join(timingRoot, 'source-0123456789abcdef');

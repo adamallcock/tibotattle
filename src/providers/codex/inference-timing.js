@@ -4,11 +4,11 @@ import { createHmac } from 'node:crypto';
 
 export const METHOD = 2;
 // Parsing semantics can advance without changing stable timing HMAC identities.
-export const INFERENCE_TIMING_PARSER_VERSION = 21;
+export const INFERENCE_TIMING_PARSER_VERSION = 22;
 export const MAX_STATE_BYTES = 128 * 1024;
 const MAX_TIER_EVENTS = 512;
 const MAX_CONTEXT_HISTORY = 512;
-const MODELS = new Set(['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6.1-terra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra',
+const MODELS = new Set(['gpt-6.2-astra', 'gpt-6.2-sol', 'gpt-6.2-astra-law', 'gpt-6-astra', 'gpt-6.1-sol', 'gpt-6.1-terra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra',
   'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex',
   'gpt-5.3-codex-spark', 'gpt-5.2-codex', 'gpt-5.2', 'auto-review']);
 const EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']);

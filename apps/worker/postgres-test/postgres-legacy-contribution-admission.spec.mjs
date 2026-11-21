@@ -2013,9 +2013,8 @@ test("PG17 the default current v0.1 test composition stores complete v0.6 pricin
   const device = await socialDevice(twin, "in3-v01-current", randomUUID(), { consent: false });
   const record = v01Contribution("a");
   const priceCard = "openai:gpt-5.6-sol:standard:short-through-2026-08-20:official-observed-2026-08-30";
-  // Keep the complete September 29 expectation independently. Terra advances
-  // registry provenance for this pre-Terra event without changing its price,
-  // selected card, method, coverage, speed or event-time semantics.
+  // Keep the complete September 29 expectation independently. Current
+  // registry provenance changes while every pricing field stays identical.
   const predecessorPricing = {
     exactCostUsd: "0.0064", costNanousd: 6_400_000,
     coveragePercent: 100, coverageStatus: "fully_priced", unknownBillableUnits: 0,
@@ -2031,9 +2030,9 @@ test("PG17 the default current v0.1 test composition stores complete v0.6 pricin
   };
   const currentPricing = {
     ...predecessorPricing,
-    registryVersion: "app-official-api-prices-v0.10",
-    registrySha256: "206544769b43e4b9645284258edd38f7c07a226022db10f5ec0181335df236ab",
-    registryObservedAt: "2026-10-26T22:25:14Z",
+    registryVersion: "app-official-api-prices-v0.11",
+    registrySha256: "eca860219a79a24a2cc1ba07471e2ecc321281508dc7e8d48412deef77609c77",
+    registryObservedAt: "2026-11-21T14:12:40Z",
   };
   const current = await workerModule("/src/server-pricing.ts");
   const priced = current.priceTelemetryUsageEvent(record.usageEvents[0]);
@@ -2085,8 +2084,8 @@ test("PG17 the default current v0.1 test composition stores complete v0.6 pricin
     server_price_event_time_start: "2026-07-25T12:05:00.000Z", server_price_event_time_end: "2026-07-25T12:05:00.000Z",
   };
   const currentRegistryColumns = {
-    server_price_registry_version: "app-official-api-prices-v0.10",
-    server_price_registry_sha256: "206544769b43e4b9645284258edd38f7c07a226022db10f5ec0181335df236ab",
+    server_price_registry_version: "app-official-api-prices-v0.11",
+    server_price_registry_sha256: "eca860219a79a24a2cc1ba07471e2ecc321281508dc7e8d48412deef77609c77",
   };
   for (const [actual, predecessor] of [[serverColumns(usage), predecessorUsagePricing],
     [serverColumns(rows.contributions[0]), predecessorContributionPricing]]) {

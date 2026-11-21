@@ -91,7 +91,7 @@ async function loadModules() {
       },
     }],
     resolve: { mainFields: ["module", "main"] },
-    ssr: { noExternal: ["jsonc-parser"] },
+    ssr: { noExternal: ["jsonc-parser", ...Object.keys(VENDORED_PACKAGE_ENTRIES)] },
   });
   return {
     route: await vite.ssrLoadModule("/src/analytics-v2/community-daily-route.ts"),

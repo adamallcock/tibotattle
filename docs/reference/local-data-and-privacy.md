@@ -140,6 +140,10 @@ supplemental full-turn estimate. Each turn is counted once; the display disclose
 the fallback count and its inclusion of initial waiting. It does not feed accounting.
 Only the separately authorized performance scheduler can project and send its
 content-free daily histograms; opening the page does not grant sharing consent.
+Its owner-only retry files carry report days, closed outcomes and pacing
+metadata, scoped to the authorized device and destination. Deleting the
+private companion state also removes those files. A device replacement
+cannot inherit the prior device's retry days.
 Failures preserve available saved evidence with its
 stale/unavailable state. Windows remains unavailable until its protected-state
 adapter is qualified. These are source behavior, not installed-release proof.

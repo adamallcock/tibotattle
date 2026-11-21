@@ -104,18 +104,43 @@ const REGISTRY_PINS = Object.freeze([
   // Kernel 18: classify shared proof reads in the existing correction-source
   // statement family. Query results, vendor and prices remain unchanged.
   "5f808f13dccf3aa6eb919bb56d7ca9b57b1ea2e474fc1bb5847102a73c78a5fd",
-  // Kernel 19: reuse v1.2 pair eligibility across the occurrence expansion.
-  // Query results, bounds, vendor, prices and orchestration method are unchanged.
-  "e32ccedf43fac51b487a9ab444608acf9a4070f2cd786b7f409741826784f1ff",
-  // Kernel 20: fast closed-shape validation with the historical comparison as
-  // fallback. Accepted states, arithmetic, prices and method are unchanged.
-  "3d19c89d3e6da520bed8b08d9e497747d390a64f34eff9137fefbf918b0f67e4",
-  // Kernel 21: the independently measured Terra and scientific-plan successor
-  // of the production origin line. Retain its allocation before this build.
+  // Kernel 19: era-isolated model composition on the production hotfix line.
+  // Existing single-era math is unchanged; each owner votes once per model.
+  "e27e4b4f0f3d6f24a9ce2e85bc3bb90424465ec06c555830b0236d46fe935bfb",
+  // Kernel 20: one entry for three closure changes on the live origin's
+  // kernel 19, so one reprice. Kernel 19's era-isolated model composition and
+  // its vendored manifest are kept as they are. The community model speed
+  // port (performance-histogram-v2, dictionary adapters, community
+  // performance shape) reaches the closure through the telemetry-contract
+  // barrel, with the performance reader and fold as closure roots. The v1.2
+  // future-day bound (decision 2026-10-12) makes the refresh plan through its
+  // own UTC day and defers later queued days as blocked. errors.ts gains
+  // COMMUNITY_MODEL_PERFORMANCE_UNPUBLISHED, ADMIN_PERFORMANCE_INTAKE_UNAVAILABLE
+  // and TELEMETRY_DAY_NOT_YET_ADMISSIBLE. Vendor, prices and the pricer are
+  // unchanged from kernel 19; this source is not deployed.
+  "981fbd1a86e62732b725a922f8c31cffec2f5f184d2721d6fb4001b2b0eeb97e",
+  // Kernel 21: reviewed Terra catalog/prices and exact retained admin catalogs,
+  // plus current scientific-plan recognition with unknown allowance. The live
+  // performance/era implementation and all predecessor identities are retained.
   "00de5d3dd296f79a2d7bb90361f126621d4155593787045baec137454775705e",
-  // Kernel 22: this line's Terra catalog/pricing and scientific-plan successor,
-  // with the exact retained-preview compatibility patch and compute closure.
-  "4d97cafbcd47b3426a0af21122c728b1d56ee2678b05df00a10587b25bc58f3d",
+  // Kernel 22: restore classification proof-read attribution in the existing
+  // correction-source family. Live performance/era behavior, vendor and prices
+  // are unchanged; this is the server branch successor to its kernel 21.
+  "93113d9c87614c9e01b29dbe0a01e8480031175dddc31648bf07f20302b4d1f8",
+  // Kernel 23: exact daily-state key matching and the primitive-zero decimal
+  // shortcut preserve historical acceptance, arithmetic and refusal behavior.
+  "340b9dab35a63d6c7baaf25b3f5ecde8d5ef683bedf3db2c30c423146a3b6273",
+  // Kernel 24: preserve genuine saved-version pricing inputs before ordinary
+  // refresh replacement. Vendor, price catalog and calculation are unchanged.
+  "eaef4fff91fbe3a790e7ac336a0b3bdb413510d39497701005542dd2c3b0efbf",
+  // Kernel 25: bounded current-owner-day correction with new-version provenance;
+  // prior registry entries, vendor and price catalog remain unchanged.
+  "01e8207c8f36afc40b20fe1368531afb99a04adceb029debff53a70d469e8e85",
+  // Kernel 26: the live-line GPT-6.2 vendor update and exact pricing adapter.
+  "6e66db8933cabf629a29017555688f90f224b3f867219630c1a44c0c37e3a332",
+  // Kernel 27: the main-based client checkout with the GPT-6.2 vendor source.
+  // This differs from the separately qualified live-line compute closure.
+  "fbeceaad8a635073bae47f7910a03242f7f0a3bc9a1b6b35073a6638e3e5fd9b",
 ]);
 const ENTRY_KEYS = ["computeClosureSha256", "kernelId", "methodVersion", "priceRegistrySha256", "priceRegistryVersion",
   "productionCommit", "vendorManifestSha256"];

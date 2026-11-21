@@ -55,9 +55,31 @@ export const WINDOWS_FINAL_UPGRADE_PREDECESSOR_V2 = Object.freeze({
   installerSha256: '4f536f2da0dba7a9e2f04adf959d0069256c9d16da7d8d61d31585b7d6f9c36e',
   installerBytes: 105541856,
 });
+// Digest and size match GitHub's immutable release metadata and manifest.
+export const WINDOWS_FINAL_UPGRADE_PREDECESSOR_V3 = Object.freeze({
+  schemaVersion: 'tibotattle-windows-final-upgrade-predecessor-v3',
+  version: '0.1.29',
+  target: 'win32-x64',
+  sourceRevision: '905d9f9682ef472671eb87281fb35ead38711561',
+  manifestSha256: '731b1ffe5d1c5fa9a8e38c23c439d2f77327fa045b25cf31da955a6834da446c',
+  installerSha256: 'd8b38010237f0a603c7d3980e8435f16b0c0ab84c71b73371eaf56f393417cb7',
+  installerBytes: 105911200,
+});
 const PREDECESSORS = Object.freeze({
   [WINDOWS_FINAL_UPGRADE_PREDECESSOR.schemaVersion]: WINDOWS_FINAL_UPGRADE_PREDECESSOR,
   [WINDOWS_FINAL_UPGRADE_PREDECESSOR_V2.schemaVersion]: WINDOWS_FINAL_UPGRADE_PREDECESSOR_V2,
+  [WINDOWS_FINAL_UPGRADE_PREDECESSOR_V3.schemaVersion]: WINDOWS_FINAL_UPGRADE_PREDECESSOR_V3,
+});
+const PREDECESSOR_MANIFEST_BYTES = Object.freeze({
+  '0.1.26': 5866,
+  '0.1.28': 5429,
+  '0.1.29': 5819,
+});
+const SUCCESSOR_PREDECESSORS = Object.freeze({
+  '0.1.27': WINDOWS_FINAL_UPGRADE_PREDECESSOR,
+  '0.1.28': WINDOWS_FINAL_UPGRADE_PREDECESSOR,
+  '0.1.29': WINDOWS_FINAL_UPGRADE_PREDECESSOR_V2,
+  '0.1.30': WINDOWS_FINAL_UPGRADE_PREDECESSOR_V3,
 });
 const FINAL_SUCCESSORS = Object.freeze({
   '0.1.27': Object.freeze({ version: '0.1.27', buildNumber: '2026100301',
@@ -66,6 +88,8 @@ const FINAL_SUCCESSORS = Object.freeze({
     receiptSchema: 'tibotattle-windows-final-upgrade-v2' }),
   '0.1.29': Object.freeze({ version: '0.1.29', buildNumber: '2026102601',
     receiptSchema: 'tibotattle-windows-final-upgrade-v3' }),
+  '0.1.30': Object.freeze({ version: '0.1.30', buildNumber: '2026112101',
+    receiptSchema: 'tibotattle-windows-final-upgrade-v4' }),
 });
 // Select the response grammar from authenticated release identity, never from
 // whatever the running application happens to return. New releases need review.
@@ -74,6 +98,7 @@ const PERFORMANCE_CONTRACTS = Object.freeze({
   '0.1.27': WINDOWS_NORMAL_CANDIDATE_PERFORMANCE_CONTRACTS.historical,
   '0.1.28': WINDOWS_NORMAL_CANDIDATE_PERFORMANCE_CONTRACTS.historical,
   '0.1.29': WINDOWS_NORMAL_CANDIDATE_PERFORMANCE_CONTRACTS.current,
+  '0.1.30': WINDOWS_NORMAL_CANDIDATE_PERFORMANCE_CONTRACTS.current,
 });
 export function resolveWindowsFinalUpgradeSuccessor({ version, buildNumber } = {}) {
   const successor = typeof version === 'string' && Object.hasOwn(FINAL_SUCCESSORS, version)
@@ -100,8 +125,7 @@ export function windowsFinalUpgradePredecessorFile(value) {
 export function validateWindowsFinalUpgradePair(intake, candidate) {
   const predecessor = validateWindowsFinalUpgradePredecessor(intake);
   const successor = resolveWindowsFinalUpgradeSuccessor(candidate);
-  if (predecessor !== (successor.version === '0.1.29'
-    ? WINDOWS_FINAL_UPGRADE_PREDECESSOR_V2 : WINDOWS_FINAL_UPGRADE_PREDECESSOR)) fail('PAIR_INVALID');
+  if (predecessor !== SUCCESSOR_PREDECESSORS[successor.version]) fail('PAIR_INVALID');
   return successor;
 }
 export function parseWindowsFinalUpgradeMode({ qualifyInstalled, qualifyUpgrade, predecessorIntake } = {}) {
@@ -121,7 +145,7 @@ export function validateWindowsFinalUpgradePredecessorManifest(bytes, intake) {
   validateWindowsFinalUpgradePredecessor(intake);
   const file = windowsFinalUpgradePredecessorFile(intake);
   const tag = `v${intake.version}`;
-  const manifestBytes = intake.schemaVersion === WINDOWS_FINAL_UPGRADE_PREDECESSOR_V2.schemaVersion ? 5429 : 5866;
+  const manifestBytes = PREDECESSOR_MANIFEST_BYTES[intake.version];
   if (!Buffer.isBuffer(bytes) || bytes.length !== manifestBytes || hash(bytes) !== intake.manifestSha256) {
     fail('PREDECESSOR_MANIFEST_INVALID');
   }

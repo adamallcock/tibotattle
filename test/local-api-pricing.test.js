@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  APP_OFFICIAL_PRICE_CARDS,
   addUsdStrings,
   aggregateLocalApiPriceResults,
   apiPriceResolutionSummary,
@@ -109,10 +110,13 @@ test("Sol 6.1, Terra 6.1 and Astra Ultrafast preserve exact event-time token acc
     ["gpt-6.1-sol", "batch", "0.695", "1.14"],
     ["gpt-6.1-sol", "flex", "0.695", "1.14"],
     ["gpt-6.1-sol", "priority", "2.78", "4.56"],
+    ["gpt-6.1-sol", "ultrafast", "8.34", "13.68"],
     ["gpt-6-astra", "ultrafast", "42", "69"],
   ];
   for (const [model, apiServiceTier, short, long] of expected) {
-    const launchDate = model === "gpt-6.1-terra" ? "2026-10-26" : "2026-09-29";
+    const launchDate = model === "gpt-6.1-terra" ? "2026-10-26"
+      : model === "gpt-6.1-sol" && apiServiceTier === "ultrafast" ? "2026-10-08"
+      : "2026-09-29";
     const event = {
       timestamp: `${launchDate}T00:00:00.000Z`, model,
       totalInputContextTokens: 272_000, raw: { input_tokens: 999_999 },
@@ -142,7 +146,7 @@ test("Sol 6.1, Terra 6.1 and Astra Ultrafast preserve exact event-time token acc
 });
 
 test("unpublished Ultrafast pairs never borrow Standard prices or Astra's multiplier", () => {
-  for (const model of ["gpt-6.1-terra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol"]) {
+  for (const model of ["gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-6.2-astra-law"]) {
     for (const totalInputContextTokens of [272_000, 272_001]) {
       const result = priceCodexUsageEvent({
         timestamp: "2026-10-26T12:00:00.000Z", model, totalInputContextTokens,
@@ -215,6 +219,131 @@ test("context-dependent Terra 6.1, Sol 6.1 and Astra rates require observed inpu
     assert.equal(knownZero.totalUsd, short);
     assert.equal(knownZero.methodVersion, "provider-neutral-api-price-equivalent-v0.3");
   }
+});
+
+test("GPT-6.2 prices every observed component in both context bands at every supported tier", () => {
+  const rates = {
+    "gpt-6.2-astra": {
+      standard: [["8", "0.4", "10", "40"], ["16", "0.8", "20", "60"]],
+      batch: [["4", "0.2", "5", "20"], ["8", "0.4", "10", "30"]],
+      priority: [["16", "0.8", "20", "80"], ["32", "1.6", "40", "120"]],
+      promo: [["24", "1.2", "30", "120"], ["48", "2.4", "60", "180"]],
+      list: [["48", "2.4", "60", "240"], ["96", "4.8", "120", "360"]],
+    },
+    "gpt-6.2-sol": {
+      standard: [["2", "0.1", "2.5", "10"], ["4", "0.2", "5", "15"]],
+      batch: [["1", "0.05", "1.25", "5"], ["2", "0.1", "2.5", "7.5"]],
+      priority: [["4", "0.2", "5", "20"], ["8", "0.4", "10", "30"]],
+      promo: [["6", "0.3", "7.5", "30"], ["12", "0.6", "15", "45"]],
+      list: [["12", "0.6", "15", "60"], ["24", "1.2", "30", "90"]],
+    },
+  };
+  const components = {
+    input_uncached_tokens: 1_000_000,
+    input_cache_read_tokens: 1_000_000,
+    input_cache_write_tokens: 1_000_000,
+    output_text_tokens: 1_000_000,
+  };
+  const testTiers = [
+    ["standard", "standard", "2026-11-17T00:00:00.000Z"],
+    ["batch", "batch", "2026-11-17T00:00:00.000Z"],
+    ["priority", "priority", "2026-11-17T00:00:00.000Z"],
+    ["fast", "priority", "2026-11-17T00:00:00.000Z"],
+    ["ultrafast", "list", "2027-03-01T08:00:00.000Z"],
+    ["ultrafast", "promo", "2027-03-01T07:59:59.999Z"],
+    ["ultrafast", "promo", "2026-11-17T00:00:00.000Z"],
+    ["ultrafast", "list", "2027-03-01T08:00:00.001Z"],
+  ];
+  for (const [model, modelRates] of Object.entries(rates)) {
+    for (const [apiServiceTier, rate, timestamp] of testTiers) {
+      for (const totalInputContextTokens of [271_999, 272_000, 272_001]) {
+        const event = { model, timestamp, totalInputContextTokens, components };
+        const result = priceCodexUsageEvent(event, { apiServiceTier });
+        const expected = modelRates[rate][totalInputContextTokens > 272_000 ? 1 : 0];
+        for (const [index, name] of Object.keys(components).entries()) {
+          assert.equal(result.components.find((part) => part.name === name).costUsd, expected[index],
+            [model, apiServiceTier, timestamp, totalInputContextTokens, name].join("/"));
+        }
+        assert.equal(result.totalUsd, addUsdStrings(...expected));
+        assert.equal(result.coverageStatus, "fully_priced");
+        assert.equal(result.selectedPriceCardIds.length, 1);
+        if (apiServiceTier === "ultrafast") assert.ok(result.selectedPriceCardIds[0].includes(rate));
+        const prior = priceCodexUsageEvent({ ...event, timestamp: "2026-11-16T23:59:59.999Z" }, { apiServiceTier });
+        assert.equal(prior.coverageStatus, "unpriced");
+        assert.ok(prior.warnings.coverage.some((warning) => warning.code === "historical_price_missing"));
+      }
+    }
+    const event = {
+      model, timestamp: "2027-03-01T08:00:00.000Z", totalInputContextTokens: 272_000, components,
+    };
+    assert.equal(priceCodexUsageEvent(event, {
+      priceEpochBasis: "current_price_sensitivity", apiServiceTier: "ultrafast",
+    }).totalUsd, addUsdStrings(...modelRates.promo[0]));
+    for (const [input, tier, warningCode] of [
+      [{ ...event, timestamp: undefined }, "ultrafast", "historical_price_timestamp_missing"],
+      [{ ...event, timestamp: "2027-03-01" }, "ultrafast", "historical_price_timestamp_missing"],
+      [{ ...event, totalInputContextTokens: null, components: { output_text_tokens: 1_000_000 } },
+        "ultrafast", "total_input_context_missing"],
+      [event, "flex", "service_tier_exact_card_missing"],
+    ]) {
+      const zero = Object.fromEntries(Object.keys(input.components).map((name) => [name, 0]));
+      for (const observed of [input.components, zero]) {
+        const result = priceCodexUsageEvent({ ...input, components: observed }, { apiServiceTier: tier });
+        assert.equal(result.coverageStatus, "unpriced");
+        assert.ok(result.warnings.coverage.some((warning) => warning.code === warningCode));
+      }
+    }
+  }
+});
+
+test("GPT-6.2 Astra for Law only prices the independently documented Standard window", () => {
+  const event = {
+    model: "gpt-6.2-astra-law", totalInputContextTokens: 272_000,
+    timestamp: "2026-12-31T23:59:59.999Z",
+    components: { input_uncached_tokens: 100_000, input_cache_read_tokens: 100_000,
+      input_cache_write_tokens: 72_000, output_text_tokens: 40_000, output_reasoning_tokens: 60_000 },
+  };
+  for (const [context, total] of [[272_000, "5.56"], [272_001, "9.12"]]) {
+    const priced = priceCodexUsageEvent({ ...event, totalInputContextTokens: context });
+    assert.equal(priced.coverageStatus, "fully_priced");
+    assert.equal(priced.totalUsd, total);
+    assert.equal(priced.selectedPriceCardIds.length, 1);
+    assert.match(priced.selectedPriceCardIds[0], /gpt-6.2-astra-law:standard/u);
+  }
+  for (const timestamp of ["2026-11-16T23:59:59.999Z", "2027-01-01T00:00:00.000Z"]) {
+    for (const components of [event.components, { output_text_tokens: 0 }]) {
+      const unknown = priceCodexUsageEvent({ ...event, timestamp, components });
+      assert.equal(unknown.coverageStatus, "unpriced");
+      assert.ok(unknown.warnings.coverage.some((warning) => warning.code === "historical_price_missing"));
+    }
+  }
+  for (const apiServiceTier of ["priority", "fast", "batch", "flex", "ultrafast"]) {
+    for (const components of [event.components, { output_text_tokens: 0 }]) {
+      const result = priceCodexUsageEvent({ ...event, components }, { apiServiceTier });
+      assert.equal(result.coverageStatus, "unpriced");
+      assert.deepEqual(new Set(result.warnings.coverage.map((warning) => warning.code)),
+        new Set(["service_tier_exact_card_missing"]));
+      assert.equal(result.ledger.warnings.some((warning) => warning.code === "unknown_model"), false);
+    }
+  }
+  const unknown = priceCodexUsageEvent({ ...event, model: "unreviewed-law-model" }, { apiServiceTier: "fast" });
+  assert.equal(unknown.coverageStatus, "unpriced");
+  assert.ok(unknown.warnings.coverage.some((warning) => warning.code === "unknown_model"));
+  assert.ok(unknown.ledger.warnings.some((warning) => warning.code === "unknown_model"));
+});
+
+test("OpenAI Fast retains an exact caller-supplied tier card", () => {
+  const source = APP_OFFICIAL_PRICE_CARDS.find((card) => card.model === "gpt-6.2-sol"
+    && card.service_tier === "priority" && card.metadata.total_input_context_band === "short");
+  const card = { ...source, id: "caller-openai-fast", service_tier: "fast" };
+  const result = priceCodexUsageEvent({
+    model: "gpt-6.2-sol", totalInputContextTokens: 1,
+    timestamp: "2026-11-21T12:00:00.000Z", components: { output_text_tokens: 1_000 },
+  }, { apiServiceTier: "fast", priceCards: [card] });
+  assert.equal(result.coverageStatus, "fully_priced");
+  assert.equal(result.totalUsd, "0.02");
+  assert.equal(result.pricingContext.serviceTier, "fast");
+  assert.deepEqual(result.selectedPriceCardIds, [card.id]);
 });
 
 test("Codex component availability reaches the ledger and never becomes observed zero", () => {

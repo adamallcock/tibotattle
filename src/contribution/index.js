@@ -79,6 +79,7 @@ export {
   TELEMETRY_PERFORMANCE_SYNC_STATE_VERSION,
   initialTelemetryPerformanceSyncState,
   parseTelemetryPerformanceSyncState,
+  readTelemetryPerformanceRetryDays,
   resumeTelemetryPerformanceSyncAfterAuthorization,
   prepareTelemetryPerformanceDay,
   runTelemetryPerformanceSync,

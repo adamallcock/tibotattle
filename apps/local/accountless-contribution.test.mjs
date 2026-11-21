@@ -167,7 +167,12 @@ test("accountless performance scheduler obtains its own grant, backfills seven d
     if (parsed.pathname === "/api/v1/envelope-key") return response(200, {
       algorithm: "RSA-OAEP-256", keyId: "key:performance-fixture", publicJwk: { kty: "RSA" },
     });
-    if (parsed.pathname === "/api/v1/device/telemetry/performance/reports") return response(202, {});
+    if (parsed.pathname === "/api/v1/device/telemetry/performance/reports") {
+      const { day, reportRevision } = JSON.parse(init.body).report;
+      return response(202, { schemaVersion: "telemetry-performance-receipt-v1",
+        status: "accepted", reportId: "12345678-1234-4234-8234-123456789abc",
+        day, reportRevision, replayed: false });
+    }
     throw new Error(`unexpected route ${parsed.pathname}`);
   };
   const reportForDay = async day => {
@@ -264,7 +269,7 @@ test("accountless performance scheduler obtains its own grant, backfills seven d
     const rejected = await selected.performanceRunNow();
     assert.equal(rejected.state, "paused", failure);
     assert.equal(requests.length, before + 1, "each renewed preference must re-prove the grant");
-    const persisted = JSON.parse(await readFile(join(stateRoot, "private", "accountless-performance-sync-state-v1.json"), "utf8"));
+    const persisted = JSON.parse(await readFile(join(stateRoot, "private", "accountless-performance-sync-state-v2.json"), "utf8")).state;
     assert.equal(persisted.pausedReason, failure === "invalid" ? "response_invalid" : "authorization_rejected");
     assert.equal(persisted.cursorDay, "2026-09-14", "reauthorization preserves acknowledged progress");
     assert.equal(requests.filter(item => item.path === "/api/v1/device/telemetry/performance/reports").length, 16);
@@ -290,7 +295,7 @@ test("accountless performance scheduler obtains its own grant, backfills seven d
   assert.equal(requests.slice(beforeRestart).filter(item => item.path === "/api/v1/accountless/telemetry-performance-authorization").length, 1,
     "a fresh process must re-prove the grant before recovering a persisted authorization pause");
   assert.equal(requests.filter(item => item.path === "/api/v1/device/telemetry/performance/reports").length, 32);
-  assert.equal(JSON.parse(await readFile(join(stateRoot, "private", "accountless-performance-sync-state-v1.json"), "utf8")).cursorDay,
+  assert.equal(JSON.parse(await readFile(join(stateRoot, "private", "accountless-performance-sync-state-v2.json"), "utf8")).state.cursorDay,
     "2026-09-14", "restart recovery preserves the prior acknowledged day");
   await selected.stop();
   host.dispose();

@@ -322,6 +322,8 @@ export function planWeeklyApiEquivalentUsd(referenceUsd, planType, normalization
 // Roster models keep a card while they have no estimate, except the ones in
 // PUBLIC_ALLOWANCE_ROSTER_UNTIL_PUBLISHED below.
 const PUBLIC_ALLOWANCE_ROSTER = Object.freeze([
+  ["gpt-6.2-astra", "GPT-6.2 Astra"],
+  ["gpt-6.2-sol", "GPT-6.2 Sol"],
   ["gpt-6-astra", "GPT-6 Astra"],
   ["gpt-6.1-sol", "GPT-6.1 Sol"],
   ["gpt-6-sol", "GPT-6 Sol"],
@@ -341,7 +343,9 @@ const PUBLIC_ALLOWANCE_ROSTER_IDS = new Set(PUBLIC_ALLOWANCE_ROSTER.map(([modelI
 // A named model follows the block's order. v1.0 and v1.1 cannot carry a block,
 // so held-back models keep their roster slots and stay known: a producer
 // publishes tuples only for models in its own reviewed catalog.
-const PUBLIC_ALLOWANCE_ROSTER_UNTIL_PUBLISHED = new Set(["gpt-6.1-sol", "gpt-6.1-terra"]);
+const PUBLIC_ALLOWANCE_ROSTER_UNTIL_PUBLISHED = new Set([
+  "gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-sol", "gpt-6.1-terra",
+]);
 // The owner chose a selected comparison, not the whole historical vocabulary
 // (2d6cfbc8, "six requested public allowance models"): older generations stay
 // off the page. That choice is this explicit list, taken from the OpenAI
@@ -360,6 +364,8 @@ const PUBLIC_ALLOWANCE_HIDDEN_IDS = Object.freeze([
   "gpt-5.2-codex", "gpt-5.2-pro", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano",
   "gpt-5.4-pro", "gpt-5.5", "gpt-5.5-codex", "gpt-5.5-pro", "gpt-5.6-sol-wm", "o1", "o1-pro",
   "o3", "o3-mini", "o3-pro", "o4-mini", "gpt-6.1-astra",
+  // Restricted configurations appear only with both published metadata and an estimate.
+  "gpt-6.2-astra-law",
 ]);
 
 /**

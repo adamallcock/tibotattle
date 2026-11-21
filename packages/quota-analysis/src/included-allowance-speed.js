@@ -2,7 +2,7 @@
 // does not price tokens, infer which pool paid for a turn, prove mode access,
 // or replace empirical quota calibration. In particular, these weights must
 // never multiply money that already includes an API speed premium.
-const FAST_MODELS = Object.freeze([
+const LEGACY_MODELS = Object.freeze([
   "gpt-5.5",
   "gpt-5.6-luna",
   "gpt-5.6-sol",
@@ -12,33 +12,59 @@ const FAST_MODELS = Object.freeze([
   "gpt-6-luna",
   "gpt-6.1-sol",
 ]);
+const LEGACY_WEIGHTS = Object.freeze({ standard: 1, fast: 2.5 });
+const LEGACY_ULTRAFAST_WEIGHT = Object.freeze({ ultrafast: 8 });
 
 export const CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY = Object.freeze({
-  version: "codex-included-allowance-speed-v0.1",
+  version: "codex-included-allowance-speed-v0.2",
   basis: "documented_included_allowance_relative_to_standard",
   unit: "dimensionless",
-  // The documentation was reviewed on this day. It does not establish the
-  // exact vendor launch instant or a policy for earlier events.
+  // Review and launch dates are day-level evidence, not rollout instants.
   reviewedFrom: "2026-09-29",
   historicalApplicability: "unavailable_before_reviewed_from",
   source: Object.freeze({
     publisher: "openai",
-    url: "https://learn.chatgpt.com/docs/agent-configuration/speed",
-    statement: "For supported models, Fast uses included allowance at 2.5x Standard; Astra Ultrafast uses 8x. Purchased credits and API prices use separate factors.",
+    url: "https://learn.chatgpt.com/docs/pricing#speed-multipliers",
+    launchDatesUrl: "https://learn.chatgpt.com/docs/changelog",
+    statement: "GPT-6.2 Astra and Sol use included allowance at 2x Standard for Fast and 6x for Ultrafast. The reviewed historical Fast weight is 2.5x, and GPT-6 Astra and GPT-6.1 Sol Ultrafast use 8x. Purchased credits and API prices use separate factors.",
   }),
-  weights: Object.freeze({ standard: 1, fast: 2.5, ultrafast: 8 }),
-  supportedFastModels: FAST_MODELS,
-  supportedUltrafastModels: Object.freeze(["gpt-6-astra"]),
+  rules: Object.freeze([
+    Object.freeze({
+      models: LEGACY_MODELS,
+      reviewedFrom: "2026-09-29",
+      weights: LEGACY_WEIGHTS,
+    }),
+    Object.freeze({
+      models: Object.freeze(["gpt-6-astra"]),
+      reviewedFrom: "2026-09-29",
+      weights: LEGACY_ULTRAFAST_WEIGHT,
+    }),
+    Object.freeze({
+      models: Object.freeze(["gpt-6.1-sol"]),
+      reviewedFrom: "2026-10-08",
+      weights: LEGACY_ULTRAFAST_WEIGHT,
+    }),
+    Object.freeze({
+      models: Object.freeze(["gpt-6.1-terra"]),
+      reviewedFrom: "2026-10-26",
+      weights: LEGACY_WEIGHTS,
+    }),
+    Object.freeze({
+      models: Object.freeze(["gpt-6.2-astra", "gpt-6.2-sol"]),
+      reviewedFrom: "2026-11-17",
+      weights: Object.freeze({ standard: 1, fast: 2, ultrafast: 6 }),
+    }),
+  ]),
   establishesModeAvailability: false,
   infersConsumptionBasis: false,
   changesCalibrationBasis: false,
 });
 
-function result(status, reasonCode, weight = null) {
+function result(status, reasonCode, weight = null, reviewedFrom = CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY.reviewedFrom) {
   return Object.freeze({
     policyVersion: CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY.version,
     basis: CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY.basis,
-    reviewedFrom: CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY.reviewedFrom,
+    reviewedFrom,
     unit: CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY.unit,
     status,
     reasonCode,
@@ -95,12 +121,12 @@ export function includedAllowanceSpeedWeight({
   if (!["standard", "fast", "ultrafast"].includes(mode)) {
     return result("unavailable", "speed_mode_unavailable");
   }
-  if (!FAST_MODELS.includes(modelId)) {
-    return result("unavailable", "model_not_reviewed");
+  const modelRules = CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY.rules.filter((rule) => rule.models.includes(modelId));
+  if (modelRules.length === 0) return result("unavailable", "model_not_reviewed");
+  const rule = modelRules.find(({ weights }) => Object.hasOwn(weights, mode));
+  if (!rule) return result("unavailable", "model_speed_not_supported");
+  if (eventDay < rule.reviewedFrom) {
+    return result("unavailable", "before_reviewed_policy", null, rule.reviewedFrom);
   }
-  if (mode === "ultrafast"
-      && !CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY.supportedUltrafastModels.includes(modelId)) {
-    return result("unavailable", "model_speed_not_supported");
-  }
-  return result("documented", "documented_speed_weight", CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY.weights[mode]);
+  return result("documented", "documented_speed_weight", rule.weights[mode], rule.reviewedFrom);
 }

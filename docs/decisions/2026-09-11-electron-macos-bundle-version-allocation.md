@@ -121,3 +121,13 @@ provenance build is `2026102601`, selected for the 2026-10-26 client date in
 America/New_York. It identifies the source candidate and artifact receipts;
 it never substitutes for the Apple bundle version. Allocation is source
 preparation only, not signed-artifact, installed-update, or publication proof.
+
+## 2026-11-21 amendment for the 0.1.30 candidate
+
+Allocate stable macOS bundle version `1038` to both 0.1.30 architectures.
+This follows published 0.1.29 bundle `1037` and preserves the existing
+allocations. The candidate's independent provenance build is `2026112101`,
+selected for November 21, 2026 in America/New_York. Read-only checks on that
+date found no GitHub `v0.1.30` tag or release and no earlier `1038` entry
+in the source allocation plan. Signing, installed qualification, and
+publication each require evidence for the exact new artifacts.

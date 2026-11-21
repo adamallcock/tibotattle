@@ -1,4 +1,6 @@
 import {
+  APP_OFFICIAL_PRICE_CARDS,
+  quotaWeightedApiPriceEquivalent,
   speedModeApiMultiplier,
 } from "@app-usagemonitor/accounting";
 import {
@@ -8,6 +10,9 @@ import {
 } from "@app-usagemonitor/quota-analysis";
 
 const WEEKLY_WINDOW_MINS = SEVEN_DAY_WINDOW_MINUTES;
+const CODEX_STANDARD_PRICE_CARDS_BY_ID = new Map(APP_OFFICIAL_PRICE_CARDS
+  .filter((card) => card.provider === "openai" && card.service_tier === "standard")
+  .map((card) => [card.id, card]));
 // The provider restates one pool's resets_at with seconds-level jitter (one
 // to twenty-two seconds observed), so the selected reset is a CLUSTER of
 // resets_at values within the same two-minute tolerance the dashboard's
@@ -474,28 +479,51 @@ function ultrafastApiCost(row) {
   if (typeof row.priorObservedAt !== "string" || typeof row.eventTime !== "string") return null;
   const start = Date.parse(row.priorObservedAt);
   const end = Date.parse(row.eventTime);
-  // Price epochs are day-granular. Without per-event timestamps, a missing
-  // start or a date-spanning aggregate cannot prove eligibility for every event.
-  if (!Number.isFinite(start) || !Number.isFinite(end) || start > end
+  // Without event timestamps, a missing start or a date-spanning aggregate
+  // cannot prove eligibility for every event.
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start >= end
       || row.priorObservedAt.slice(0, 10) !== row.eventTime.slice(0, 10)) return null;
+  const firstEventTime = new Date(start + 1).toISOString();
   const models = Object.entries(row.modelMix ?? {});
   if (models.length === 0) return null;
+  if (!Array.isArray(row.priceCardIds) || row.priceCardIds.length === 0
+      || row.priceCardIds.length > CODEX_STANDARD_PRICE_CARDS_BY_ID.size) return null;
+  const unmatchedCardIds = new Set(row.priceCardIds);
+  if (unmatchedCardIds.size !== row.priceCardIds.length) return null;
+  const standardCards = [];
+  for (const id of row.priceCardIds) {
+    const card = CODEX_STANDARD_PRICE_CARDS_BY_ID.get(id);
+    if (!card) return null;
+    standardCards.push(card);
+  }
   let rawCost = 0;
   let events = 0;
   let weightedCost = 0;
   for (const [model, summary] of models) {
     if (!Number.isFinite(summary?.costUsd) || summary.costUsd < 0
-        || !Number.isSafeInteger(summary?.events) || summary.events < 0) return null;
-    const multiplier = speedModeApiMultiplier(model, "ultrafast", {
+        || !Number.isSafeInteger(summary?.events) || summary.events <= 0) return null;
+    const standardPriceCardIds = [];
+    for (const card of standardCards) {
+      if (card.model === model || card.aliases?.includes(model)) {
+        standardPriceCardIds.push(card.id);
+        unmatchedCardIds.delete(card.id);
+      }
+    }
+    const evidence = {
       eventTime: row.eventTime,
-      standardPriceCardIds: row.priceCardIds ?? [],
-    });
-    if (multiplier === null) return null;
+      standardPriceCardIds,
+    };
+    const multiplier = speedModeApiMultiplier(model, "ultrafast", evidence);
+    // The March 1 Pacific cutover lands inside a UTC day. Require the same
+    // eligible ratio from the first possible event through the interval end.
+    if (multiplier === null || multiplier !== speedModeApiMultiplier(model, "ultrafast", {
+      ...evidence, eventTime: firstEventTime,
+    })) return null;
     rawCost += summary.costUsd;
     events += summary.events;
     weightedCost += summary.costUsd * multiplier;
   }
-  return events === row.marginalUsageEventCount
+  return unmatchedCardIds.size === 0 && events === row.marginalUsageEventCount
     && Math.abs(rawCost - row.marginalApiPricedUsd) <= 1e-8
     ? weightedCost : null;
 }
@@ -508,6 +536,11 @@ function tierWeightedCost(row, fastMultiplier) {
   const counts = row.tierUsageEventCounts ?? {};
   if ((counts.ultrafast ?? 0) > 0) return ultrafastApiCost(row);
   const fast = counts.fast ?? 0;
+  // The aggregate does not locate Fast events by model, so the sensitivity
+  // has no usable weight if any represented model cannot use the assumption.
+  if (fast > 0 && Object.keys(row.modelMix ?? {}).some((model) => (
+    quotaWeightedApiPriceEquivalent({ model, mode: "fast", apiPriceEquivalentUsd: 0 }).multiplier === null
+  ))) return null;
   const standard = counts.standard ?? 0;
   const unknown = counts.unknown ?? 0;
   const total = fast + standard + unknown;

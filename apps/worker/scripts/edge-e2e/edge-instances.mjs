@@ -28,6 +28,7 @@
 import { createHash, generateKeyPairSync, randomBytes, sign as signBytes, webcrypto } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { setTimeout as allowSocketRead } from "node:timers/promises";
 import { readD1Migrations } from "@cloudflare/vitest-pool-workers";
 import { parse } from "jsonc-parser";
 import { Miniflare } from "miniflare";
@@ -270,6 +271,17 @@ function normalizeResponse(response, body) {
   });
 }
 
+// Workerd can answer from the headers while a large fixed-length test body
+// is still in flight. Yield between bounded writes so Undici can receive
+// that answer before an eager upload fills the socket and loses the response.
+async function* fixedLengthUploadChunks(bytes) {
+  const chunkBytes = 16 * 1024;
+  for (let offset = 0; offset < bytes.length; offset += chunkBytes) {
+    await allowSocketRead(2);
+    yield bytes.subarray(offset, offset + chunkBytes);
+  }
+}
+
 function requestInit({ method = "GET", headers = {}, body, ip, chunked = false, signal }) {
   const init = { method, redirect: "manual", headers: { ...headers } };
   if (ip !== null && ip !== undefined) init.headers["cf-connecting-ip"] = ip;
@@ -278,10 +290,14 @@ function requestInit({ method = "GET", headers = {}, body, ip, chunked = false, 
       const bytes = typeof body === "string" ? Buffer.from(body) : Buffer.from(body);
       const declared = Object.keys(init.headers).some((name) => name.toLowerCase() === "content-length");
       if (!chunked && !declared) init.headers["content-length"] = String(bytes.byteLength);
-      init.body = chunked
-        ? new ReadableStream({ start(controller) { controller.enqueue(bytes); controller.close(); } })
-        : bytes;
-      if (chunked) init.duplex = "half";
+      if (chunked) {
+        init.body = new ReadableStream({ start(controller) { controller.enqueue(bytes); controller.close(); } });
+      } else if (bytes.byteLength >= 1024 * 1024) {
+        init.body = ReadableStream.from(fixedLengthUploadChunks(bytes));
+      } else {
+        init.body = bytes;
+      }
+      if (init.body instanceof ReadableStream) init.duplex = "half";
     } else {
       init.body = body;
       init.duplex = "half";

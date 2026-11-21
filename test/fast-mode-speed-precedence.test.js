@@ -239,6 +239,8 @@ test("the ratio map holds every registered published Priority model", () => {
     "gpt-6-luna": 2,
     "gpt-6.1-sol": 2,
     "gpt-6.1-terra": 2,
+    "gpt-6.2-astra": 2,
+    "gpt-6.2-sol": 2,
   });
   // Every API price ratio is strictly greater than 1x and is never
   // accidentally recorded as 1x (which would

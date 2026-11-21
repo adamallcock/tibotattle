@@ -134,6 +134,14 @@ function tierForEvent(row: TelemetryUsageEvent): {
     // instead would strand models and epochs without a published Priority row
     // as unpriced and poison whole resets in the community fit.
     if (row.billingSurface === "chatgpt_subscription" && row.speedMode === "fast") {
+      if (row.modelId === "gpt-6.2-astra-law") {
+        // The reviewed legal offering has a Standard card and no Fast rate.
+        return {
+          apiServiceTier: "unknown",
+          tierBasis: "api_service_tier_unavailable",
+          speedMultiplier: null,
+        };
+      }
       const publishedRatio = fastModeQuotaMultiplier(row.modelId, {
         eventTime: row.eventTime,
         totalInputContextTokens: row.totalInputContextTokens,

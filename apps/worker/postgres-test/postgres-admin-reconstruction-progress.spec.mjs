@@ -37,7 +37,7 @@ before(async () => {
   await defaultAnalyticsV2FixtureStamps(pool, schema);
   vite = await createServer({ root: ROOT, configFile: false, server: { middlewareMode: true },
     appType: "custom", logLevel: "silent", resolve: { mainFields: ["module", "main"] },
-    ssr: { noExternal: ["jsonc-parser"] }, plugins: [{ name: "progress-vendor", enforce: "pre",
+    ssr: { noExternal: ["jsonc-parser", ...Object.keys(VENDORED_PACKAGE_ENTRIES)] }, plugins: [{ name: "progress-vendor", enforce: "pre",
       resolveId(source, importer) { return usesVendoredPackages(importer) ? VENDORED_PACKAGE_ENTRIES[source] : null; } }] });
   reader = (await vite.ssrLoadModule("/src/postgres-admin-reconstruction-progress.ts")).readPostgresAdminReconstructionProgress;
   overview = (await vite.ssrLoadModule("/src/postgres-admin-overview.ts")).readPostgresAdminOverview;

@@ -11,7 +11,7 @@ on:
         default: false
         type: boolean
       qualify_upgrade:
-        description: Exact signed upgrade 026 to 027/028, or pinned 028 to 029 (2026102601)
+        description: Exact signed upgrade 026 to 027/028, pinned 028 to 029, or pinned 029 to 030 (2026112101)
         required: false
         default: false
         type: boolean

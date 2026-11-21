@@ -18,10 +18,16 @@ const fail = reason => { throw Object.assign(new Error('MACOS_QUALIFICATION_IDEN
 // v4 admits only published 0.1.28 -> 0.1.29. Its predecessor manifest SHA-256 is
 // 459b89538461b4249dc38e9bbcb5f7c6eb8f49b202856f3cc4f1db8a57650f89:
 // https://github.com/adamallcock/tibotattle/releases/download/v0.1.28/release-manifest.json
+// v5 admits only published 0.1.29 -> 0.1.30. Its predecessor manifest SHA-256 is
+// 731b1ffe5d1c5fa9a8e38c23c439d2f77327fa045b25cf31da955a6834da446c:
+// https://github.com/adamallcock/tibotattle/releases/download/v0.1.29/release-manifest.json
 // 0.1.26 DMGs/source are pinned by the immutable published manifest:
 // https://github.com/adamallcock/tibotattle/releases/download/v0.1.26/release-manifest.json
 // SHA-256 be65a83f8c1f060b7c5cf6141b6332c02df730dc1a2aac696442e4e433c123cc.
 // Bundle/build metadata is also checked inside the signed, digest-verified DMG.
+const LEGACY_UPDATE_SUCCESSORS = Object.freeze([
+  '0.1.21', '0.1.22', '0.1.23', '0.1.24', '0.1.25', '0.1.26', '0.1.27', '0.1.28', '0.1.29',
+]);
 const PRODUCTION_UPDATE_PREDECESSORS = Object.freeze({
   'tibotattle-production-electron-update-intake-v1': Object.freeze({
     version: '0.1.20', sourceRevision: 'f518126a05a6d165b9617f6417a87219d7047273',
@@ -57,12 +63,22 @@ const PRODUCTION_UPDATE_PREDECESSORS = Object.freeze({
       'darwin-x64': 'cecd6cc5b9c68edbfc6764660356d792d772d0b18af1d1ae14d3135fa682ae92',
     }),
   }),
+  'tibotattle-production-electron-update-intake-v5': Object.freeze({
+    version: '0.1.29', sourceRevision: '905d9f9682ef472671eb87281fb35ead38711561',
+    buildNumber: '2026102601', bundleVersion: '1037', successorVersion: '0.1.30',
+    successorBuildNumber: '2026112101',
+    dmgSha256: Object.freeze({
+      'darwin-arm64': '4a4696bd297e31ad8a7ecce5e08b0fb6c639518c7199d6d69c05de8048e5af52',
+      'darwin-x64': '462561a50ce102cf8d808fe540c7a0950261acf5b91e47c3b18f40696ceb1991',
+    }),
+  }),
 });
 
 export function resolveMacOSProductionUpdatePredecessor({ schemaVersion, version, buildNumber } = {}) {
   if (typeof schemaVersion !== 'string' || !Object.hasOwn(PRODUCTION_UPDATE_PREDECESSORS, schemaVersion)) fail('update_profile');
   const predecessor = PRODUCTION_UPDATE_PREDECESSORS[schemaVersion];
   if (predecessor.successorVersion && version !== predecessor.successorVersion) fail('update_profile');
+  if (!predecessor.successorVersion && version !== undefined && !LEGACY_UPDATE_SUCCESSORS.includes(version)) fail('update_profile');
   if (predecessor.successorBuildNumber && buildNumber !== predecessor.successorBuildNumber) fail('update_profile');
   return predecessor;
 }

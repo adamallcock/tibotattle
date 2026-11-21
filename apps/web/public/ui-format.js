@@ -649,6 +649,7 @@ const REVIEWED_MODEL_DISPLAY_NAMES = Object.freeze({
   "claude-mythos-5-1": "Claude Mythos 5.1",
   "claude-opus-5-5": "Claude Opus 5.5",
   "gpt-6.1-astra": "GPT-6.1 Astra (forecast)",
+  "gpt-6.2-astra-law": "GPT-6.2 Astra for Law",
 });
 
 /**

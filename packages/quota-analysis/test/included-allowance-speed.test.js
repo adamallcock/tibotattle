@@ -14,15 +14,17 @@ const BASE = Object.freeze({
 
 test("documented included weights have a reviewed source and preserve distinct API money ratios", () => {
   const policy = CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY;
+  assert.equal(policy.version, "codex-included-allowance-speed-v0.2");
   assert.equal(policy.reviewedFrom, "2026-09-29");
-  assert.equal(policy.source.url, "https://learn.chatgpt.com/docs/agent-configuration/speed");
+  assert.equal(policy.source.url, "https://learn.chatgpt.com/docs/pricing#speed-multipliers");
+  assert.equal(policy.source.launchDatesUrl, "https://learn.chatgpt.com/docs/changelog");
   assert.equal(policy.historicalApplicability, "unavailable_before_reviewed_from");
   assert.equal(policy.unit, "dimensionless");
   assert.equal(policy.establishesModeAvailability, false);
   assert.equal(policy.infersConsumptionBasis, false);
   assert.equal(policy.changesCalibrationBasis, false);
-  assert.deepEqual(policy.weights, { standard: 1, fast: 2.5, ultrafast: 8 });
-  for (const value of [policy, policy.source, policy.weights, policy.supportedFastModels, policy.supportedUltrafastModels]) {
+  const ruleValues = policy.rules.flatMap((rule) => [rule, rule.models, rule.weights]);
+  for (const value of [policy, policy.source, policy.rules, ...ruleValues]) {
     assert.equal(Object.isFrozen(value), true);
   }
   for (const [mode, apiRatio, includedWeight] of [["standard", 1, 1], ["fast", 2, 2.5], ["ultrafast", 6, 8]]) {
@@ -36,23 +38,63 @@ test("documented included weights have a reviewed source and preserve distinct A
   }
 });
 
-test("current exact supported Fast models are closed and Sol 6.1 Ultrafast stays unavailable", () => {
-  assert.deepEqual(CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY.supportedFastModels, [
+test("legacy model weights survive the GPT-6.2 launch, with qualified Ultrafast dates", () => {
+  for (const modelId of [
     "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra",
     "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol",
-  ]);
-  for (const modelId of CODEX_INCLUDED_ALLOWANCE_SPEED_POLICY.supportedFastModels) {
+  ]) {
     for (const [mode, weight] of [["standard", 1], ["fast", 2.5]]) {
       assert.equal(includedAllowanceSpeedWeight({ ...BASE, modelId, mode }).weight, weight);
     }
     const ultrafast = includedAllowanceSpeedWeight({ ...BASE, modelId });
     assert.equal(ultrafast.weight, modelId === "gpt-6-astra" ? 8 : null);
-    if (modelId !== "gpt-6-astra") assert.equal(ultrafast.reasonCode, "model_speed_not_supported");
+    if (modelId === "gpt-6.1-sol") assert.equal(ultrafast.reasonCode, "before_reviewed_policy");
+    else if (modelId !== "gpt-6-astra") assert.equal(ultrafast.reasonCode, "model_speed_not_supported");
   }
+  const sol = { ...BASE, modelId: "gpt-6.1-sol" };
+  const beforeSolLaunch = includedAllowanceSpeedWeight({ ...sol, eventTime: "2026-10-07T23:59:59.999Z" });
+  assert.equal(beforeSolLaunch.weight, null);
+  assert.equal(beforeSolLaunch.reviewedFrom, "2026-10-08");
+  for (const eventTime of ["2026-10-08T00:00:00.000Z", "2027-03-01T08:00:00.000Z"]) {
+    assert.equal(includedAllowanceSpeedWeight({ ...sol, eventTime }).weight, 8);
+  }
+  for (const modelId of ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna"]) {
+    assert.equal(includedAllowanceSpeedWeight({ ...BASE, modelId, mode: "fast", eventTime: "2026-11-17T00:00:00.000Z" }).weight, 2.5);
+  }
+  assert.equal(includedAllowanceSpeedWeight({
+    ...BASE, modelId: "gpt-6.1-terra", mode: "fast", eventTime: "2026-10-25T23:59:59.999Z",
+  }).weight, null);
+});
+
+test("GPT-6.2 included weights are model-specific and independent of the paid Ultrafast cutoff", () => {
+  for (const modelId of ["gpt-6.2-astra", "gpt-6.2-sol"]) {
+    for (const [mode, weight] of [["standard", 1], ["fast", 2], ["ultrafast", 6]]) {
+      const comparison = { ...BASE, modelId, mode };
+      const beforeLaunch = includedAllowanceSpeedWeight({ ...comparison, eventTime: "2026-11-16T23:59:59.999Z" });
+      assert.equal(beforeLaunch.weight, null);
+      assert.equal(beforeLaunch.reasonCode, "before_reviewed_policy");
+      assert.equal(beforeLaunch.reviewedFrom, "2026-11-17");
+      for (const eventTime of [
+        "2026-11-17T00:00:00.000Z", "2027-03-01T07:59:59.999Z", "2027-03-01T08:00:00.000Z",
+      ]) {
+        assert.equal(includedAllowanceSpeedWeight({ ...comparison, eventTime }).weight, weight);
+      }
+    }
+  }
+});
+
+test("included speed rules use a closed exact model list", () => {
   // API Priority capability is not evidence of current Codex mode availability.
   assert.equal(speedModeApiMultiplier("gpt-4.1", "fast"), 1.75);
-  for (const modelId of ["gpt-4.1", "gpt-5", "gpt-5-mini", "gpt-5.5-codex", "gpt-6.1-sol-preview", "GPT-6-ASTRA", "unknown", null]) {
+  for (const modelId of ["gpt-4.1", "gpt-5", "gpt-5-mini", "gpt-5.5-codex", "gpt-6.1-sol-preview", "gpt-6.2-sol-preview", "GPT-6-ASTRA", "unknown", null]) {
     assert.equal(includedAllowanceSpeedWeight({ ...BASE, modelId, mode: "fast" }).reasonCode, "model_not_reviewed");
+  }
+  for (const mode of ["standard", "fast", "ultrafast"]) {
+    const law = includedAllowanceSpeedWeight({
+      ...BASE, modelId: "gpt-6.2-astra-law", eventTime: "2026-11-17T12:00:00.000Z", mode,
+    });
+    assert.equal(law.reasonCode, "model_not_reviewed");
+    assert.equal(law.weight, null);
   }
 });
 

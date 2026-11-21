@@ -97,7 +97,7 @@ test("local evidence accepts retained variants but withholds unknown provenance"
     row("unknown", {
       eventTime: `${DAY}T12:01:00.000Z`,
       sourceOffset: 200,
-      parserVersion: "unified-rollout-typed-v22",
+      parserVersion: "unified-rollout-typed-v23",
       boundary: boundary(1),
     }),
     row("bad-boundary", {
@@ -208,8 +208,8 @@ test("an incomplete boundary join keeps missing relations unknown", () => {
 });
 
 
-test("boundary evidence keeps reviewed v17 through v21 provenance coherent without relabeling rows", () => {
-  for (const version of [17, 18, 19, 20, 21]) {
+test("boundary evidence keeps reviewed v17 through v22 provenance coherent without relabeling rows", () => {
+  for (const version of [17, 18, 19, 20, 21, 22]) {
     for (const suffix of ["", "-partial", "-parent-model", "-parent-model-partial"]) {
       for (const assumption of ["", "-cache-write-zero"]) {
         const parserVersion = `unified-rollout-typed-v${version}${suffix}${assumption}`;
@@ -221,7 +221,7 @@ test("boundary evidence keeps reviewed v17 through v21 provenance coherent witho
       }
     }
   }
-  for (const [previousVersion, currentVersion] of [[17, 18], [19, 20], [20, 21]]) {
+  for (const [previousVersion, currentVersion] of [[17, 18], [19, 20], [20, 21], [21, 22]]) {
     const previousParser = `unified-rollout-typed-v${previousVersion}`;
     const currentParser = `unified-rollout-typed-v${currentVersion}`;
     const previous = row("previous", { sourceOffset: 100,
@@ -241,8 +241,8 @@ test("boundary evidence withholds unsupported old, future, and unknown parser va
     "unified-rollout-typed-v14",
     "unified-rollout-typed-v15-cache-write-zero",
     "unified-rollout-typed-v20-cache-write-zero-unknown",
-    "unified-rollout-typed-v22",
-    "unified-rollout-typed-v22-cache-write-zero",
+    "unified-rollout-typed-v23",
+    "unified-rollout-typed-v23-cache-write-zero",
     "unknown-parser-cache-write-zero",
   ]) {
     const value = row("unsupported", { parserVersion,

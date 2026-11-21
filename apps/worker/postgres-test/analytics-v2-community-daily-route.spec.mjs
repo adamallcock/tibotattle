@@ -87,7 +87,7 @@ async function loadModules() {
     }],
     // jsonc-parser publishes UMD as `main`; take its ESM build as esbuild does.
     resolve: { mainFields: ["module", "main"] },
-    ssr: { noExternal: ["jsonc-parser"] },
+    ssr: { noExternal: ["jsonc-parser", ...Object.keys(VENDORED_PACKAGE_ENTRIES)] },
   });
   return {
     route: await vite.ssrLoadModule("/src/analytics-v2/community-daily-route.ts"),
@@ -570,8 +570,8 @@ const SEPTEMBER29_MODEL_CONFIG = Object.freeze([
   { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", family: "luna", order: 6 },
 ]);
 
-// Current presentation is literal, never derived from the route's builder.
-const CURRENT_MODEL_CONFIG = Object.freeze([
+// October presentation is retained independently of current metadata.
+const OCTOBER26_MODEL_CONFIG = Object.freeze([
   { id: "gpt-6-astra", label: "GPT-6 Astra", family: "astra", order: 0 },
   { id: "gpt-6.1-sol", label: "GPT-6.1 Sol", family: "sol", order: 1 },
   { id: "gpt-6-sol", label: "GPT-6 Sol", family: "sol", order: 2 },
@@ -580,6 +580,12 @@ const CURRENT_MODEL_CONFIG = Object.freeze([
   { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", family: "terra", order: 5 },
   { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", family: "sol", order: 6 },
   { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", family: "luna", order: 7 },
+]);
+
+const CURRENT_MODEL_CONFIG = Object.freeze([
+  { id: "gpt-6.2-astra", label: "GPT-6.2 Astra", family: "astra", order: 0 },
+  { id: "gpt-6.2-sol", label: "GPT-6.2 Sol", family: "sol", order: 1 },
+  ...OCTOBER26_MODEL_CONFIG.map((model) => ({ ...model, order: model.order + 2 })),
 ]);
 
 /** Hand-derived retained Pro 10x contract; the legacy expected HTTP bytes stay frozen. */
@@ -782,6 +788,9 @@ test("breakdowns v1.4: a retained Pro 10x preview keeps its plan amounts and eve
     allowanceBreakdowns: { ...predecessorExpected.allowanceBreakdowns, modelConfig: CURRENT_MODEL_CONFIG } };
   assert.equal(text, JSON.stringify(expected));
   const predecessor = JSON.parse(text);
+  predecessor.allowanceBreakdowns.modelConfig = OCTOBER26_MODEL_CONFIG;
+  assert.equal(JSON.stringify(predecessor), JSON.stringify({ ...predecessorExpected,
+    allowanceBreakdowns: { ...predecessorExpected.allowanceBreakdowns, modelConfig: OCTOBER26_MODEL_CONFIG } }));
   predecessor.allowanceBreakdowns.modelConfig = SEPTEMBER29_MODEL_CONFIG;
   assert.equal(JSON.stringify(predecessor), JSON.stringify(predecessorExpected),
     "restoring only model metadata preserves every retained Pro 10x HTTP value and byte order");
@@ -806,6 +815,9 @@ test("breakdowns v1.5: the current B' preview serves the Pro 20x amounts with Pr
     allowanceBreakdowns: { ...predecessorExpected.allowanceBreakdowns, modelConfig: CURRENT_MODEL_CONFIG } };
   assert.equal(text, JSON.stringify(expected));
   const predecessor = JSON.parse(text);
+  predecessor.allowanceBreakdowns.modelConfig = OCTOBER26_MODEL_CONFIG;
+  assert.equal(JSON.stringify(predecessor), JSON.stringify({ ...predecessorExpected,
+    allowanceBreakdowns: { ...predecessorExpected.allowanceBreakdowns, modelConfig: OCTOBER26_MODEL_CONFIG } }));
   predecessor.allowanceBreakdowns.modelConfig = SEPTEMBER29_MODEL_CONFIG;
   assert.equal(JSON.stringify(predecessor), JSON.stringify(predecessorExpected),
     "restoring only model metadata preserves every Pro 20x HTTP value and byte order");

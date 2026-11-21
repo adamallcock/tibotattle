@@ -87,6 +87,7 @@ import {
 
 /** The default and original vendored revision (what runs without `--commit`). */
 export const SOURCE_COMMIT = "d43c8f92a059d9c577776f7eca8a331eb305b8a6";
+export const GPT62_SOURCE_COMMIT = "2175b2c6960a8ef71c74161c25a71de80460e612";
 export const MANIFEST_SCHEMA = "analytics-kernel-vendor-manifest-v1";
 export const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const MANIFEST_FILE = "MANIFEST.json";
@@ -812,6 +813,57 @@ export function foldV11DailyProjectionValuesTrusted(state:V11DailyProjectionValu
   },
 ].map((patch) => Object.freeze({ ...patch, hunks: Object.freeze(patch.hunks.map((hunk) => Object.freeze({ ...hunk }))) })));
 
+// This build recognizes one more retained v0.3 roster. Keep the old patch
+// intact so historical vendor trees still regenerate byte for byte.
+const LEGACY_PREVIEW_PATCH = SOURCE_PATCHES.find((patch) => patch.id === "historical-preview-catalog-compatibility");
+const GPT62_PREVIEW_PATCH = Object.freeze({
+  id: "gpt62-historical-preview-catalog-compatibility",
+  path: "apps/worker/src/admin-community-allowance.ts",
+  hunks: Object.freeze([
+    { find: `  ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+  projectAdminModelHistoryDay,`, replace: `  ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+  OCTOBER26_ADMIN_MODEL_CONFIG,
+  OCTOBER26_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+  SEPTEMBER29_ADMIN_MODEL_CONFIG,
+  SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+  projectAdminModelHistoryDay,` },
+    { find: `export const ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG = ADMIN_MODEL_CONFIG;`,
+      replace: `export const ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG = ADMIN_MODEL_CONFIG;
+const SEPTEMBER23_ADMIN_MODEL_CONFIG = Object.freeze(SEPTEMBER29_ADMIN_MODEL_CONFIG.slice(0, 42));
+const REVIEWED_MODEL_CATALOGS = [
+  ["reviewed-model-catalog-2026-09-23.1", SEPTEMBER23_ADMIN_MODEL_CONFIG],
+  [SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION, SEPTEMBER29_ADMIN_MODEL_CONFIG],
+  [OCTOBER26_ADMIN_MODEL_HISTORY_CATALOG_VERSION, OCTOBER26_ADMIN_MODEL_CONFIG],
+  [ADMIN_MODEL_HISTORY_CATALOG_VERSION, ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG],
+] as const;` },
+    { find: LEGACY_PREVIEW_PATCH.hunks[0].find,
+      replace: `  if (!Array.isArray(models.modelConfig)) return false;
+  const headerLength = models.modelConfig.length;
+  const header = REVIEWED_MODEL_CATALOGS.findIndex(([, config]) => config.length === headerLength);
+  if (header === -1) return false;
+  const september23Catalog = header === 0;
+  for (const [index, expected] of REVIEWED_MODEL_CATALOGS[header]![1].entries()) {` },
+    LEGACY_PREVIEW_PATCH.hunks[1],
+    { find: LEGACY_PREVIEW_PATCH.hunks[2].find,
+      replace: `    if (!validModelCompositionDay(candidate)) return false;
+    // The shared reader also admits earlier compact history versions. Only
+    // the known roster transition could place newer evidence below this header.
+    const dayCatalog = REVIEWED_MODEL_CATALOGS.findIndex(([version]) => candidate.catalogVersion === version);
+    if (dayCatalog > header) return false;
+    if (candidate.day <= previousDay` },
+    { find: LEGACY_PREVIEW_PATCH.hunks[3].find,
+      replace: `  const header = REVIEWED_MODEL_CATALOGS.find(([, config]) => config.length === parsed.models.modelConfig.length)!;
+  return { ...parsed, models: { ...parsed.models, modelConfig: header[1] } };` },
+  ].map((hunk) => Object.freeze(hunk))),
+});
+
+const GPT62_SOURCE_PATCHES = Object.freeze(SOURCE_PATCHES.map((patch) =>
+  patch === LEGACY_PREVIEW_PATCH ? GPT62_PREVIEW_PATCH : patch));
+
+export function sourcePatchesAt(commit) {
+  return commit === GPT62_SOURCE_COMMIT ? GPT62_SOURCE_PATCHES : SOURCE_PATCHES;
+}
+
 const SOURCE_PATCH_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
 /** Throws unless every source patch names a Worker source file, an id and non-empty, distinct hunks, once per (id, path). */
@@ -834,6 +886,7 @@ export function assertSourcePatchSpecs(patches) {
   }
 }
 assertSourcePatchSpecs(SOURCE_PATCHES);
+assertSourcePatchSpecs(GPT62_SOURCE_PATCHES);
 
 const occurrences = (text, part) => text.split(part).length - 1;
 
@@ -1659,15 +1712,16 @@ export async function withSourceExtraction({ layout = DEFAULT_LAYOUT, authoredFr
   const blobs = readBlobs(root, extractable.map((path) => tree.get(path).blob));
   const textAt = (path) => (tree.has(path) && blobs.has(tree.get(path).blob) ? blobs.get(tree.get(path).blob).toString("utf8") : undefined);
   const exportPlan = await planExportPatches({ readText: textAt });
-  for (const patch of SOURCE_PATCHES) {
+  const sourcePatches = sourcePatchesAt(layout.commit);
+  for (const patch of sourcePatches) {
     if (!extractable.includes(patch.path)) throw new VendorError("SOURCE_PATCH_UNRESOLVED", `${patch.path} is not in ${layout.commit}`);
   }
-  const vendoredBytes = (path) => applySourcePatches(path, applyExportPatches(path, blobs.get(tree.get(path).blob), exportPlan));
+  const vendoredBytes = (path) => applySourcePatches(path, applyExportPatches(path, blobs.get(tree.get(path).blob), exportPlan), sourcePatches);
   const scratch = mkdtempSync(join(tmpdir(), "vendor-analytics-kernels-"));
   try {
     for (const path of extractable) writeFile(join(scratch, path), vendoredBytes(path));
     for (const file of AUTHORED_FILES) writeFile(join(scratch, file), readFileSync(join(authored.dir, file)));
-    return await fn({ scratch, tree, exportPlan, authored, replacing, blobs: (path) => blobs.get(tree.get(path).blob),
+    return await fn({ scratch, tree, exportPlan, sourcePatches, authored, replacing, blobs: (path) => blobs.get(tree.get(path).blob),
       vendoredBytes });
   } finally {
     rmSync(scratch, { recursive: true, force: true });
@@ -1936,7 +1990,7 @@ export function workerIndexAt(root, commit) {
 export async function vendorAnalyticsKernels({ log = console.log, commit = SOURCE_COMMIT, outRoot = WORKER_ROOT, authoredFrom, provenance = true,
   onVocabularies } = {}) {
   const layout = vendorLayout({ commit, outRoot });
-  return withSourceExtraction({ layout, authoredFrom, provenance }, async ({ scratch, tree, blobs, exportPlan, authored, replacing,
+  return withSourceExtraction({ layout, authoredFrom, provenance }, async ({ scratch, tree, blobs, exportPlan, sourcePatches, authored, replacing,
     vendoredBytes }) => {
     // 1. Runtime closure from the facade, the website normalizer and the parity specs.
     const esbuild = loadEsbuild();
@@ -1952,7 +2006,7 @@ export async function vendorAnalyticsKernels({ log = console.log, commit = SOURC
 
     // 2. Files: the closure plus the whole of each vendored package.
     const patchedPaths = new Set(exportPlan.filter((resolution) => resolution.status === "apply").map((resolution) => resolution.path));
-    const sourcePatchedPaths = new Set(SOURCE_PATCHES.map((patch) => patch.path));
+    const sourcePatchedPaths = new Set(sourcePatches.map((patch) => patch.path));
     const files = [];
     for (const path of [...tree.keys()].sort()) {
       const pkg = PACKAGE_RULE.exec(path);
@@ -1984,7 +2038,7 @@ export async function vendorAnalyticsKernels({ log = console.log, commit = SOURC
     // 4. Prove the tree on its own before anything real is touched: stage exactly
     //    the files that would be written, then bundle, load and typecheck the
     //    stage, and derive the GCP-only vocabularies from it.
-    const manifest = buildManifest({ layout, closure, files, typeStubs, parityTests, exportPlan, sourcePatches: SOURCE_PATCHES });
+    const manifest = buildManifest({ layout, closure, files, typeStubs, parityTests, exportPlan, sourcePatches });
     const stage = mkdtempSync(join(tmpdir(), "vendor-analytics-kernels-stage-"));
     let verified;
     let vocabularies;
@@ -2117,7 +2171,7 @@ export async function reportAtCommit({ commit, reference, referenceDirectory } =
       verification = { status: "failed", detail: error.message };
     }
   }
-  const sourcePatches = SOURCE_PATCHES.map((patch) => {
+  const sourcePatches = sourcePatchesAt(layout.commit).map((patch) => {
     const text = readTextAt(root, layout.commit, patch.path);
     if (text === undefined) return { path: patch.path, id: patch.id, status: "file-missing" };
     try {

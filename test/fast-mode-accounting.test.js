@@ -68,6 +68,8 @@ test("published Priority (Fast) API price ratios are derived, sourced, and dated
     "gpt-6-luna": 2,
     "gpt-6.1-sol": 2,
     "gpt-6.1-terra": 2,
+    "gpt-6.2-astra": 2,
+    "gpt-6.2-sol": 2,
   });
   assert.equal(Object.isFrozen(FAST_MODE_QUOTA_MULTIPLIERS), true);
   // The map is derived from the price registry and re-deriving it is exact.
@@ -91,7 +93,7 @@ test("published Priority (Fast) API price ratios are derived, sourced, and dated
     /not uniform/,
   );
   assert.equal(FAST_MODE_MULTIPLIER_SOURCE.publisher, "openai");
-  assert.equal(FAST_MODE_MULTIPLIER_SOURCE.recordedAt, "2026-10-26");
+  assert.equal(FAST_MODE_MULTIPLIER_SOURCE.recordedAt, "2026-11-21");
   assert.equal(
     FAST_MODE_MULTIPLIER_SOURCE.basis,
     "published_api_speed_price_ratio_relative_to_standard",
@@ -119,7 +121,8 @@ test("published Priority (Fast) API price ratios are derived, sourced, and dated
     standard: "standard",
     ultrafast: "ultrafast",
   });
-  assert.match(FAST_MODE_MULTIPLIER_SOURCE.statement, /exact registered models/u);
+  assert.match(FAST_MODE_MULTIPLIER_SOURCE.statement, /exact registered model, context, and effective prices/u);
+  assert.match(FAST_MODE_MULTIPLIER_SOURCE.statement, /restricted to Standard has no premium estimate/u);
 });
 
 test("model families match exactly and unsupported models stay an explicit null", () => {

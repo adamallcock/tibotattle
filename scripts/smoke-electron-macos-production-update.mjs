@@ -25,10 +25,14 @@ export const ELECTRON_PRODUCTION_UPDATE_SCHEMA = 'tibotattle-signed-macos-produc
 export const ELECTRON_PRODUCTION_UPDATE_SCHEMA_V2 = 'tibotattle-signed-macos-production-update-v2';
 export const ELECTRON_PRODUCTION_UPDATE_SCHEMA_V3 = 'tibotattle-signed-macos-production-update-v3';
 export const ELECTRON_PRODUCTION_UPDATE_SCHEMA_V4 = 'tibotattle-signed-macos-production-update-v4';
-const currentProductionUpdateRoute = input => ['tibotattle-production-electron-update-intake-v2',
-  'tibotattle-production-electron-update-intake-v3', 'tibotattle-production-electron-update-intake-v4'].includes(input.schemaVersion);
-const retainedProductionUpdateRoute = input => ['tibotattle-production-electron-update-intake-v3',
-  'tibotattle-production-electron-update-intake-v4'].includes(input.schemaVersion);
+export const ELECTRON_PRODUCTION_UPDATE_SCHEMA_V5 = 'tibotattle-signed-macos-production-update-v5';
+const PRODUCTION_UPDATE_ROUTES = Object.freeze({
+  'tibotattle-production-electron-update-intake-v2': Object.freeze({ receiptSchema: ELECTRON_PRODUCTION_UPDATE_SCHEMA_V2 }),
+  'tibotattle-production-electron-update-intake-v3': Object.freeze({ receiptSchema: ELECTRON_PRODUCTION_UPDATE_SCHEMA_V3, predecessorUserVersion: 11 }),
+  'tibotattle-production-electron-update-intake-v4': Object.freeze({ receiptSchema: ELECTRON_PRODUCTION_UPDATE_SCHEMA_V4, predecessorUserVersion: 12 }),
+  'tibotattle-production-electron-update-intake-v5': Object.freeze({ receiptSchema: ELECTRON_PRODUCTION_UPDATE_SCHEMA_V5, predecessorUserVersion: 12 }),
+});
+const retainedProductionUpdateRoute = input => PRODUCTION_UPDATE_ROUTES[input.schemaVersion]?.predecessorUserVersion !== undefined;
 const ELECTRON_020 = resolveMacOSProductionUpdatePredecessor({ schemaVersion: 'tibotattle-production-electron-update-intake-v1' });
 export const ELECTRON_020_SOURCE = ELECTRON_020.sourceRevision;
 export const ELECTRON_020_DMG = ELECTRON_020.dmgSha256;
@@ -114,7 +118,7 @@ async function bytes(path, limit = 1024 ** 3) {
   if (!s.isFile() || s.nlink !== 1 || s.uid !== process.getuid() || s.size < 1 || s.size > limit) fail('unsafe_file');
   return readFile(path);
 }
-// v3/v4 seed real predecessor ingestion provenance before any app launch. The
+// Routes with an explicit index format seed ingestion provenance before any app launch. The
 // retired usage source exercises retained history; the metadata-only source
 // keeps ordinary local analysis available without adding usage or quota facts.
 export async function seedProductionUpdateRetainedNativeState(nativeRoot, codexHome, index, ingest) {
@@ -246,8 +250,8 @@ export async function waitForProductionUpdateSuccessor({ appPath, predecessorPid
   }, 180000, 'updater_relaunch', { now, sleep });
 }
 // v3's verified 026 reader admits live v11 while the successor migrates a
-// staging clone. v4's verified 028 reader already uses format 12. Both routes
-// require their exact format and intact metadata, through read-only handles.
+// staging clone. The v4 and v5 readers already use format 12. Each route
+// requires its exact format and intact metadata, through read-only handles.
 export async function readProductionUpdateSuccessorState(stateRoot, predecessorIndex, predecessorUserVersion = 11) {
   if (![11, 12].includes(predecessorUserVersion)) fail('successor_state_schema');
   let database;
@@ -416,13 +420,14 @@ export async function runProductionUpdate(options) {
   let input, app, active, stage = 'intake'; const knownProcesses = new Map();
   try {
     input = validateProductionUpdateIntake(JSON.parse(await bytes(options.intakePath, 16384)));
-    if (currentProductionUpdateRoute(input)) {
-      const predecessor = resolveMacOSProductionUpdatePredecessor(input);
-      Object.assign(proof, { schemaVersion: input.schemaVersion === 'tibotattle-production-electron-update-intake-v4'
-        ? ELECTRON_PRODUCTION_UPDATE_SCHEMA_V4 : input.schemaVersion === 'tibotattle-production-electron-update-intake-v3'
-        ? ELECTRON_PRODUCTION_UPDATE_SCHEMA_V3 : ELECTRON_PRODUCTION_UPDATE_SCHEMA_V2, predecessorVersion: predecessor.version,
-        predecessorBundleVersion: predecessor.bundleVersion, predecessorBuildNumber: predecessor.buildNumber,
-        predecessorSourceRevision: predecessor.sourceRevision, predecessorProcessesExitedNaturally: false });
+    const predecessorIdentity = resolveMacOSProductionUpdatePredecessor(input);
+    const route = PRODUCTION_UPDATE_ROUTES[input.schemaVersion];
+    const currentRoute = route !== undefined;
+    if (currentRoute) {
+      Object.assign(proof, { schemaVersion: route.receiptSchema,
+        predecessorVersion: predecessorIdentity.version,
+        predecessorBundleVersion: predecessorIdentity.bundleVersion, predecessorBuildNumber: predecessorIdentity.buildNumber,
+        predecessorSourceRevision: predecessorIdentity.sourceRevision, predecessorProcessesExitedNaturally: false });
     }
     for (const key of ['target', 'sourceRevision', 'version', 'buildNumber', 'bundleVersion', 'dmgSha256', 'asarSha256',
       'zipSha256', 'feedSha256', 'predecessorAsarSha256', 'predecessorDmgSha256']) proof[key] = input[key];
@@ -480,7 +485,7 @@ export async function runProductionUpdate(options) {
       assertSignedReplacementContinuity(seeded, before, JSON.parse(await readFile(settingsFile)), sharing);
       await absent(join(stateRoot, 'accountless-device-binding-v1.json'));
       // The namespace's static dependencies remain loaded after owned scratch
-      // removal; the v3/v4 readiness probe uses only its read-only public API.
+      // removal; the readiness probe uses only its read-only public API.
       return { before, environment, stateRoot, settingsFile, sharing, predecessorIndex: index };
     });
     // Invoke the ordinary Settings APIs; only the signed main process owns the updater/feed.
@@ -508,7 +513,6 @@ export async function runProductionUpdate(options) {
     // A changed production feed invalidates this exact-candidate acceptance before installation.
     if (hash(await fetchBytes(input.feedUrl, 65536)) !== input.feedSha256) fail('production_feed_changed');
     stage = 'install_update'; const oldPid = active.pid;
-    const currentRoute = currentProductionUpdateRoute(input);
     const predecessorProcesses = requestProductionUpdateInstall({ appPath: app, predecessorPid: oldPid, knownProcesses, currentRoute,
       install: () => active.settings.evaluate('globalThis.tibotattleDesktop.installUpdateAndRestart()') });
     proof.installUpdateInvoked = true;
@@ -532,8 +536,7 @@ export async function runProductionUpdate(options) {
     if (retainedProductionUpdateRoute(input)) {
       stage = 'successor_state_readiness';
       successorState = await waitForProductionUpdateSuccessorState({ stateRoot, predecessorIndex,
-        predecessorUserVersion: input.schemaVersion === 'tibotattle-production-electron-update-intake-v4' ? 12 : 11,
-        successorPid: successor, successorFingerprint },
+        predecessorUserVersion: route.predecessorUserVersion, successorPid: successor, successorFingerprint },
         { onStage: value => { stage = value; } });
     } else {
       stage = 'successor_state_read';

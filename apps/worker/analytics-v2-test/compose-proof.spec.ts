@@ -270,14 +270,19 @@ describe("one-process composition over the reviewed vendored kernels", () => {
     const second = await compose();
     expect(digest(second.response)).toBe(digest(response));
     expect(digest(second.preview)).toBe(digest(preview));
-    // Terra changes the registry identity, while this pre-launch corpus keeps
-    // every priced value and coverage byte. Restoring only the v0.9 registry
-    // stamp must first reproduce the immediately preceding composed envelope.
-    const predecessorResponse = structuredClone(response);
-    for (const day of predecessorResponse.days) {
+    // The pre-launch corpus keeps every priced value and coverage byte.
+    // Verify each retained registry stamp against its original envelope.
+    const octoberResponse = structuredClone(response);
+    for (const day of octoberResponse.days) {
       const spend = day.payload.apiEquivalentSpend as Record<string, unknown>;
       expect(spend.pricingMethodVersion).toBe("server-api-price-equivalent-v0.6");
-      expect(spend.registrySha256).toBe("206544769b43e4b9645284258edd38f7c07a226022db10f5ec0181335df236ab");
+      expect(spend.registrySha256).toBe("eca860219a79a24a2cc1ba07471e2ecc321281508dc7e8d48412deef77609c77");
+      spend.registrySha256 = "206544769b43e4b9645284258edd38f7c07a226022db10f5ec0181335df236ab";
+    }
+    expect(digest(octoberResponse)).toBe("16ae12463cca066348fddeb897fb3526f5f98e6ed88cdffeeaec29edfe93928e");
+    const predecessorResponse = structuredClone(octoberResponse);
+    for (const day of predecessorResponse.days) {
+      const spend = day.payload.apiEquivalentSpend as Record<string, unknown>;
       spend.registrySha256 = "d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d";
     }
     expect(digest(predecessorResponse)).toBe(COMPOSED_RESPONSE_SHA256);
@@ -293,11 +298,20 @@ describe("one-process composition over the reviewed vendored kernels", () => {
     expect(digest(historicalIdentity)).toBe(HISTORICAL_RESPONSE_SHA256);
     // Restore each exact predecessor header/catalog stamp separately. The
     // complete old pins retain every estimate, count, date and plan unit.
-    expect(preview.models.modelConfig).toHaveLength(44);
+    expect(preview.models.modelConfig).toHaveLength(47);
     expect(preview.models.modelConfig[42]!.modelId).toBe("gpt-6.1-sol");
     expect(preview.models.modelConfig[43]!.modelId).toBe("gpt-6.1-terra");
-    expect(preview.models.days.every((day) => day.catalogVersion === "reviewed-model-catalog-2026-10-26.1"
-      && day.values.every(([modelId]) => modelId !== "gpt-6.1-sol" && modelId !== "gpt-6.1-terra"))).toBe(true);
+    expect(preview.models.modelConfig.slice(44).map(({ modelId }) => modelId))
+      .toEqual(["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.2-astra-law"]);
+    const addedModels = ["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.2-astra-law"];
+    expect(preview.models.days.every((day) => day.catalogVersion === "reviewed-model-catalog-2026-11-17.1"
+      && day.values.every(([modelId]) => !addedModels.includes(modelId)))).toBe(true);
+    const octoberCatalog = { ...preview, models: { ...preview.models,
+      modelConfig: preview.models.modelConfig.slice(0, 44),
+      days: preview.models.days.map((day) => ({ ...day, catalogVersion: "reviewed-model-catalog-2026-10-26.1" })),
+    } };
+    expect(validCachedAdminCommunityAllowancePreview(octoberCatalog, preview.generatedAt, NOW_MS)).toBe(true);
+    expect(digest(octoberCatalog)).toBe("74757d4f173c3585f1818165e426a2f596d9d09d148fd8faac80e2f85aafc454");
     const predecessorCatalog = { ...preview, models: { ...preview.models,
       modelConfig: preview.models.modelConfig.slice(0, 43),
       days: preview.models.days.map((day) => ({ ...day, catalogVersion: "reviewed-model-catalog-2026-09-29.1" })),
@@ -310,10 +324,6 @@ describe("one-process composition over the reviewed vendored kernels", () => {
     } };
     expect(validCachedAdminCommunityAllowancePreview(historicalCatalog, preview.generatedAt, NOW_MS)).toBe(true);
     expect(digest(historicalCatalog)).toBe(HISTORICAL_PREVIEW_SHA256);
-    expect({ responseSha256: digest(response), previewSha256: digest(preview) }).toEqual({
-      responseSha256: "16ae12463cca066348fddeb897fb3526f5f98e6ed88cdffeeaec29edfe93928e",
-      previewSha256: "74757d4f173c3585f1818165e426a2f596d9d09d148fd8faac80e2f85aafc454",
-    });
     console.log(JSON.stringify({ composeProof: { responseSha256: digest(response), previewSha256: digest(preview),
       responseBytes: JSON.stringify(response).length } }));
   }, 240_000);

@@ -73,6 +73,15 @@ const adminHistorySeptember29Ids = Object.freeze(SEPTEMBER29_ADMIN_MODEL_CONFIG
   .filter((model) => model.allowanceTrack === "primary")
   .map((model) => model.modelId));
 
+export const OCTOBER26_ADMIN_MODEL_HISTORY_CATALOG_VERSION = "reviewed-model-catalog-2026-10-26.1";
+export const OCTOBER26_ADMIN_MODEL_CONFIG = Object.freeze([
+  ...SEPTEMBER29_ADMIN_MODEL_CONFIG,
+  Object.freeze({
+    modelId: "gpt-6.1-terra", label: "GPT-6.1 Terra", allowanceTrack: "primary", pricingStatus: "published",
+  }),
+]);
+const adminHistoryOctober26Ids = Object.freeze([...adminHistorySeptember29Ids, "gpt-6.1-terra"]);
+
 const adminHistoryLegacyIds = Object.freeze([
   "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
 ]);
@@ -106,6 +115,15 @@ const adminHistoryOlderIds = Object.freeze([
   "gpt-5.4-pro", "gpt-5.5", "gpt-5.5-codex", "gpt-5.5-pro", "gpt-5.6-luna",
   "gpt-5.6-sol", "gpt-5.6-sol-wm", "gpt-5.6-terra", "gpt-6-astra", "o1",
   "o1-pro", "o3", "o3-mini", "o3-pro", "o4-mini",
+]);
+const adminHistoryModelIds = new Map([
+  [ADMIN_MODEL_HISTORY_CATALOG_VERSION, adminHistoryCurrentIds],
+  [OCTOBER26_ADMIN_MODEL_HISTORY_CATALOG_VERSION, adminHistoryOctober26Ids],
+  [SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION, adminHistorySeptember29Ids],
+  [adminHistorySeptember23Version, adminHistorySeptember23Ids],
+  [PREVIOUS_ADMIN_MODEL_HISTORY_CATALOG_VERSION, adminHistoryPreviousIds],
+  [OLDER_ADMIN_MODEL_HISTORY_CATALOG_VERSION, adminHistoryOlderIds],
+  [LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION, adminHistoryLegacyIds],
 ]);
 const adminHistoryCountKeys = Object.freeze([
   "fittedParticipantCount", "unstableParticipantCount", "staleParticipantCount",
@@ -172,18 +190,7 @@ export function projectAdminModelHistoryDay(value) {
   } else if (!adminHistoryExactKeys(input, ["day", "catalogVersion", "values", ...adminHistoryCountKeys])) {
     return null;
   }
-  const ids = catalogVersion === ADMIN_MODEL_HISTORY_CATALOG_VERSION
-    ? adminHistoryCurrentIds
-    : catalogVersion === adminHistorySeptember23Version
-      ? adminHistorySeptember23Ids
-    : catalogVersion === SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION
-      ? adminHistorySeptember29Ids
-      : catalogVersion === PREVIOUS_ADMIN_MODEL_HISTORY_CATALOG_VERSION
-        ? adminHistoryPreviousIds
-        : catalogVersion === OLDER_ADMIN_MODEL_HISTORY_CATALOG_VERSION
-          ? adminHistoryOlderIds
-          : catalogVersion === LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION
-            ? adminHistoryLegacyIds : null;
+  const ids = adminHistoryModelIds.get(catalogVersion);
   if (!ids || !Array.isArray(values) || values.length > ids.length) return null;
   const allowed = new Set(ids);
   const seen = new Set();
@@ -208,21 +215,14 @@ export function projectAdminModelHistoryDay(value) {
 export function expandAdminModelHistoryDay(value) {
   const day = projectAdminModelHistoryDay(value);
   if (day === null) return null;
-  const covered = new Set(day.catalogVersion === ADMIN_MODEL_HISTORY_CATALOG_VERSION
-    ? adminHistoryCurrentIds
-    : day.catalogVersion === adminHistorySeptember23Version
-      ? adminHistorySeptember23Ids
-    : day.catalogVersion === SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION
-      ? adminHistorySeptember29Ids
-      : day.catalogVersion === PREVIOUS_ADMIN_MODEL_HISTORY_CATALOG_VERSION
-        ? adminHistoryPreviousIds
-        : day.catalogVersion === OLDER_ADMIN_MODEL_HISTORY_CATALOG_VERSION
-          ? adminHistoryOlderIds : adminHistoryLegacyIds);
+  const covered = new Set(adminHistoryModelIds.get(day.catalogVersion));
   const identified = new Map(day.values.map(([id, capacityUsd, participantCount]) => [
     id, Object.freeze({ capacityUsd, participantCount }),
   ]));
   const modelConfig = day.catalogVersion === SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION
-    ? SEPTEMBER29_ADMIN_MODEL_CONFIG : ADMIN_MODEL_CONFIG;
+    ? SEPTEMBER29_ADMIN_MODEL_CONFIG
+    : day.catalogVersion === OCTOBER26_ADMIN_MODEL_HISTORY_CATALOG_VERSION
+      ? OCTOBER26_ADMIN_MODEL_CONFIG : ADMIN_MODEL_CONFIG;
   const byModel = Object.freeze(Object.fromEntries(modelConfig.map(({ modelId }) => [
     modelId,
     identified.get(modelId) ?? Object.freeze({

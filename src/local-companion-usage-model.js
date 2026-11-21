@@ -2,7 +2,6 @@ import { projectRecordedTokenComponents } from "./reporting/index.js";
 import {
   addUsdStrings,
   emptySpeedWeightingCrossing,
-  FAST_MODE_MODEL_FAMILY_KEYS,
   speedModeModelFamilyKey,
   OBSERVED_SPEED_MODE_KEYS,
   priceCodexUsageEvent,
@@ -387,7 +386,7 @@ export function newUsagePeriod(id, label, { includeSpark = true } = {}) {
     byReasoningEffort: {
       unknown: { events: 0, totalTokens: 0, apiPriceEquivalentUsd: 0 },
     },
-    // Observed speed mode crossed with the model's Priority (Fast) price-
+    // Observed speed mode crossed with the model's event-qualified price
     // ratio family, so the published ratio can be applied at read time.
     speedWeighting: emptySpeedWeightingCrossing(),
     // The same crossing, holding only the events the log left UNOBSERVED that
@@ -445,7 +444,7 @@ function finalizeSpeedWeighting(crossing) {
 export function safeSpeedWeighting(value) {
   const crossing = emptySpeedWeightingCrossing();
   for (const speed of OBSERVED_SPEED_MODE_KEYS) {
-    for (const family of FAST_MODE_MODEL_FAMILY_KEYS) {
+    for (const family of Object.keys(crossing[speed])) {
       const cell = value?.[speed]?.[family];
       crossing[speed][family] = {
         events: Number.isSafeInteger(cell?.events) && cell.events >= 0

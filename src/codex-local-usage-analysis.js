@@ -1,5 +1,6 @@
 import {
   addUsdStrings,
+  APP_OFFICIAL_PRICE_CARDS,
   apiPriceResolutionSummary,
   aggregateLocalApiPriceResults,
   costWarningCodes,
@@ -32,6 +33,9 @@ export async function scanAndPriceCodexLogs({
   excludeSessionIds = [],
 }) {
   const priceResolution = apiPriceResolutionSummary({ priceCards });
+  const longContextPriceCardIds = new Set((priceCards ?? APP_OFFICIAL_PRICE_CARDS)
+    .filter((card) => card?.provider === "openai" && card.metadata?.total_input_context_band === "long")
+    .map((card) => card.id));
   const totals = {};
   const byModel = {};
   const speedWeightingByModel = {};
@@ -75,13 +79,15 @@ export async function scanAndPriceCodexLogs({
   function onUsage(event) {
     eventCount += 1;
     usageBearingRollouts.add(event.sourceRolloutOrdinal);
-    if (event.raw.input_tokens >= 272_000) pricingDiagnostics.longContextEvents += 1;
     addComponents(totals, event.components);
     const modelSummary = byModel[event.model] ??= { components: {}, costUsd: 0, costUsdExact: "0", events: 0, warningCounts: {} };
     addComponents(modelSummary.components, event.components);
     modelSummary.events += 1;
 
     const priced = priceCodexUsageEvent(event, { priceCards });
+    if (priced.selectedPriceCardIds.some((id) => longContextPriceCardIds.has(id))) {
+      pricingDiagnostics.longContextEvents += 1;
+    }
     const cost = Number(priced.totalUsd);
     const family = fastModeModelFamilyKey(event.model, {
       eventTime: event.timestamp, standardPriceCardIds: priced.selectedPriceCardIds,
@@ -112,9 +118,11 @@ export async function scanAndPriceCodexLogs({
         ultrafast.modelMultipliers[event.model] = null;
       } else {
         ultrafast.weightedUsd += weighted.usd;
-        if (ultrafast.modelMultipliers[event.model] !== null) {
-          ultrafast.modelMultipliers[event.model] = weighted.multiplier;
-        }
+        const priorMultiplier = ultrafast.modelMultipliers[event.model];
+        // The total can be complete across price epochs without a single
+        // multiplier applying to every event for this model.
+        ultrafast.modelMultipliers[event.model] = priorMultiplier === undefined
+          || priorMultiplier === weighted.multiplier ? weighted.multiplier : null;
       }
     }
     if (priced.coverageStatus === "fully_priced") pricingDiagnostics.pricedEvents += 1;

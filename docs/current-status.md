@@ -1,17 +1,25 @@
 ---
 title: Current product and release status
-date: 2026-10-09
+date: 2026-11-21
 type: status
 status: current
-source_commit: bf84bc6c04372bb2cee64ef4a4f29981432fc3eb
-observation_date: 2026-10-09
+source_commit: 905d9f9682ef472671eb87281fb35ead38711561
+observation_date: 2026-11-21
 ---
 
 # Current product and release status
 
+The public release page lists the current installers for macOS Apple silicon,
+macOS Intel, Windows x64 and Linux x64. Version 0.1.29 was published on
+October 30, 2026. The 0.1.30 release notes describe the November GPT-6.2
+models and their speed-dependent prices. [Latest public release](https://github.com/adamallcock/tibotattle/releases/latest) ·
+[0.1.30 release notes](../release-notes/0.1.30.md)
+
+## October 9 release record for 0.1.28
+
 [TiboTattle 0.1.28](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.28)
-is the published shared Electron release for macOS Apple silicon, macOS Intel,
-Windows x64 and Linux x64. The installers, all six stable updater feeds,
+was published for macOS Apple silicon, macOS Intel, Windows x64 and Linux x64.
+The installers, all six stable updater feeds,
 Homebrew cask and website downloads have been published and verified. Both native
 Sparkle production upgrades passed. Electron 0.1.26-to-0.1.28 production
 updates also passed on both Mac architectures with discoverable Codex logs.
@@ -26,7 +34,7 @@ The optional Codex dashboard reader is deferred. Version 0.1.27 was tagged and
 signed but never published; 0.1.28 carries its client changes forward from the
 last public 0.1.26 release. See the [release notes](../release-notes/0.1.28.md).
 
-## Signed release
+### Signed release
 
 The immutable GitHub release was published on **2026-10-09 at 12:19:26 UTC**.
 Its 20 assets and [canonical release manifest](https://github.com/adamallcock/tibotattle/releases/download/v0.1.28/release-manifest.json)
@@ -89,7 +97,7 @@ passed all four jobs and its exact 0.1.28 cask readback matches the published Ma
 DMG hashes. Feed metadata, installed updater runs and cask resolution remain
 distinct evidence.
 
-## Hosted and website boundary
+### Hosted and website observations on October 9
 
 The owner-installed 0.1.28 app completed its local refresh and displayed Sol 6.1
 and separate auto-review allowance correctly. Ordinary sharing received accepted

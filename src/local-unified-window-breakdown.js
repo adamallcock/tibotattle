@@ -1,5 +1,6 @@
 import {
-  fastModeQuotaMultiplier,
+  FAST_MODE_QUOTA_MULTIPLIERS,
+  fastModeModelFamilyKey,
 } from "@app-usagemonitor/accounting";
 import {
   KNOWN_SPEEDS,
@@ -123,19 +124,22 @@ export function summarizeWindowBreakdownRows(rows, { pricer = null } = {}) {
 
     if (speed === "ultrafast") { ultrafastCostUsd += cost; ultrafastEvents += 1; }
     const model = projection.model;
+    const fastModeFamily = fastModeModelFamilyKey(model, {
+      eventTime: record.observedAt,
+      standardPriceCardIds: projection.priceCardIds,
+    });
     const modelRow = byModel.get(model) ?? {
       model,
       costUsd: 0,
       tokens: 0,
       events: 0,
       unpricedEvents: 0,
-      fastModeFamily: projection.fastModeFamily,
-      fastModeMultiplier: projection.fastModeFamily === "unsupported"
-        ? null : fastModeQuotaMultiplier(model),
+      fastModeFamily,
+      fastModeMultiplier: FAST_MODE_QUOTA_MULTIPLIERS[fastModeFamily] ?? null,
     };
     // A model aggregate cannot claim one published card basis if any of its
     // events lacked a matching Priority context or date.
-    if (modelRow.fastModeFamily !== projection.fastModeFamily) {
+    if (modelRow.fastModeFamily !== fastModeFamily) {
       modelRow.fastModeFamily = "unsupported";
       modelRow.fastModeMultiplier = null;
     }

@@ -4,7 +4,6 @@ import {
   createAccountlessContributionScheduler,
   createTelemetryPerformanceClient,
   createTelemetryPerformanceScheduler,
-  initialTelemetryPerformanceSyncState,
   parseTelemetryPerformanceSyncState,
   resumeTelemetryPerformanceSyncAfterAuthorization,
 } from "../../src/application/index.js";
@@ -14,7 +13,7 @@ import {
 } from "../../src/platform/index.js";
 import { runAccountlessContributionSyncOnce } from "../../src/contribution-accountless-client.js";
 import { withContributionDeviceSecret } from "../../src/contribution-device-capability.js";
-import { readJsonIfExists, writeJsonOwnerOnlyAtomic } from "../../src/storage.js";
+import { createLocalTelemetryPerformanceState } from "./telemetry-performance-state.js";
 
 const PERFORMANCE_AUTHORIZATION = Object.freeze({
   schemaVersion: "accountless-performance-owner-v1",
@@ -98,24 +97,6 @@ function performanceResponseFailure(response) {
   const retryAfter = response.headers.get("retry-after");
   if (transient && retryAfter !== null && retryAfter.length <= 128) error.retryAfter = retryAfter;
   return error;
-}
-
-async function readPerformanceState(path) {
-  try {
-    const value = await readJsonIfExists(path, null);
-    return value === null ? initialTelemetryPerformanceSyncState()
-      : parseTelemetryPerformanceSyncState(value);
-  } catch {
-    // A corrupt private cursor cannot authorize a request or suppress a
-    // server-side revision replacement. Rebuild the bounded cursor and let
-    // the report revision/idempotency fence decide whether work is new.
-    return initialTelemetryPerformanceSyncState();
-  }
-}
-
-async function writePerformanceState(path, value) {
-  const parsed = parseTelemetryPerformanceSyncState(value);
-  await writeJsonOwnerOnlyAtomic(path, parsed);
 }
 
 function assertPerformanceEnvelopeKey(value) {
@@ -224,6 +205,7 @@ export function createLocalAccountlessContribution({
   let performanceScheduler;
   let performanceGrantGeneration = 0;
   let performanceGrantedGeneration = -1;
+  let performanceGrantedDeviceId = null;
   // A new process must negotiate the current dictionary once even when the
   // previous client persisted a rejected older grant. The protected preference
   // and a fresh independent hosted grant still gate all preparation/uploads.
@@ -232,6 +214,7 @@ export function createLocalAccountlessContribution({
     onInvalidated: () => {
       performanceGrantGeneration += 1;
       performanceGrantedGeneration = -1;
+      performanceGrantedDeviceId = null;
       performanceResumeRequested = true;
       scheduler?.preferenceChanged();
       performanceScheduler?.preferenceChanged();
@@ -253,8 +236,12 @@ export function createLocalAccountlessContribution({
     if (typeof fetchImpl !== "function") throw accountlessConfigurationError();
     const createEnvelope = performanceOptions.createEnvelope
       ?? createTelemetryPerformanceEnvelope;
-    const performanceStateFile = performanceOptions.stateFile
-      ?? join(stateRoot, "private", "accountless-performance-sync-state-v1.json");
+    const performanceState = createLocalTelemetryPerformanceState({
+      path: performanceOptions.stateFile ?? join(stateRoot, "private", "accountless-performance-sync-state-v2.json"),
+      legacyPath: performanceOptions.stateFile === undefined
+        ? join(stateRoot, "private", "accountless-performance-sync-state-v1.json") : null,
+      origin,
+    });
     const performanceFetch = async (...args) => {
       const preference = await bridge.readPreference();
       assertPerformancePreference(preference, origin);
@@ -272,19 +259,26 @@ export function createLocalAccountlessContribution({
       expectedOrigin: origin,
       operation,
     });
-    const readAuthorization = async () => {
+    const readPerformanceDeviceId = async () => {
+      const preference = await bridge.readPreference();
+      try { assertPerformancePreference(preference, origin); }
+      catch { return null; }
+      return withSecret(async (_, binding) => binding.deviceId);
+    };
+    const readAuthorization = async (deviceId) => {
       const generation = performanceGrantGeneration;
       const preference = await bridge.readPreference();
       assertPerformancePreference(preference, origin);
+      if (deviceId === null) throw performanceError("telemetry_performance_authorization_rejected");
       // The grant route is idempotent and is intentionally independent of
       // usage authorization. Re-prove it once per protected preference
       // generation so an accountless opt-out cannot leave a performance grant
       // as a hidden upload path, while one day pass does not create a grant
       // request for every capability/report lease.
-      if (performanceGrantedGeneration !== generation) {
+      if (performanceGrantedGeneration !== generation || performanceGrantedDeviceId !== deviceId) {
         const grant = await withSecret(async (secret, binding) => {
           try {
-            if (!binding || !DEVICE_ID.test(binding.deviceId)) {
+            if (!binding || binding.deviceId !== deviceId || !DEVICE_ID.test(binding.deviceId)) {
               throw performanceError("telemetry_performance_authorization_rejected");
             }
             const response = await performanceFetch(new URL(
@@ -318,11 +312,13 @@ export function createLocalAccountlessContribution({
           throw performanceError("telemetry_performance_response_invalid");
         }
         performanceGrantedGeneration = generation;
+        performanceGrantedDeviceId = deviceId;
       }
       assertPerformancePreference(await bridge.readPreference(), origin);
-      return withSecret(async (secret, binding) => (
-        `Device um_device_${binding.deviceId}.${secret.toString("base64url")}`
-      ));
+      const authorization = await withSecret(async (secret, binding) => binding.deviceId === deviceId
+        ? `Device um_device_${binding.deviceId}.${secret.toString("base64url")}` : null);
+      if (authorization === null) throw performanceError("telemetry_performance_authorization_rejected");
+      return authorization;
     };
     const readEnvelopeKey = async () => {
       let response;
@@ -343,9 +339,12 @@ export function createLocalAccountlessContribution({
       origin,
       fetchImpl: performanceFetch,
       readAuthorization,
+      readDeviceId: readPerformanceDeviceId,
+      readRetryState: performanceState.read,
       readPreparedDay: performanceOptions.readPreparedDay,
-      readState: async () => {
-        const state = await readPerformanceState(performanceStateFile);
+      readState: async (deviceId) => {
+        const state = await performanceState.read(deviceId);
+        if (deviceId === null) return state;
         if (!performanceResumeRequested) return state;
         try { assertPerformancePreference(await bridge.readPreference(), origin); }
         catch { return state; }
@@ -360,7 +359,7 @@ export function createLocalAccountlessContribution({
         }
         return state;
       },
-      saveState: (value) => writePerformanceState(performanceStateFile, value),
+      saveState: performanceState.save,
       createEnvelope: async ({ report }) => {
         const key = await readEnvelopeKey();
         return createEnvelope({ report, ...key });
@@ -368,7 +367,8 @@ export function createLocalAccountlessContribution({
     });
     performanceScheduler = createTelemetryPerformanceScheduler({
       ...performanceOptions.schedulerOptions,
-      runner: ({ day, nowEpoch, resetRetryCount }) => client.runDay({ day, nowEpoch, resetRetryCount }),
+      runner: client.runDay,
+      readRetryDays: client.readRetryDays,
       backfillDays: performanceOptions.schedulerOptions?.backfillDays ?? 7,
       includeCurrentDay: performanceOptions.schedulerOptions?.includeCurrentDay ?? true,
     });

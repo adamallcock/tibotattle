@@ -60,7 +60,10 @@ function tokenCount(timestamp, total, last, usedPercent, explicitModel = undefin
   });
 }
 
-async function fixture({ replayTool = false, responseRecords = false, responseOnly = false, compressed = false } = {}) {
+async function fixture({
+  replayTool = false, responseRecords = false, responseOnly = false, compressed = false,
+  parentModel = "gpt-5.6-sol", parentNextModel = null, childModel = "gpt-5.6-sol",
+} = {}) {
   const root = await mkdtemp(join(tmpdir(), "usage-monitor-checkpoint-equivalence-"));
   const home = join(root, "codex-home");
   const sessions = join(home, "sessions");
@@ -75,7 +78,7 @@ async function fixture({ replayTool = false, responseRecords = false, responseOn
     // memory-mode changes) instead of rewriting the canonical head record.
     JSON.stringify({ timestamp: "2026-07-24T12:00:00.001Z", type: "session_meta", payload: { id: "PRIVATE_PARENT", memory_mode: "enabled" } }),
     "",
-    JSON.stringify({ timestamp: "2026-07-24T12:00:00.010Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } }),
+    JSON.stringify({ timestamp: "2026-07-24T12:00:00.010Z", type: "turn_context", payload: { model: parentModel } }),
     JSON.stringify({
       timestamp: "2026-07-24T12:00:00.020Z",
       type: "event_msg",
@@ -106,13 +109,16 @@ async function fixture({ replayTool = false, responseRecords = false, responseOn
     "ordinary private-looking text without a scanner needle",
     JSON.stringify({ timestamp: "2026-07-24T12:02:10.000Z", type: "response_item", payload: { type: "shell_call", call_id: "PRIVATE_TOOL_2" } }),
     tokenCount("2026-07-24T12:02:30.000Z", usage({ input: 160, cached: 60, output: 35, reasoning: 11, total: 195 }), usage({ input: 60, cached: 20, output: 15, reasoning: 3, total: 75 }), 14.6, 42),
+    ...(parentNextModel === null ? [] : [JSON.stringify({
+      timestamp: "2026-07-24T12:02:59.000Z", type: "turn_context", payload: { model: parentNextModel },
+    })]),
     // Missing component fields exercise the component-presence contract.
     tokenCount("2026-07-24T12:03:00.000Z", { input_tokens: 190, total_tokens: 225 }, { input_tokens: 30, total_tokens: 30 }, 16.4),
     JSON.stringify({ timestamp: "2026-07-24T12:03:01.000Z", type: "event_msg", payload: { type: "task_complete", turn_id: "PRIVATE_PARENT_TASK" } }),
   ];
   const child = [
     JSON.stringify({ timestamp: "2026-07-24T12:03:10.000Z", type: "session_meta", payload: { id: "PRIVATE_CHILD", forked_from_id: "PRIVATE_PARENT" } }),
-    JSON.stringify({ timestamp: "2026-07-24T12:03:10.010Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } }),
+    JSON.stringify({ timestamp: "2026-07-24T12:03:10.010Z", type: "turn_context", payload: { model: childModel } }),
     // Exact replay of the parent's final cumulative snapshot.
     tokenCount("2026-07-24T12:03:11.000Z", { input_tokens: 190, total_tokens: 225 }, { input_tokens: 30, total_tokens: 30 }, 16.4),
     ...(replayTool ? [
@@ -307,6 +313,26 @@ test("checkpoint scanner has byte-for-byte logical parity with the legacy scanne
   } finally {
     await rm(value.root, { recursive: true, force: true });
   }
+});
+
+test("checkpoint resume exports exact GPT-6.2 model identities once with the existing occurrence IDs", async () => {
+  const value = await fixture({
+    parentModel: "gpt-6.2-astra", parentNextModel: "gpt-6.2-sol", childModel: "gpt-6.2-astra-law",
+  });
+  try {
+    const scanner = await legacyResult(value.home);
+    const checkpointed = await checkpointResult({
+      ...value, label: "gpt-62-resume", maximumLinesPerBatch: 1, interruptAfterBatch: 17,
+    });
+    assert.deepEqual(checkpointed.records, scanner.records);
+    assert.deepEqual(checkpointed.diagnostics, scanner.diagnostics);
+    assert.deepEqual(checkpointed.privateCanariesPresent, []);
+    const usage = checkpointed.records.filter(item => item.recordType === "usageEvent").map(item => item.record);
+    assert.equal(usage.length, 4);
+    assert.deepEqual(usage.filter(item => item.modelRecognition === "recognized").map(item => item.modelId).sort(),
+      ["gpt-6.2-astra", "gpt-6.2-astra-law", "gpt-6.2-sol"]);
+    assert.ok(usage.every(item => item.modelFingerprint === null));
+  } finally { await rm(value.root, { recursive: true }); }
 });
 
 test("checkpoint lineage excludes copied parent tool calls from child usage", async () => {

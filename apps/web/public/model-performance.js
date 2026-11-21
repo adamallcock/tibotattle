@@ -29,6 +29,8 @@ const preloadRetryDelay = attempt => Math.min(30_000, 5_000 * 2 ** attempt);
 const SPEED_METHOD = "speed";
 const SPEED_MODES = ["standard", "fast", "ultrafast"];
 const MODEL_NAMES = Object.freeze({
+  "gpt-6.2-astra": "GPT-6.2 Astra", "gpt-6.2-sol": "GPT-6.2 Sol",
+  "gpt-6.2-astra-law": "GPT-6.2 Astra for Law",
   "gpt-6-astra": "Astra", "gpt-6.1-sol": "GPT-6.1 Sol",
   "gpt-6-sol": "GPT-6 Sol", "gpt-6-luna": "GPT-6 Luna",
   "gpt-6.1-terra": "GPT-6.1 Terra",
@@ -59,7 +61,7 @@ export function normalizeModelPerformance(value) {
       || !(value.historyProgress === null || exact(value.historyProgress, ["checked", "total"])
         && count(value.historyProgress.checked) && count(value.historyProgress.total)
         && value.historyProgress.checked <= value.historyProgress.total)
-      || !Array.isArray(value.models) || value.models.length > 16) return null;
+      || !Array.isArray(value.models) || value.models.length > MODEL_ORDER.length) return null;
   const step = value.interval === "week" ? 8 * DAY : 26 * 3_600_000;
   const seen = new Set();
   const validPoints = (points, maximum) => {

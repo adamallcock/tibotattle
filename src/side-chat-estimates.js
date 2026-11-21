@@ -8,10 +8,10 @@ import {
   APP_OFFICIAL_PRICE_CARDS,
   APP_PRICE_REGISTRY_MANIFEST,
   DEFAULT_UNRESOLVED_SPEED_SCENARIO,
-  FAST_MODE_ASSUMED_MULTIPLIER,
   emptySpeedWeightingCrossing,
   speedModeModelFamilyKey,
   priceCodexUsageEvent,
+  quotaWeightedApiPriceEquivalent,
   summarizeQuotaWeightedAccounting,
 } from "@app-usagemonitor/accounting";
 import { codexPrimaryAllowanceBasis } from "./codex-primary-allowance-basis.js";
@@ -756,7 +756,12 @@ export async function collectHistoricalSideChatGapProbe({
     // The missing events are hypothetical: their input context and exact
     // price epoch were never observed. A model-capability ratio would claim
     // unsupported evidence, so this backcast uses the disclosed fallback.
-    const missingMultiplier = FAST_MODE_ASSUMED_MULTIPLIER;
+    const { multiplier: missingMultiplier } = quotaWeightedApiPriceEquivalent({
+      model: assumedMissingModel, mode: "fast", apiPriceEquivalentUsd: 0,
+    });
+    if (missingMultiplier === null) {
+      return unavailable("side_chat_historical_gap_speed_weighting_incomplete");
+    }
     const weighting = exactUsage.allowanceWeighting;
     const minimumMovement = quota.minimumMovementPercentagePoints;
     const maximumMovement = quota.maximumMovementPercentagePoints;

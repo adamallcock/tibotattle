@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   ADMIN_MODEL_CONFIG,
   ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+  OCTOBER26_ADMIN_MODEL_CONFIG,
+  OCTOBER26_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
   SEPTEMBER29_ADMIN_MODEL_CONFIG,
   SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
   expandAdminModelHistoryDay,
@@ -13,8 +15,8 @@ import {
   validCachedAdminCommunityAllowancePreview,
 } from "../vendor/analytics-d43c8f92/apps/worker/src/admin-community-allowance";
 
-const DAY = "2026-10-26";
-const NOW = Date.parse("2026-10-27T12:00:00.000Z");
+const DAY = "2026-11-17";
+const NOW = Date.parse("2026-11-18T12:00:00.000Z");
 const SEPTEMBER23 = "reviewed-model-catalog-2026-09-23.1";
 
 function modelDay(catalogVersion: string, modelId = "gpt-6.1-sol") {
@@ -28,11 +30,13 @@ function modelDay(catalogVersion: string, modelId = "gpt-6.1-sol") {
   return value;
 }
 
-function preview(length: 42 | 43 | 44) {
+function preview(length: 42 | 43 | 44 | 47) {
   const built = buildAdminCommunityAllowancePreview([], NOW);
-  const config = length === 44 ? ADMIN_MODEL_CONFIG : SEPTEMBER29_ADMIN_MODEL_CONFIG.slice(0, length);
+  const config = length === 47 ? ADMIN_MODEL_CONFIG
+    : length === 44 ? OCTOBER26_ADMIN_MODEL_CONFIG : SEPTEMBER29_ADMIN_MODEL_CONFIG.slice(0, length);
   const catalog = length === 42 ? SEPTEMBER23
-    : length === 43 ? SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION : ADMIN_MODEL_HISTORY_CATALOG_VERSION;
+    : length === 43 ? SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION
+    : length === 44 ? OCTOBER26_ADMIN_MODEL_HISTORY_CATALOG_VERSION : ADMIN_MODEL_HISTORY_CATALOG_VERSION;
   return { ...structuredClone(built), models: { ...structuredClone(built.models),
     modelConfig: config.map(model => ({ ...model })),
     days: [modelDay(catalog, length === 42 ? "gpt-6-astra" : "gpt-6.1-sol")],
@@ -46,15 +50,18 @@ function read(value: ReturnType<typeof preview>) {
   return readCachedAdminCommunityAllowancePreview(db, NOW);
 }
 
-describe("vendored Terra catalog transition preserves retained v0.3 publications", () => {
-  it("binds the exact frozen 43-row predecessor and the appended 44th identity", () => {
-    expect(ADMIN_MODEL_CONFIG).toHaveLength(44);
+describe("vendored GPT-6.2 catalog preserves retained v0.3 publications", () => {
+  it("keeps the exact October roster and appends all three November identities", () => {
+    expect(ADMIN_MODEL_CONFIG).toHaveLength(47);
     expect(ADMIN_MODEL_CONFIG.slice(0, 43)).toEqual(SEPTEMBER29_ADMIN_MODEL_CONFIG);
+    expect(ADMIN_MODEL_CONFIG.slice(0, 44)).toEqual(OCTOBER26_ADMIN_MODEL_CONFIG);
     expect(ADMIN_MODEL_CONFIG[42]?.modelId).toBe("gpt-6.1-sol");
     expect(ADMIN_MODEL_CONFIG[43]?.modelId).toBe("gpt-6.1-terra");
+    expect(ADMIN_MODEL_CONFIG.slice(44).map(({ modelId }) => modelId))
+      .toEqual(["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.2-astra-law"]);
   });
 
-  it.each([42, 43, 44] as const)("reads the exact %i-row contract without changing values, dates or units", async length => {
+  it.each([42, 43, 44, 47] as const)("reads the exact %i-row contract without changing values, dates or units", async length => {
     const value = preview(length);
     const bytes = JSON.stringify(value);
     expect(value.schemaVersion).toBe("admin-community-allowance-preview-v0.3");
@@ -68,6 +75,10 @@ describe("vendored Terra catalog transition preserves retained v0.3 publications
       const expanded = expandAdminModelHistoryDay(value.models.days[0]);
       expect(Object.keys(expanded!.byModel)).toEqual(SEPTEMBER29_ADMIN_MODEL_CONFIG.map(model => model.modelId));
       expect(expanded!.byModel).not.toHaveProperty("gpt-6.1-terra");
+    } else if (length === 44) {
+      const expanded = expandAdminModelHistoryDay(value.models.days[0]);
+      expect(Object.keys(expanded!.byModel)).toEqual(OCTOBER26_ADMIN_MODEL_CONFIG.map(model => model.modelId));
+      expect(expanded!.byModel).not.toHaveProperty("gpt-6.2-astra");
     }
   });
 
@@ -83,8 +94,8 @@ describe("vendored Terra catalog transition preserves retained v0.3 publications
     expect(validCachedAdminCommunityAllowancePreview(september23, september23.generatedAt, NOW)).toBe(false);
   });
 
-  it("refuses newer sparse evidence beneath either retained header", () => {
-    for (const length of [42, 43] as const) {
+  it("refuses newer sparse evidence beneath each retained header", () => {
+    for (const length of [42, 43, 44] as const) {
       const value = preview(length);
       value.models.days = [modelDay(ADMIN_MODEL_HISTORY_CATALOG_VERSION, "gpt-6-astra")];
       expect(validCachedAdminCommunityAllowancePreview(value, value.generatedAt, NOW)).toBe(false);
@@ -92,6 +103,11 @@ describe("vendored Terra catalog transition preserves retained v0.3 publications
     const september23 = preview(42);
     september23.models.days = [modelDay(SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION, "gpt-6-astra")];
     expect(validCachedAdminCommunityAllowancePreview(september23, september23.generatedAt, NOW)).toBe(false);
+    for (const length of [42, 43] as const) {
+      const value = preview(length);
+      value.models.days = [modelDay(OCTOBER26_ADMIN_MODEL_HISTORY_CATALOG_VERSION, "gpt-6-astra")];
+      expect(validCachedAdminCommunityAllowancePreview(value, value.generatedAt, NOW)).toBe(false);
+    }
   });
 
   it("refuses arbitrary roster prefixes, duplicates, order changes, and invalid retained labels", () => {
@@ -110,13 +126,25 @@ describe("vendored Terra catalog transition preserves retained v0.3 publications
     }
   });
 
-  it("admits actual Terra values only with the current reviewed day catalog and header", () => {
+  it("retains actual Terra values with the October day catalog and header", () => {
     const value = preview(44);
-    value.models.days = [modelDay(ADMIN_MODEL_HISTORY_CATALOG_VERSION, "gpt-6.1-terra")];
+    value.models.days = [modelDay(OCTOBER26_ADMIN_MODEL_HISTORY_CATALOG_VERSION, "gpt-6.1-terra")];
     expect(validCachedAdminCommunityAllowancePreview(value, value.generatedAt, NOW)).toBe(true);
     expect(value.models.days[0]!.values).toEqual([["gpt-6.1-terra", 500, 1]]);
     const retained = preview(43);
     retained.models.days[0] = { ...retained.models.days[0]!, values: [["gpt-6.1-terra", 500, 1]] };
     expect(validCachedAdminCommunityAllowancePreview(retained, retained.generatedAt, NOW)).toBe(false);
+  });
+
+  it("admits actual GPT-6.2 values only with the current reviewed day catalog and header", () => {
+    for (const modelId of ["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.2-astra-law"]) {
+      const value = preview(47);
+      value.models.days = [modelDay(ADMIN_MODEL_HISTORY_CATALOG_VERSION, modelId)];
+      expect(validCachedAdminCommunityAllowancePreview(value, value.generatedAt, NOW)).toBe(true);
+      expect(value.models.days[0]!.values).toEqual([[modelId, 500, 1]]);
+      const october = preview(44);
+      october.models.days[0] = { ...october.models.days[0]!, values: [[modelId, 500, 1]] };
+      expect(validCachedAdminCommunityAllowancePreview(october, october.generatedAt, NOW)).toBe(false);
+    }
   });
 });

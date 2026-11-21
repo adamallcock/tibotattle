@@ -248,6 +248,84 @@ test("unqualified or mixed Ultrafast intervals preserve raw cost and make every 
   }
 });
 
+test("mixed-model Ultrafast intervals apply each model's qualified Standard-card evidence", () => {
+  const day = "2026-11-18";
+  const { snapshotIntervals, options } = ultrafastDiagnosticFixture();
+  const row = snapshotIntervals[0];
+  row.priorObservedAt = `${day}T14:00:00.000Z`;
+  row.eventTime = `${day}T14:10:00.000Z`;
+  row.modelMix = {
+    "gpt-6.2-sol": { events: 1, costUsd: 2 },
+    "gpt-6.2-astra": { events: 1, costUsd: 4 },
+    "gpt-6-astra": { events: 1, costUsd: 1 },
+  };
+  row.marginalUsageEventCount = 3;
+  row.tierUsageEventCounts = { ultrafast: 3 };
+  row.marginalApiPricedUsd = 7;
+  snapshotIntervals[1].eventTime = `${day}T22:10:00.000Z`;
+  const diagnosticOptions = {
+    ...options, fastStart: `${day}T14:00:00.000Z`, fastEnd: `${day}T18:00:00.000Z`,
+    referenceStart: `${day}T22:00:00.000Z`, referenceEnd: `${day}T23:00:00.000Z`,
+  };
+  const cardIds = (model, apiServiceTier = "standard") => priceCodexUsageEvent({
+    model, timestamp: row.eventTime, totalInputContextTokens: 1_000,
+    components: { input_uncached_tokens: 1_000 },
+  }, { apiServiceTier }).selectedPriceCardIds;
+  const valid = Object.keys(row.modelMix).flatMap((model) => cardIds(model));
+  assert.equal(valid.length, 3);
+  row.priceCardIds = valid;
+  const result = analyzeFastDiagnostic({ snapshotIntervals }, diagnosticOptions);
+  assert.equal(result.fast.rawCostUsd, 7);
+  assert.equal(result.fast.tierWeightedCostUsd, 24);
+
+  for (const invalid of [
+    [...valid, "unreviewed:test:card"],
+    [...valid, ...cardIds("gpt-6.1-sol")],
+    [...valid, ...cardIds("gpt-6.2-sol", "ultrafast")],
+    [...valid, valid[0]],
+    valid.slice(1),
+  ]) {
+    assert.notDeepEqual(invalid, valid);
+    row.priceCardIds = invalid;
+    const withheld = analyzeFastDiagnostic({ snapshotIntervals }, diagnosticOptions);
+    assert.equal(withheld.fast.rawCostUsd, 7);
+    assert.equal(withheld.fast.tierWeightedCostUsd, null);
+  }
+
+  row.modelMix["gpt-6.1-sol"] = { events: 0, costUsd: 0 };
+  row.priceCardIds = [...valid, ...cardIds("gpt-6.1-sol")];
+  assert.equal(analyzeFastDiagnostic({ snapshotIntervals }, diagnosticOptions).fast.tierWeightedCostUsd, null);
+});
+
+test("Ultrafast intervals spanning the Pacific price cutover withhold weighted cost", () => {
+  const day = "2027-03-01";
+  const { snapshotIntervals, options } = ultrafastDiagnosticFixture();
+  const row = snapshotIntervals[0];
+  row.priorObservedAt = `${day}T07:45:00.000Z`;
+  row.modelMix = {
+    "gpt-6.2-sol": { events: 1, costUsd: 2 },
+    "gpt-6.2-astra": { events: 1, costUsd: 4 },
+  };
+  row.marginalUsageEventCount = 2;
+  row.tierUsageEventCounts = { ultrafast: 2 };
+  row.marginalApiPricedUsd = 6;
+  row.priceCardIds = Object.keys(row.modelMix).flatMap((model) => priceCodexUsageEvent({
+    model, timestamp: `${day}T08:10:00.000Z`, totalInputContextTokens: 1_000,
+    components: { input_uncached_tokens: 1_000 },
+  }).selectedPriceCardIds);
+  snapshotIntervals[1].eventTime = `${day}T22:10:00.000Z`;
+  const diagnosticOptions = {
+    ...options, fastStart: `${day}T07:00:00.000Z`, fastEnd: `${day}T10:00:00.000Z`,
+    referenceStart: `${day}T22:00:00.000Z`, referenceEnd: `${day}T23:00:00.000Z`,
+  };
+  row.eventTime = `${day}T07:55:00.000Z`;
+  assert.equal(analyzeFastDiagnostic({ snapshotIntervals }, diagnosticOptions).fast.tierWeightedCostUsd, 18);
+  row.eventTime = `${day}T08:10:00.000Z`;
+  assert.equal(analyzeFastDiagnostic({ snapshotIntervals }, diagnosticOptions).fast.tierWeightedCostUsd, null);
+  row.priorObservedAt = `${day}T07:59:59.999Z`;
+  assert.equal(analyzeFastDiagnostic({ snapshotIntervals }, diagnosticOptions).fast.tierWeightedCostUsd, 36);
+});
+
 test("Ultrafast usage cannot form a Standard reference segment", () => {
   const { snapshotIntervals, options } = ultrafastDiagnosticFixture();
   snapshotIntervals[1].tierUsageEventCounts = { ultrafast: 1 };

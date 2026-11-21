@@ -7,6 +7,9 @@ import { translate, SUPPORTED_LOCALES } from "../public/localization.js";
 
 test("model names format Astra while preserving reviewed names and unknown identifiers", () => {
   for (const [id, label] of [
+    ["gpt-6.2-astra", "GPT-6.2 Astra"],
+    ["gpt-6.2-sol", "GPT-6.2 Sol"],
+    ["gpt-6.2-astra-law", "GPT-6.2 Astra for Law"],
     ["gpt-6-astra", "GPT-6 Astra"],
     ["gpt-6.1-sol", "GPT-6.1 Sol"],
     ["gpt-6-sol", "GPT-6 Sol"],
@@ -127,6 +130,7 @@ test("model table preserves unavailable, unreviewed, separate-allowance and pric
 test("shared model icons preserve established aliases without inventing unknown identities", () => {
   const documentRef = { createElementNS: (_namespace, tag) => element(tag) };
   for (const [id, theme] of [
+    ["gpt-6.2-astra", "astra"], ["gpt-6.2-sol", "sol"], ["gpt-6.2-astra-law", "astra"],
     ["gpt-6-astra", "astra"], ["gpt-6.1-sol", "sol"], ["gpt-6-sol", "sol"],
     ["gpt-6-luna", "luna"], ["gpt-5.6-sol-wm", "sol"],
     ["gpt-6.1-terra", "terra"], ["gpt-5.6-terra", "terra"], ["gpt-5.6-luna", "luna"],

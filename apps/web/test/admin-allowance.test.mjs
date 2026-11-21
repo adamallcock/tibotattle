@@ -205,14 +205,33 @@ test("model filtering preserves catalog visibility without manufacturing evidenc
   assert.equal(adminAllowanceChartModel(preview, { mode: "models", modelFilter: "gpt-6-astra" }), null);
 });
 
+test("restricted Astra for Law appears in the admin comparison only with an identified fit", async () => {
+  const { adminAllowanceChartModel } = await importAdminModule();
+  const preview = allowancePreviewWithModels();
+  const modelId = "gpt-6.2-astra-law";
+  preview.models.modelConfig.push({ modelId, label: "GPT-6.2 Astra for Law" });
+  const options = { mode: "models", modelFilter: "all" };
+  assert.equal(adminAllowanceChartModel(preview, options).legendSeries.some(series => series.key === modelId), false);
+  assert.equal(adminAllowanceChartModel(preview, { ...options, modelFilter: modelId }), null);
+  preview.models.days.at(-1).byModel[modelId] = { capacityUsd: 1350, participantCount: 1 };
+  const observed = adminAllowanceChartModel(preview, { ...options, modelFilter: modelId });
+  assert.deepEqual(observed.legendSeries.map(({ key, label, theme }) => [key, label, theme]),
+    [[modelId, "GPT-6.2 Astra for Law", "astra"]]);
+  assert.deepEqual(observed.series[0].points.map(({ value }) => value), [1350]);
+});
+
 test("admin model order and themes match the public presentation, including catalog fallbacks", async () => {
   const { adminAllowanceChartModel } = await importAdminModule();
   const preview = allowancePreviewWithModels();
   preview.models.modelConfig.push({ modelId: "gpt-6-astra", label: "GPT-6 Astra" });
   preview.models.modelConfig.push({ modelId: "gpt-5.4-mini", label: "GPT-5.4 mini" });
   preview.models.modelConfig.push({ modelId: "gpt-6.1-terra", label: "GPT-6.1 Terra" });
+  preview.models.modelConfig.push({ modelId: "gpt-6.2-sol", label: "GPT-6.2 Sol" });
+  preview.models.modelConfig.push({ modelId: "gpt-6.2-astra", label: "GPT-6.2 Astra" });
   const model = adminAllowanceChartModel(preview, { mode: "models" });
   assert.deepEqual(model.legendSeries.map(({ key, theme, className }) => [key, theme, className]), [
+    ["gpt-6.2-astra", "astra", "allowance-model-astra"],
+    ["gpt-6.2-sol", "sol", "allowance-model-sol"],
     ["gpt-6-astra", "astra", "allowance-model-astra"],
     ["gpt-5.6-sol", "sol", "allowance-model-sol"],
     ["gpt-6.1-terra", "terra", "allowance-model-terra"],

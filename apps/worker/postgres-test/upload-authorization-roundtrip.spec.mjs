@@ -246,8 +246,21 @@ test("PostgreSQL issues bounded upload grants under current device authority and
       nowEpoch,
       consentVersion: constants.TELEMETRY_CONSENT_VERSION,
     });
+    const authorityLocks = [];
+    const recordingPool = {
+      async connect() {
+        const client = await pool.connect();
+        return {
+          query(text, values) {
+            if (text.includes("FOR UPDATE OF")) authorityLocks.push(text.replace(/\s+/gu, " "));
+            return client.query(text, values);
+          },
+          release: client.release.bind(client),
+        };
+      },
+    };
     const principal = await transport.authenticatePostgresDevice(
-      pool, social.authorization, { ...options, nowEpoch },
+      recordingPool, social.authorization, { ...options, nowEpoch },
     );
     await assert.rejects(
       transport.authenticatePostgresDevice(pool, `Upload ${social.authorization.slice("Device ".length)}`, {
@@ -257,8 +270,13 @@ test("PostgreSQL issues bounded upload grants under current device authority and
     );
 
     const issued = await issuer.createPostgresDeviceUploadAuthorization(
-      pool, principal, request, { ...options, nowEpoch },
+      recordingPool, principal, request, { ...options, nowEpoch },
     );
+    assert.equal(authorityLocks.length, 2);
+    for (const sql of authorityLocks) {
+      assert.ok(sql.includes(`FROM ${q(schema, "participants")} participant JOIN ${q(schema, "device_credentials")} device`));
+      assert.ok(sql.endsWith("FOR UPDATE OF participant, device"));
+    }
     assert.equal(issued.expiresAt, new Date(nowEpoch + constants.UPLOAD_AUTHORIZATION_TTL_MILLISECONDS).toISOString());
     const { authorizationId, secret } = uploadCredential(issued.uploadAuthorization);
     const issuedRow = await pool.query(

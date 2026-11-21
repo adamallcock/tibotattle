@@ -21,6 +21,14 @@ import {
 
 const EVENT_TIME = "2026-09-29T00:00:00.000Z";
 const EVIDENCE = { eventTime: EVENT_TIME, totalInputContextTokens: 272_000 };
+const PUBLISHED_ULTRAFAST = {
+  "gpt-6-astra": 6,
+  "gpt-6.1-sol": 6,
+  "gpt-6.2-astra:3x": 3,
+  "gpt-6.2-astra:6x": 6,
+  "gpt-6.2-sol:3x": 3,
+  "gpt-6.2-sol:6x": 6,
+};
 const ULTRAFAST_CARDS = APP_OFFICIAL_PRICE_CARDS.filter(
   (card) => card.provider === "openai" && card.service_tier === "ultrafast",
 );
@@ -33,13 +41,13 @@ function crossing(cells) {
   return value;
 }
 
-test("generic API multipliers retain Fast prices and publish only Astra Ultrafast", () => {
+test("generic API multipliers retain Fast prices and separate dated Ultrafast ratios", () => {
   assert.equal(SPEED_MODE_API_MULTIPLIERS.fast, FAST_MODE_QUOTA_MULTIPLIERS);
-  assert.deepEqual(SPEED_MODE_API_MULTIPLIERS.ultrafast, { "gpt-6-astra": 6 });
+  assert.deepEqual(SPEED_MODE_API_MULTIPLIERS.ultrafast, PUBLISHED_ULTRAFAST);
   assert.ok(Object.isFrozen(SPEED_MODE_API_MULTIPLIERS));
   assert.ok(Object.isFrozen(SPEED_MODE_API_MULTIPLIERS.ultrafast));
   assert.deepEqual(deriveSpeedModeApiRatiosFromRegistry("fast"), FAST_MODE_QUOTA_MULTIPLIERS);
-  assert.deepEqual(deriveSpeedModeApiRatiosFromRegistry("ultrafast"), { "gpt-6-astra": 6 });
+  assert.deepEqual(deriveSpeedModeApiRatiosFromRegistry("ultrafast"), PUBLISHED_ULTRAFAST);
   assert.throws(() => deriveSpeedModeApiRatiosFromRegistry("invented"), /Unsupported API speed mode/u);
   assert.deepEqual(OBSERVED_SPEED_MODE_KEYS, ["standard", "fast", "ultrafast", "unknown"]);
   assert.deepEqual(Object.keys(emptySpeedWeightingCrossing().ultrafast), SPEED_MODE_MODEL_FAMILY_KEYS);
@@ -56,31 +64,36 @@ test("generic API multipliers retain Fast prices and publish only Astra Ultrafas
   assert.equal(speedModeModelFamilyKey("gpt-6-astra", "invented", EVIDENCE), "unsupported");
 });
 
-test("every eligible Ultrafast card equals six times the exact Standard component cost", () => {
-  assert.equal(ULTRAFAST_CARDS.length, 2);
+test("every published Ultrafast card equals its multiplier times the exact Standard cost", () => {
+  assert.equal(ULTRAFAST_CARDS.length, 12);
   for (const card of ULTRAFAST_CARDS) {
+    const launch = card.effective.from;
+    const eventTime = launch.length === 10 ? launch + "T00:00:00.000Z" : launch;
+    const modelHasDatedRatios = ["gpt-6.2-astra", "gpt-6.2-sol"].includes(card.model);
+    const publishedMultiplier = modelHasDatedRatios && card.effective.to ? 3 : 6;
+    const family = modelHasDatedRatios ? card.model + ":" + publishedMultiplier + "x" : card.model;
     const totalInputContextTokens = card.metadata.total_input_context_band === "long" ? 272_001 : 272_000;
     const components = Object.fromEntries(card.components
       .filter((component) => component.usage_component.endsWith("_tokens"))
       .map((component) => [component.usage_component, 1_000]));
     for (const model of [card.model, ...(card.aliases ?? [])]) {
-      const event = { model, timestamp: EVENT_TIME, totalInputContextTokens, components };
+      const event = { model, timestamp: eventTime, totalInputContextTokens, components };
       const standard = priceCodexUsageEvent(event, { apiServiceTier: "standard" });
       const ultrafast = priceCodexUsageEvent(event, { apiServiceTier: "ultrafast" });
       assert.equal(standard.coverageStatus, "fully_priced");
       assert.equal(ultrafast.coverageStatus, "fully_priced");
       assert.deepEqual(ultrafast.selectedPriceCardIds, [card.id]);
-      const evidence = { eventTime: EVENT_TIME, totalInputContextTokens, standardPriceCardIds: standard.selectedPriceCardIds };
-      assert.equal(speedModeModelFamilyKey(model, "ultrafast", evidence), "gpt-6-astra");
-      assert.equal(speedModeApiMultiplier(model, "ultrafast", evidence), 6);
+      const evidence = { eventTime, totalInputContextTokens, standardPriceCardIds: standard.selectedPriceCardIds };
+      assert.equal(speedModeModelFamilyKey(model, "ultrafast", evidence), family);
+      assert.equal(speedModeApiMultiplier(model, "ultrafast", evidence), publishedMultiplier);
       assert.deepEqual(quotaWeightedApiPriceEquivalent({
         apiPriceEquivalentUsd: Number(standard.totalUsd), model, mode: "ultrafast", ...evidence,
-      }), { usd: Number(ultrafast.totalUsd), multiplier: 6, status: "ultrafast_weighted" });
+      }), { usd: Number(ultrafast.totalUsd), multiplier: publishedMultiplier, status: "ultrafast_weighted" });
       // Exact Standard card evidence may establish the context when its raw
       // token count is unavailable; conflicting explicit context is rejected.
       assert.equal(speedModeApiMultiplier(model, "ultrafast", {
-        eventTime: EVENT_TIME, standardPriceCardIds: standard.selectedPriceCardIds,
-      }), 6);
+        eventTime, standardPriceCardIds: standard.selectedPriceCardIds,
+      }), publishedMultiplier);
       assert.equal(speedModeApiMultiplier(model, "ultrafast", {
         ...evidence, totalInputContextTokens: totalInputContextTokens === 272_000 ? 272_001 : 272_000,
       }), null);
@@ -117,7 +130,9 @@ test("Ultrafast never assumes a ratio for unsupported models, dates, contexts, o
   }), { usd: null, multiplier: null, status: "ultrafast_price_unavailable" });
   // Capability lookup is deliberately separate from event pricing authority.
   assert.equal(speedModeApiMultiplier("gpt-6-astra", "ultrafast"), 6);
-  assert.equal(speedModeApiMultiplier("gpt-6.1-sol", "ultrafast"), null);
+  assert.equal(speedModeApiMultiplier("gpt-6.1-sol", "ultrafast"), 6);
+  assert.equal(speedModeApiMultiplier("gpt-6.2-sol", "ultrafast"), null);
+  assert.equal(speedModeApiMultiplier("gpt-6.2-astra", "ultrafast"), null);
 });
 
 test("Ultrafast ratio proof rejects partial cards and unequal component or context ratios", () => {
@@ -176,7 +191,7 @@ test("mixed speed accounting preserves provenance, distinct API ratios, and unsu
 });
 
 test("unsupported Ultrafast remains unknown even for zero-dollar events and legacy crossings remain readable", () => {
-  for (const family of ["unsupported", "gpt-6.1-sol"]) {
+  for (const family of ["unsupported", "gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.2-astra-law"]) {
     for (const usd of [0, 4]) {
       const speedWeighting = crossing([["ultrafast", family, 1, usd]]);
       const summary = summarizeQuotaWeightedAccounting({ speedWeighting });
@@ -191,6 +206,57 @@ test("unsupported Ultrafast remains unknown even for zero-dollar events and lega
   const legacy = crossing([["fast", "gpt-5.6-sol", 1, 4], ["unknown", "unsupported", 1, 2]]);
   delete legacy.ultrafast;
   assert.equal(summarizeQuotaWeightedAccounting({ speedWeighting: legacy }).quotaWeightedApiPriceEquivalentUsd, 10);
+});
+
+test("same-day Ultrafast pricing separates dated rates across observed and declared crossings", () => {
+  const observed = emptySpeedWeightingCrossing();
+  const declared = emptySpeedWeightingCrossing();
+  for (const model of ["gpt-6.2-astra", "gpt-6.2-sol"]) {
+    for (const [eventTime, multiplier] of [
+      ["2027-03-01T08:00:00.000Z", 6],
+      ["2027-03-01T07:59:59.999Z", 3],
+    ]) {
+      const evidence = { eventTime, totalInputContextTokens: 272_001 };
+      assert.equal(speedModeApiMultiplier(model, "ultrafast", evidence), multiplier);
+      const family = speedModeModelFamilyKey(model, "ultrafast", evidence);
+      assert.equal(family, model + ":" + multiplier + "x");
+      for (const row of [observed.ultrafast, observed.unknown, declared.ultrafast]) {
+        row[family] = { events: 1, apiPriceEquivalentUsd: 1.25 };
+      }
+    }
+  }
+  const result = summarizeQuotaWeightedAccounting({
+    speedWeighting: observed, declaredSpeedWeighting: declared,
+  });
+  assert.equal(result.quotaWeightedApiPriceEquivalentUsd, 45);
+  assert.equal(result.standardApiPriceEquivalentUsd, 10);
+  assert.equal(result.coverage.observedEvents, 4);
+  assert.equal(result.coverage.declaredFromConfigEvents, 4);
+  assert.equal(result.weightingStatus, "complete");
+  assert.deepEqual(result.appliedMultipliers, {
+    "ultrafast:gpt-6.2-astra:3x": 3,
+    "ultrafast:gpt-6.2-astra:6x": 6,
+    "ultrafast:gpt-6.2-sol:3x": 3,
+    "ultrafast:gpt-6.2-sol:6x": 6,
+  });
+});
+
+test("GPT-6.2 Astra for Law does not get the generic assumed Fast comparison", () => {
+  const model = "gpt-6.2-astra-law";
+  const evidence = { eventTime: "2026-11-21T00:00:00.000Z", totalInputContextTokens: 1 };
+  assert.equal(fastModeQuotaMultiplier(model, evidence), null);
+  assert.equal(fastModeModelFamilyKey(model, evidence), model);
+  assert.deepEqual(quotaWeightedApiPriceEquivalent({
+    apiPriceEquivalentUsd: 8, model, mode: "fast", ...evidence,
+  }), { usd: null, multiplier: null, status: "fast_price_unavailable" });
+  const result = summarizeQuotaWeightedAccounting({
+    speedWeighting: crossing([["fast", model, 1, 8]]),
+  });
+  assert.equal(result.standardApiPriceEquivalentUsd, 8);
+  assert.equal(result.quotaWeightedApiPriceEquivalentUsd, null);
+  assert.equal(result.unweightedUnknownApiPriceEquivalentUsd, 8);
+  assert.equal(result.assumedRatioStandardApiPriceEquivalentUsd, 0);
+  assert.equal(result.weightingStatus, "unknown");
 });
 
 test("Ultrafast evidence cannot form a Standard reference for residual Fast diagnostics", () => {

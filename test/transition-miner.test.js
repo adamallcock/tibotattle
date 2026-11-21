@@ -146,6 +146,26 @@ test("pure transition derivation rejects invalid envelopes and ignores malformed
   assert.equal(derived.transitions.length, 0);
 });
 
+test("transition derivation preserves Astra Law Standard charges but withholds Fast weighting", () => {
+  const derived = deriveCodexTransitionSeries({
+    startAt: "2026-11-17T17:00:00.000Z",
+    endAt: "2026-11-17T19:00:00.000Z",
+    rawUsageEvents: [{
+      timestamp: "2026-11-17T18:30:00.000Z",
+      model: "gpt-6.2-astra-law",
+      totalInputContextTokens: 1_000,
+      components: { input_uncached_tokens: 1_000 },
+      tierSemantics: { codexSpeedMode: "fast", apiServiceTier: "unknown" },
+    }],
+  });
+  assert.equal(derived.usageEvents.length, 1);
+  assert.equal(derived.usageEvents[0].costUsd, 0.008);
+  assert.equal(derived.usageEvents[0].fastWeightedEquivalentUsd, null);
+  assert.equal(derived.usageEvents[0].quotaWeightedLowerUsd, null);
+  assert.equal(derived.usageEvents[0].quotaWeightedUpperUsd, null);
+  assert.equal(derived.quotaWeightedSensitivityComplete, false);
+});
+
 test("cooperative transition derivation preserves the synchronous result", async () => {
   const rawUsageEvents = [{
     timestamp: "2026-07-23T00:00:01.000Z",

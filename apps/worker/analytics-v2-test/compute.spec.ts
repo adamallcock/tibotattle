@@ -209,29 +209,42 @@ describe("computeAnalyticsV2 (A-2)", () => {
     // This pre-Terra corpus keeps every value and coverage byte. Restore only
     // the previous registry identity and exact September 29 catalog metadata
     // before comparing with the independently retained predecessor pins.
-    const predecessorResponse = structuredClone(response);
-    for (const day of predecessorResponse.days) {
+    const octoberResponse = structuredClone(response);
+    for (const day of octoberResponse.days) {
       const spend = day.payload.apiEquivalentSpend as Record<string, unknown>;
       expect(spend.pricingMethodVersion).toBe("server-api-price-equivalent-v0.6");
-      expect(spend.registrySha256).toBe("206544769b43e4b9645284258edd38f7c07a226022db10f5ec0181335df236ab");
+      expect(spend.registrySha256).toBe("eca860219a79a24a2cc1ba07471e2ecc321281508dc7e8d48412deef77609c77");
+      spend.registrySha256 = "206544769b43e4b9645284258edd38f7c07a226022db10f5ec0181335df236ab";
+    }
+    expect(sha(JSON.stringify(octoberResponse))).toBe("3e88e6570ec207cf6f87648a4601a12804b4fb45fcdeb857e41f92c0ccd2119b");
+    const predecessorResponse = structuredClone(octoberResponse);
+    for (const day of predecessorResponse.days) {
+      const spend = day.payload.apiEquivalentSpend as Record<string, unknown>;
       spend.registrySha256 = "d57a7443bb43a756f1458872897dfcfcafdde0893433fc83b1036d58184de78d";
     }
     expect(sha(JSON.stringify(predecessorResponse))).toBe("51a7d0cb490c82b92e88783d5d14ea01bbe6a44dd636522ce40e4b3cce2e3a9a");
-    expect(preview.models.modelConfig).toHaveLength(44);
+    expect(preview.models.modelConfig).toHaveLength(47);
     expect(preview.models.modelConfig[42]!.modelId).toBe("gpt-6.1-sol");
     expect(preview.models.modelConfig[43]!.modelId).toBe("gpt-6.1-terra");
-    expect(preview.models.days.every((day) => day.catalogVersion === "reviewed-model-catalog-2026-10-26.1"
-      && day.values.every(([modelId]) => modelId !== "gpt-6.1-terra"))).toBe(true);
+    expect(preview.models.modelConfig.slice(44)).toEqual([
+      { modelId: "gpt-6.2-astra", label: "GPT-6.2 Astra", allowanceTrack: "primary", pricingStatus: "published" },
+      { modelId: "gpt-6.2-sol", label: "GPT-6.2 Sol", allowanceTrack: "primary", pricingStatus: "published" },
+      { modelId: "gpt-6.2-astra-law", label: "GPT-6.2 Astra for Law", allowanceTrack: "primary", pricingStatus: "published" },
+    ]);
+    expect(preview.models.days.every((day) => day.catalogVersion === "reviewed-model-catalog-2026-11-17.1"
+      && day.values.every(([modelId]) => !["gpt-6.1-terra", "gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.2-astra-law"].includes(modelId)))).toBe(true);
     const predecessorPreview = { ...preview, models: { ...preview.models,
       modelConfig: preview.models.modelConfig.slice(0, 43),
       days: preview.models.days.map((day) => ({ ...day, catalogVersion: "reviewed-model-catalog-2026-09-29.1" })),
     } };
     expect(validCachedAdminCommunityAllowancePreview(predecessorPreview, preview.generatedAt, NOW_MS)).toBe(true);
     expect(sha(JSON.stringify(predecessorPreview))).toBe("7e69cbb790b249ef40fef152b28dfc2c786d99e30102f0551ebe0fe5ba284ba9");
-    expect({ responseSha256: sha(JSON.stringify(response)), previewSha256: sha(JSON.stringify(preview)) }).toEqual({
-      responseSha256: "3e88e6570ec207cf6f87648a4601a12804b4fb45fcdeb857e41f92c0ccd2119b",
-      previewSha256: "5b2e42a75a0f733cc2a4c84e9b0e7b302b932b875ed0b5393f5091b25a958d5a",
-    });
+    const octoberPreview = { ...preview, models: { ...preview.models,
+      modelConfig: preview.models.modelConfig.slice(0, 44),
+      days: preview.models.days.map((day) => ({ ...day, catalogVersion: "reviewed-model-catalog-2026-10-26.1" })),
+    } };
+    expect(validCachedAdminCommunityAllowancePreview(octoberPreview, preview.generatedAt, NOW_MS)).toBe(true);
+    expect(sha(JSON.stringify(octoberPreview))).toBe("5b2e42a75a0f733cc2a4c84e9b0e7b302b932b875ed0b5393f5091b25a958d5a");
 
     // Content identity excludes only the revision stamp; a restamp keeps it.
     const first = outputs.dailyCandidates[0]!;

@@ -198,6 +198,35 @@ test("Terra performance cohorts agree across runtime and schema without admittin
   }
 });
 
+test("GPT-6.2 schemas preserve the exact model IDs and observed Codex reasoning", () => {
+  const schemas = telemetryPerformanceJsonSchemas();
+  const ajv = new Ajv({ strict: false });
+  ajv.addSchema(schemas["performance-histogram.schema.json"]);
+  const validate = ajv.compile(schemas["performance-record.schema.json"]);
+  const generalEfforts = ["low", "medium", "high", "xhigh", "max", "ultra"];
+  for (const [modelId, efforts] of [
+    ["gpt-6.2-astra", generalEfforts], ["gpt-6.2-sol", generalEfforts], ["gpt-6.2-astra-law", ["high"]],
+  ]) {
+    for (const reasoningEffort of efforts) {
+      const usage = v12Usage({ modelId, reasoningEffort });
+      const performance = performanceRecord({ modelId, reasoningEffort });
+      assert.equal(parseTelemetryV12Record("usage", usage), usage);
+      assert.equal(browser.parseTelemetryV12Record("usage", usage), usage);
+      assert.equal(parseTelemetryPerformanceRecord(performance), performance);
+      assert.equal(browser.parseTelemetryPerformanceRecord(performance), performance);
+      assert.equal(validate(performance), true);
+    }
+    for (const invalid of [
+      performanceRecord({ modelId: `${modelId}-preview` }),
+      performanceRecord({ modelId, provider: "anthropic_claude_code" }),
+    ]) {
+      expectInvalid(invalid, "GPT-6.2 performance boundary");
+      assert.throws(() => browser.parseTelemetryPerformanceRecord(invalid));
+      assert.equal(validate(invalid), false);
+    }
+  }
+});
+
 test("performance validation rejects privacy, version, bounds, and relation violations", () => {
   const extra = performanceRecord();
   extra.extra = 1;

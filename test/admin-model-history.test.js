@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
 import {
   ADMIN_MODEL_CONFIG, ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+  OCTOBER26_ADMIN_MODEL_CONFIG, OCTOBER26_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
   SEPTEMBER29_ADMIN_MODEL_CONFIG, SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
   LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
   projectAdminModelHistoryDay, expandAdminModelHistoryDay,
@@ -261,10 +262,8 @@ test("70 complete catalog days plus the whole preview stay under the storage cei
 });
 
 test("September 29 admin history freezes its 43-model roster before the Terra catalog", () => {
-  assert.equal(ADMIN_MODEL_CONFIG.length, 44);
-  assert.equal(ADMIN_MODEL_HISTORY_CATALOG_VERSION, "reviewed-model-catalog-2026-10-26.1");
   assert.equal(SEPTEMBER29_ADMIN_MODEL_CONFIG.length, 43);
-  assert.deepEqual(SEPTEMBER29_ADMIN_MODEL_CONFIG, ADMIN_MODEL_CONFIG.slice(0, -1));
+  assert.deepEqual(SEPTEMBER29_ADMIN_MODEL_CONFIG, OCTOBER26_ADMIN_MODEL_CONFIG.slice(0, -1));
   assert.equal(SEPTEMBER29_ADMIN_MODEL_CONFIG.some(({ modelId }) => modelId === "gpt-6.1-terra"), false);
   assert.equal(new Set(SEPTEMBER29_ADMIN_MODEL_CONFIG.map(model => model.modelId)).size, 43);
   const wire = { ...current(), catalogVersion: SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
@@ -297,5 +296,31 @@ test("September 29 admin history freezes its 43-model roster before the Terra ca
   ]) {
     assert.equal(projectAdminModelHistoryDay(invalid), null);
     assert.equal(browser.projectAdminModelHistoryDay(invalid), null);
+  }
+});
+
+test("October 26 admin history preserves the 44-model Terra publication before GPT-6.2", () => {
+  assert.equal(OCTOBER26_ADMIN_MODEL_CONFIG.length, 44);
+  assert.equal(OCTOBER26_ADMIN_MODEL_HISTORY_CATALOG_VERSION, "reviewed-model-catalog-2026-10-26.1");
+  assert.deepEqual(OCTOBER26_ADMIN_MODEL_CONFIG, ADMIN_MODEL_CONFIG.slice(0, -3));
+  assert.deepEqual(browser.OCTOBER26_ADMIN_MODEL_CONFIG, OCTOBER26_ADMIN_MODEL_CONFIG);
+  assert.equal(ADMIN_MODEL_CONFIG.length, 47);
+  assert.equal(ADMIN_MODEL_HISTORY_CATALOG_VERSION, "reviewed-model-catalog-2026-11-17.1");
+  const october = { ...current(), catalogVersion: OCTOBER26_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+    values: [["gpt-6.1-terra", 500, 1]] };
+  const old = expandAdminModelHistoryDay(october);
+  assert.deepEqual(Object.keys(old.byModel), OCTOBER26_ADMIN_MODEL_CONFIG.map(({ modelId }) => modelId));
+  assert.deepEqual(old.byModel["gpt-6.1-terra"], { capacityUsd: 500, participantCount: 1 });
+  assert.deepEqual(old.byModel["gpt-6.1-sol"], { capacityUsd: null, participantCount: 0 });
+  assert.deepEqual(browser.expandAdminModelHistoryDay(october), old);
+  const fresh = { ...current(), values: [["gpt-6.2-astra", 600, 2], ["gpt-6.2-sol", 800, 1], ["gpt-6.2-astra-law", 400, 1]] };
+  const expanded = expandAdminModelHistoryDay(fresh);
+  assert.deepEqual(expanded.byModel["gpt-6.2-astra"], { capacityUsd: 600, participantCount: 2 });
+  assert.deepEqual(expanded.byModel["gpt-6.2-sol"], { capacityUsd: 800, participantCount: 1 });
+  assert.deepEqual(expanded.byModel["gpt-6.2-astra-law"], { capacityUsd: 400, participantCount: 1 });
+  assert.deepEqual(browser.expandAdminModelHistoryDay(fresh), expanded);
+  for (const value of fresh.values) {
+    assert.equal(projectAdminModelHistoryDay({ ...october, values: [value] }), null);
+    assert.equal(browser.projectAdminModelHistoryDay({ ...october, values: [value] }), null);
   }
 });
