@@ -570,16 +570,19 @@ const SEPTEMBER29_MODEL_CONFIG = Object.freeze([
   { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", family: "luna", order: 6 },
 ]);
 
-// Current presentation is literal, never derived from the route's builder.
+// Keep a literal current roster as an independent response oracle.
+// Astra for Law is eligible only when a published day contains its estimate.
 const CURRENT_MODEL_CONFIG = Object.freeze([
-  { id: "gpt-6-astra", label: "GPT-6 Astra", family: "astra", order: 0 },
-  { id: "gpt-6.1-sol", label: "GPT-6.1 Sol", family: "sol", order: 1 },
-  { id: "gpt-6-sol", label: "GPT-6 Sol", family: "sol", order: 2 },
-  { id: "gpt-6-luna", label: "GPT-6 Luna", family: "luna", order: 3 },
-  { id: "gpt-6.1-terra", label: "GPT-6.1 Terra", family: "terra", order: 4 },
-  { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", family: "terra", order: 5 },
-  { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", family: "sol", order: 6 },
-  { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", family: "luna", order: 7 },
+  { id: "gpt-6.2-astra", label: "GPT-6.2 Astra", family: "astra", order: 0 },
+  { id: "gpt-6.2-sol", label: "GPT-6.2 Sol", family: "sol", order: 1 },
+  { id: "gpt-6-astra", label: "GPT-6 Astra", family: "astra", order: 2 },
+  { id: "gpt-6.1-sol", label: "GPT-6.1 Sol", family: "sol", order: 3 },
+  { id: "gpt-6-sol", label: "GPT-6 Sol", family: "sol", order: 4 },
+  { id: "gpt-6-luna", label: "GPT-6 Luna", family: "luna", order: 5 },
+  { id: "gpt-6.1-terra", label: "GPT-6.1 Terra", family: "terra", order: 6 },
+  { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", family: "terra", order: 7 },
+  { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", family: "sol", order: 8 },
+  { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", family: "luna", order: 9 },
 ]);
 
 /** Hand-derived retained Pro 10x contract; the legacy expected HTTP bytes stay frozen. */
