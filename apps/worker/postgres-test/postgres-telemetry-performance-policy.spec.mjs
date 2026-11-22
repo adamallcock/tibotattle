@@ -1,7 +1,7 @@
 // PostgreSQL 17 spec for src/postgres-telemetry-performance-policy.ts: the
 // accountless performance grant (v1 and v2 bodies), per-device dictionary
 // resolution, the storage gate and the capability read, on the promoted
-// primary chain (applyPostgresMigrations ends at 0079).
+// primary chain (applyPostgresMigrations ends at 0080).
 //
 // Fixtures come from postgres-test/fixtures/performance-telemetry.mjs and are
 // synthetic and content-free. Each test drops only the schemas this file
@@ -96,7 +96,8 @@ async function newSchemaName(label) {
 async function promotedSchema(label) {
   const schema = await newSchemaName(label);
   const applied = await applyPostgresMigrations({ role: "primary", schema, pool });
-  assert.equal(applied.migrations.at(-1)?.name, PERFORMANCE_MIGRATION_NAME);
+  assert.equal(applied.migrations.at(-2)?.name, PERFORMANCE_MIGRATION_NAME);
+  assert.equal(applied.migrations.at(-1)?.name, "0080_analytics_v2_current_correction.sql");
   return schema;
 }
 

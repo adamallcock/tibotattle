@@ -3,7 +3,7 @@
 // (primary 0079_performance_telemetry.sql).
 //
 // Every schema is built through the production runner on the promoted
-// primary chain (applyPostgresMigrations), which ends at 0079; the
+// primary chain (applyPostgresMigrations), which ends at 0080; the
 // pre-migration case uses promoted-migration-prefix.mjs applyMigrationsBefore.
 // Fixtures are synthetic and content-free (a constant commit, random UUID
 // keys, a constant synthetic owner identity). Each test drops only the
@@ -117,7 +117,8 @@ async function newSchemaName(label) {
 async function promotedSchema(label) {
   const schema = await newSchemaName(label);
   const applied = await applyPostgresMigrations({ role: "primary", schema, pool });
-  assert.equal(applied.migrations.at(-1)?.name, PERFORMANCE_MIGRATION_NAME);
+  assert.equal(applied.migrations.at(-2)?.name, PERFORMANCE_MIGRATION_NAME);
+  assert.equal(applied.migrations.at(-1)?.name, "0080_analytics_v2_current_correction.sql");
   await setControls(schema, { uploadRegistration: true, processing: true });
   return schema;
 }
@@ -280,7 +281,8 @@ test("the manifest digest is the migrate receipt's historySha256 over the image'
   assert.deepEqual(expected.map(({ version, name, sha256 }) => ({ version, name, sha256 })),
     promoted.map(({ version, name, sha256 }) => ({ version, name, sha256 })),
     "the image manifest equals the files the migrate job applies");
-  assert.equal(expected.at(-1).name, PERFORMANCE_MIGRATION_NAME);
+  assert.equal(expected.at(-2).name, PERFORMANCE_MIGRATION_NAME);
+  assert.equal(expected.at(-1).name, "0080_analytics_v2_current_correction.sql");
   const digest = await activation.postgresRuntimeMigrationHistorySha256(expected);
   assert.match(digest, /^[0-9a-f]{64}$/u);
   assert.equal(digest, receiptHistorySha256(promoted));

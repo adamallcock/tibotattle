@@ -691,9 +691,9 @@ local, aggregate-only statement timings at synthetic scale; it is evidence, not
 a gate. Migration, image rollout and installed-client acceptance remain separate
 operational gates.
 
-## GCP primary migrations 0077 to 0079
+## GCP primary migrations 0077 to 0080
 
-The PostgreSQL primary chain continues after `0076` with three forward-only,
+The PostgreSQL primary chain continues after `0076` with four forward-only,
 additive migrations. Each is source until an owner-authorized migrate and roll
 applies it.
 
@@ -706,6 +706,13 @@ applies it.
   model-performance intake and adds its community publication heads (owner
   decisions of 2026-10-10). Its number is provisional; the integrator
   renumbers it with its pin set if the live head already holds 0079 or higher.
+- `0080` adds a closed current-source correction receipt and input provenance
+  to the existing repricing ledger/archive. The explicit `current-owner-day`
+  mode verifies retained inputs and unchanged non-spend history, then appends
+  contribution versions for the saved cohort. It does not reconstruct an old
+  input association or create equivalence proofs. Migration, deployment and
+  public spend readback remain separate gates
+  ([correction contract](../../docs/runbooks/2026-10-09-historical-spend-repricing.md#current-source-correction)).
 
 ## Community model speed on the GCP origin
 

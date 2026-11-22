@@ -34,6 +34,71 @@ test("inclusive effective-to dates and both context threshold conventions are ca
   }
 });
 
+test("the live Job pricer uses the reviewed GPT-6.2 cards and exact Ultrafast cutoff", () => {
+  const reference = oracle.module.priceTelemetryUsageEvent;
+  const pricer = fast.module.createFastTelemetryUsagePricer();
+  const components = { ...ordinaryEvent().components, inputUncachedTokens: 100_000,
+    inputCacheReadTokens: 100_000, inputCacheWriteTokens: 72_000,
+    outputTextTokens: 40_000, outputReasoningTokens: 60_000, outputCombinedTokens: 100_000 };
+  const standard = { billingSurface: "openai_api", apiServiceTier: "standard",
+    eventTime: "2026-11-17T00:00:00.000Z", totalInputContextTokens: 272_000, components };
+  for (const [modelId, short, long, batch, priority, promo, list] of [
+    ["gpt-6.2-astra", "5.56", "9.120016", "2.78", "11.12", "16.68", "33.36"],
+    ["gpt-6.2-sol", "1.39", "2.280004", "0.695", "2.78", "4.17", "8.34"],
+  ]) {
+    for (const [override, expected] of [
+      [{}, short],
+      [{ totalInputContextTokens: 272_001, components: { ...components, inputUncachedTokens: 100_001 } }, long],
+      [{ apiServiceTier: "batch" }, batch],
+      [{ apiServiceTier: "priority" }, priority],
+      [{ apiServiceTier: "ultrafast", eventTime: "2027-03-01T08:00:00.000Z" }, list],
+      [{ apiServiceTier: "ultrafast", eventTime: "2027-03-01T07:59:59.999Z" }, promo],
+      [{ billingSurface: "chatgpt_subscription", apiServiceTier: "unknown",
+        speedMode: "ultrafast", eventTime: "2027-03-01T08:00:00.001Z" }, list],
+    ]) {
+      const event = ordinaryEvent({ ...standard, modelId, ...override });
+      assertSame(reference, pricer, event, modelId + "/" + event.apiServiceTier);
+      const result = pricer(event);
+      assert.equal(result.coverageStatus, "fully_priced");
+      assert.equal(result.exactCostUsd, expected);
+      assert.deepEqual(result.unpricedReasonCodes, []);
+      assert.equal(result.selectedPriceCardIds.length, 1);
+      assert.equal(result.registryVersion, "app-official-api-prices-v0.11");
+    }
+  }
+
+  const law = ordinaryEvent({ ...standard, modelId: "gpt-6.2-astra-law", eventTime: "2026-12-31T23:59:59.999Z" });
+  assertSame(reference, pricer, law, "Law Standard");
+  assert.equal(pricer(law).exactCostUsd, "5.56");
+  const olderSol = ordinaryEvent({
+    ...standard, modelId: "gpt-6.1-sol", apiServiceTier: "ultrafast", eventTime: "2026-10-08T00:00:00.000Z",
+  });
+  assertSame(reference, pricer, olderSol, "Sol 6.1 Ultrafast launch");
+  assert.equal(pricer(olderSol).exactCostUsd, "8.34");
+  const zero = Object.fromEntries(COMPONENT_KEYS.map((key) => [key, 0]));
+  for (const [override, reason] of [
+    [{ modelId: "gpt-6.2-astra", eventTime: "2026-11-16T23:59:59.999Z" }, "historical_price_missing"],
+    [{ modelId: "gpt-6.2-sol", apiServiceTier: "flex" }, "service_tier_exact_card_missing"],
+    [{ modelId: "gpt-6.2-astra-law", eventTime: "2027-01-01T00:00:00.000Z" }, "historical_price_missing"],
+    [{ modelId: "gpt-6.2-astra-law", apiServiceTier: "priority" }, "service_tier_exact_card_missing"],
+    [{ modelId: "gpt-6.2-astra-law", billingSurface: "chatgpt_subscription",
+      speedMode: "fast", apiServiceTier: "unknown" }, "api_service_tier_unavailable"],
+    [{ ...olderSol, eventTime: "2026-10-07T23:59:59.999Z" }, "service_tier_exact_card_missing"],
+    [{ modelId: "gpt-6.1-astra", modelRecognition: "unknown" }, "unknown_model"],
+  ]) {
+    for (const quantities of [components, zero]) {
+      const event = ordinaryEvent({ ...standard, ...override, components: quantities });
+      assertSame(reference, pricer, event, event.modelId + "/" + reason);
+      const result = pricer(event);
+      assert.equal(result.coverageStatus, "unpriced");
+      assert.equal(result.exactCostUsd, "0");
+      assert.deepEqual(result.selectedPriceCardIds, []);
+      assert.ok(result.unpricedReasonCodes.includes(reason), result.unpricedReasonCodes.join(","));
+      if (reason !== "unknown_model") assert.ok(!result.unpricedReasonCodes.includes("unknown_model"));
+    }
+  }
+});
+
 test("partial observations, split writes, duplicate aliases and large/invalid quantities retain reasons and errors", () => {
   for (const provider of ["openai_codex", "anthropic_claude_code", "unknown"]) {
     const modelId = provider === "anthropic_claude_code" ? "claude-fable-5" : "gpt-5.5";

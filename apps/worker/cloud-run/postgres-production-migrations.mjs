@@ -289,6 +289,11 @@ export const CONTRACT_MIGRATIONS = Object.freeze({
     operations: Object.freeze(["drop"]),
     reason: "drops only 0022's release observed_at foreign key to the completed distribution manifest; the maintained source writes retained releases and assets before inserting that manifest last, and all dashboard readers select dates through completed manifests. No rows, primary keys or asset-to-release foreign key change. A previous revision behind the exact-history receipt fence refuses storage-gated routes after migration until the matching image rolls",
   }),
+  "0080_analytics_v2_current_correction.sql": Object.freeze({
+    sha256: "127665f492340ad44d36519eeedadec46d0fb76f3003d4099413845a2a7ece87",
+    operations: Object.freeze(["drop", "add-constraint"]),
+    reason: "replaces 0077's reprice receipt check with disjoint saved-snapshot and current-owner-day contracts; the new input_source defaults to saved-snapshot and source_kernel_id stays NULL for every existing row and earlier writer, preserving v1 receipt semantics. The nullable correction_provenance column leaves existing immutable contribution inputs unchanged, while new provenance must match the preceding contribution version and retained input digest. Invalid rows abort the migration atomically; no saved contribution, association or price is rewritten. A previous revision behind the exact-history receipt fence refuses storage-gated routes after migration until the matching image rolls",
+  }),
 });
 
 const EXECUTION_PATTERN = /^[a-z][a-z0-9-]{0,62}$/u;

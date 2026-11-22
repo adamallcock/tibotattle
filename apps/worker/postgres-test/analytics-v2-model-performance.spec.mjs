@@ -7,7 +7,7 @@
  * the fold (src/analytics-v2/compute-performance.ts) after computeAnalyticsV2
  * returns, and publishes through the store (store-publication.ts).
  *
- * It proves, on the promoted primary chain (0001-0079) with the shared SPD-G1
+ * It proves, on the promoted primary chain (0001-0080) with the shared SPD-G1
  * fixtures (postgres-test/fixtures/performance-telemetry.mjs):
  * - an empty corpus, or one with no included record (excluded, unknown-mode
  *   or after the publication's end), writes no head (deferred empty first
@@ -79,7 +79,8 @@ const SLOTS = PERFORMANCE_PUBLICATION_PERIODS.flatMap((period) =>
 const HEADS = "analytics_v2_published_performance";
 const UNREVIEWED_MODEL = "synthetic-unreviewed-model";
 // Fixture rows are stamped ten days before the Job's clock, inside their leases.
-const SEEDED_AT_MS = NOW_MS - 10 * 86_400_000;
+const DAY_MS = 86_400_000;
+const SEEDED_AT_MS = NOW_MS - 10 * DAY_MS;
 
 let vite;
 let store;
@@ -222,7 +223,8 @@ async function promotedSchema() {
   schemas.push(schema);
   await pool.query(`CREATE SCHEMA "${schema}"`);
   const applied = await applyPostgresMigrations({ role: "primary", schema, pool });
-  assert.equal(applied.migrations.at(-1)?.name, PERFORMANCE_MIGRATION_NAME, "the promoted chain ends at 0079");
+  assert.equal(applied.migrations.at(-2)?.name, PERFORMANCE_MIGRATION_NAME, "0079 remains in the promoted prefix");
+  assert.equal(applied.migrations.at(-1)?.name, "0080_analytics_v2_current_correction.sql", "the promoted chain ends at 0080");
   await activatePerformanceRuntime(pool, { schema, nowEpoch: SEEDED_AT_MS });
   return schema;
 }
@@ -295,8 +297,12 @@ function runJob(schema, pipeline) {
 
 /** One accountless owner with a current 2026-09-29.1 grant (fixture rows stamped before the Job's clock). */
 async function contributor(schema) {
-  const owner = await seedPerformanceAccountlessOwner(pool, { schema, issuedAtEpoch: SEEDED_AT_MS - 86_400_000,
-    leaseMs: 60 * 86_400_000 });
+  const issuedAtEpoch = SEEDED_AT_MS - DAY_MS;
+  // Admission and report inserts check PostgreSQL's current clock. Keep the
+  // historical issue time and extend the shared expiry when that clock advances.
+  const { rows: [{ now: databaseNow }] } = await pool.query("SELECT now() AS now");
+  const leaseMs = Math.max(60 * DAY_MS, databaseNow.getTime() + DAY_MS - issuedAtEpoch);
+  const owner = await seedPerformanceAccountlessOwner(pool, { schema, issuedAtEpoch, leaseMs });
   const grant = await insertPerformanceGrant(pool, { schema, owner, fieldDictionaryVersion: PERFORMANCE_DICTIONARY_2026_09_29,
     dictionaryBasis: "v12_parser_inference", nowEpoch: SEEDED_AT_MS });
   return { owner, grant };

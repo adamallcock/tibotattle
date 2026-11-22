@@ -18,6 +18,11 @@
  *                   --mode=execute, waits and validates the execution
  *                   receipt the same way.
  *
+ * Explicit --input-source=current-owner-day --source-kernel=<id> selects
+ * new-contribution correction. It uses source-bound v2 carrier/operator
+ * receipts and current-correction-<mode>:<env>:<sourceKernel>:<commit or hash>
+ * authorization. The legacy v1 default and its authorization stay unchanged.
+ *
  * Both modes take --environment, --commit (the deployed source commit the
  * Job must report), --expected-kernel (a kernel id registered in this
  * checkout's kernel-registry.json; the receipt must name it), the three
@@ -52,6 +57,8 @@ import { lstat, readFile, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  ANALYTICS_CURRENT_CORRECTION_INPUT_SOURCE,
+  ANALYTICS_CURRENT_CORRECTION_RECEIPT_VERSION,
   ANALYTICS_REPRICE_LIMITS,
   ANALYTICS_REPRICE_RECEIPT_VERSION,
   parseAnalyticsRepriceArguments,
@@ -67,10 +74,12 @@ export const REPOSITORY_ROOT = resolve(WORKER_ROOT, "../..");
 export const REPRICE_MODES = Object.freeze(["plan", "execute"]);
 export const REPRICE_ENVIRONMENTS = Object.freeze(["production", "staging"]);
 export const REPRICE_RECEIPT_SCHEMA = "tibotattle-gcp-analytics-reprice-v1";
+export const CURRENT_CORRECTION_RECEIPT_SCHEMA = "tibotattle-gcp-analytics-reprice-v2";
 export const REPRICE_RECEIPT_KEYS = Object.freeze([
   "schema", "mode", "outcome", "environment", "project", "region", "job", "execution", "commit", "imageDigest",
   "kernel", "bounds", "planSha256", "runId", "result", "failure", "completedAt", "digestSha256",
 ]);
+export const CURRENT_CORRECTION_RECEIPT_KEYS = Object.freeze([...REPRICE_RECEIPT_KEYS, "inputSource", "sourceKernelId"]);
 export const REPRICE_TARGET_KEYS = Object.freeze([
   "environment", "project", "region", "job", "refreshJob", "migrationJob", "imageRepository", "entry",
 ]);
@@ -88,13 +97,13 @@ const FLAGS = Object.freeze({
   plan: Object.freeze({
     required: ["--environment", "--mode", "--commit", "--expected-kernel", "--from-day", "--through-day",
       "--max-days", "--max-members", "--max-input-bytes", "--receipt-out"],
-    optional: ["--authorize"],
+    optional: ["--authorize", "--input-source", "--source-kernel"],
   }),
   execute: Object.freeze({
     required: ["--environment", "--mode", "--commit", "--expected-kernel", "--from-day", "--through-day",
       "--max-days", "--max-members", "--max-input-bytes", "--receipt-out", "--plan-receipt",
       "--expected-plan-sha256", "--run-id"],
-    optional: ["--authorize"],
+    optional: ["--authorize", "--input-source", "--source-kernel"],
   }),
 });
 const COMMIT = /^[0-9a-f]{40}$/u;
@@ -213,10 +222,13 @@ function readFlags(argv) {
  * production-shaped target (which refuses --schema and --now), before any
  * remote call. gcloud's --args list is comma-separated, so none may hold one.
  */
-export function repriceJobArguments({ mode, bounds, runId = null, expectedPlanSha256 = null }) {
+export function repriceJobArguments({ mode, bounds, runId = null, expectedPlanSha256 = null,
+  inputSource, sourceKernelId }) {
   const cli = [
     `--mode=${mode}`, `--from-day=${bounds.fromDay}`, `--through-day=${bounds.throughDay}`,
     `--max-days=${bounds.maxDays}`, `--max-members=${bounds.maxMembers}`, `--max-input-bytes=${bounds.maxInputBytes}`,
+    ...(inputSource === undefined && sourceKernelId === undefined ? []
+      : [`--input-source=${inputSource}`, `--source-kernel=${sourceKernelId}`]),
     ...(mode === "execute" ? [`--run-id=${runId}`, `--expected-plan-sha256=${expectedPlanSha256}`] : []),
   ];
   try {
@@ -256,6 +268,14 @@ export function parseRepriceArguments(argv) {
   if (!COMMIT.test(commit)) fail("REPRICE_COMMIT_INVALID");
   if (!KERNEL_ID.test(values.get("--expected-kernel"))) fail("REPRICE_KERNEL_INVALID");
   const expectedKernel = Number(values.get("--expected-kernel"));
+  const inputSource = values.get("--input-source");
+  const sourceKernelText = values.get("--source-kernel");
+  let sourceKernelId;
+  if (inputSource !== undefined || sourceKernelText !== undefined) {
+    if (inputSource !== ANALYTICS_CURRENT_CORRECTION_INPUT_SOURCE) fail("REPRICE_SOURCE_INVALID");
+    sourceKernelId = positive(sourceKernelText, 32767, "REPRICE_SOURCE_INVALID");
+    if (sourceKernelId > expectedKernel) fail("REPRICE_SOURCE_INVALID");
+  }
   const fromDay = values.get("--from-day");
   const throughDay = values.get("--through-day");
   if (!calendarDay(fromDay) || !calendarDay(throughDay) || fromDay > throughDay) fail("REPRICE_BOUNDS_INVALID");
@@ -274,11 +294,14 @@ export function parseRepriceArguments(argv) {
   const runId = values.get("--run-id") ?? null;
   if (runId !== null && !UUID.test(runId)) fail("REPRICE_RUN_ID_INVALID");
   const authorize = values.get("--authorize") ?? null;
-  const expected = `reprice-${mode}:${environment}:${mode === "plan" ? commit : expectedPlanSha256}`;
+  const expected = inputSource === undefined
+    ? `reprice-${mode}:${environment}:${mode === "plan" ? commit : expectedPlanSha256}`
+    : `current-correction-${mode}:${environment}:${sourceKernelId}:${mode === "plan" ? commit : expectedPlanSha256}`;
   if (authorize !== null && authorize !== expected) fail("REPRICE_AUTHORIZATION_MISMATCH");
   if (execute && authorize === null) fail("REPRICE_AUTHORIZATION_REQUIRED");
   const parsed = {
     mode, environment, commit, expectedKernel, bounds, execute,
+    ...(inputSource === undefined ? {} : { inputSource, sourceKernelId }),
     receiptOut: values.get("--receipt-out"),
     planReceipt: values.get("--plan-receipt") ?? null,
     expectedPlanSha256,
@@ -356,18 +379,23 @@ async function defaultReadKernelRegistry() {
  * reviewed plan hash. A failed receipt yields only its closed code and phase.
  */
 export function validateJobReceipt(receipt, { mode, environment, bounds, kernel, expectedPlanSha256 = null,
-  manifestVersion = null }) {
-  if (!isRecord(receipt) || receipt.schemaVersion !== ANALYTICS_REPRICE_RECEIPT_VERSION) fail("REPRICE_RECEIPT_INVALID");
+  manifestVersion = null, inputSource, sourceKernelId }) {
+  const correction = inputSource !== undefined || sourceKernelId !== undefined;
+  const sourceKeys = correction ? ["inputSource", "sourceKernelId"] : [];
+  if (!isRecord(receipt) || receipt.schemaVersion !== (correction
+    ? ANALYTICS_CURRENT_CORRECTION_RECEIPT_VERSION : ANALYTICS_REPRICE_RECEIPT_VERSION)
+    || (correction && (!validCorrectionSource({ inputSource, sourceKernelId })
+      || receipt.inputSource !== inputSource || receipt.sourceKernelId !== sourceKernelId))) fail("REPRICE_RECEIPT_INVALID");
   if (receipt.status === "failed") {
     const keys = Object.hasOwn(receipt, "phase") ? ["schemaVersion", "status", "code", "phase"]
       : ["schemaVersion", "status", "code"];
-    if (!hasExactKeys(receipt, keys) || typeof receipt.code !== "string" || !JOB_CODE.test(receipt.code)
+    if (!hasExactKeys(receipt, [...keys, ...sourceKeys]) || typeof receipt.code !== "string" || !JOB_CODE.test(receipt.code)
         || (Object.hasOwn(receipt, "phase") && !JOB_PHASES.includes(receipt.phase))) {
       fail("REPRICE_RECEIPT_INVALID");
     }
     return deepFreeze({ status: "failed", code: receipt.code, phase: receipt.phase ?? null });
   }
-  if (!hasExactKeys(receipt, ["schemaVersion", "status", "mode", "target", "now", "clock", "kernel", "result"])
+  if (!hasExactKeys(receipt, ["schemaVersion", "status", "mode", "target", "now", "clock", "kernel", "result", ...sourceKeys])
       || receipt.status !== "ok" || receipt.mode !== mode || receipt.target !== environment
       || receipt.clock !== "wall" || typeof receipt.now !== "string" || !ISO_INSTANT.test(receipt.now)
       || !Number.isFinite(Date.parse(receipt.now))
@@ -391,6 +419,7 @@ export function validateJobReceipt(receipt, { mode, environment, bounds, kernel,
         manifestVersion: receipt.kernel.manifestVersion },
       pricingMethodVersion,
       expectedPlanSha256,
+      ...(correction ? { inputSource, sourceKernelId } : {}),
     });
   } catch {
     fail("REPRICE_RECEIPT_INVALID");
@@ -404,6 +433,25 @@ function receiptBody(receipt) {
   return body;
 }
 
+function validCorrectionSource(value) {
+  return value?.inputSource === ANALYTICS_CURRENT_CORRECTION_INPUT_SOURCE
+    && Number.isSafeInteger(value.sourceKernelId) && value.sourceKernelId > 0 && value.sourceKernelId <= 32767;
+}
+
+function correctionFields(value) {
+  return value.inputSource === undefined ? {} : { inputSource: value.inputSource, sourceKernelId: value.sourceKernelId };
+}
+
+function jobReceiptVersion(value) {
+  return value.inputSource === undefined ? ANALYTICS_REPRICE_RECEIPT_VERSION : ANALYTICS_CURRENT_CORRECTION_RECEIPT_VERSION;
+}
+
+function assertCorrectionCatalog(registry, sourceKernelId, targetKernel) {
+  if (registeredKernel(registry, sourceKernelId).priceRegistrySha256 !== targetKernel.priceRegistrySha256) {
+    fail("REPRICE_SOURCE_CATALOG_MISMATCH");
+  }
+}
+
 /** Seal a verb receipt: its digest is the sha256 of the canonical JSON of every other field. */
 export function sealRepriceReceipt(body) {
   return deepFreeze({ ...body, digestSha256: sha256(canonicalJson(body)) });
@@ -415,8 +463,10 @@ export function sealRepriceReceipt(body) {
  * against its own bounds, kernel and the registered price registry.
  */
 export function verifyRepriceReceipt(receipt, { registry }) {
-  const ok = hasExactKeys(receipt, REPRICE_RECEIPT_KEYS)
-    && receipt.schema === REPRICE_RECEIPT_SCHEMA
+  const correction = receipt?.schema === CURRENT_CORRECTION_RECEIPT_SCHEMA;
+  const ok = hasExactKeys(receipt, correction ? CURRENT_CORRECTION_RECEIPT_KEYS : REPRICE_RECEIPT_KEYS)
+    && receipt.schema === (correction ? CURRENT_CORRECTION_RECEIPT_SCHEMA : REPRICE_RECEIPT_SCHEMA)
+    && (!correction || validCorrectionSource(receipt))
     && REPRICE_MODES.includes(receipt.mode)
     && ["ok", "failed"].includes(receipt.outcome)
     && REPRICE_ENVIRONMENTS.includes(receipt.environment)
@@ -428,6 +478,7 @@ export function verifyRepriceReceipt(receipt, { registry }) {
     && typeof receipt.completedAt === "string" && ISO_INSTANT.test(receipt.completedAt)
     && receipt.digestSha256 === sha256(canonicalJson(receiptBody(receipt)));
   if (!ok) fail("REPRICE_RECEIPT_FILE_INVALID");
+  if (correction) registeredKernel(registry, receipt.sourceKernelId);
   if (receipt.outcome === "failed") {
     if (receipt.result !== null || receipt.kernel !== null
         || !hasExactKeys(receipt.failure, ["code", "phase"]) || !JOB_CODE.test(receipt.failure.code ?? "")
@@ -440,6 +491,7 @@ export function verifyRepriceReceipt(receipt, { registry }) {
     fail("REPRICE_RECEIPT_FILE_INVALID");
   }
   const kernel = registeredKernel(registry, receipt.kernel.kernelId);
+  if (correction) assertCorrectionCatalog(registry, receipt.sourceKernelId, kernel);
   let result;
   try {
     result = validateAnalyticsRepriceResult(receipt.result, {
@@ -448,6 +500,7 @@ export function verifyRepriceReceipt(receipt, { registry }) {
       stamp: { kernel, manifestVersion: receipt.kernel.manifestVersion },
       pricingMethodVersion: receipt.mode === "plan" ? receipt.result?.target?.pricingMethodVersion : null,
       expectedPlanSha256: receipt.planSha256,
+      ...correctionFields(receipt),
     });
   } catch {
     fail("REPRICE_RECEIPT_FILE_INVALID");
@@ -473,6 +526,9 @@ async function readPlanReceipt(path, registry) {
  */
 export function assertMatchingPlan(plan, { args, target, nowMs }) {
   if (plan.mode !== "plan" || plan.outcome !== "ok") fail("REPRICE_PLAN_RECEIPT_MISMATCH");
+  if (plan.inputSource !== args.inputSource || plan.sourceKernelId !== args.sourceKernelId) {
+    fail("REPRICE_PLAN_SOURCE_MISMATCH");
+  }
   if (plan.environment !== args.environment || plan.project !== target.project || plan.region !== target.region
       || plan.job !== target.job || plan.commit !== args.commit) {
     fail("REPRICE_PLAN_RECEIPT_MISMATCH");
@@ -510,10 +566,10 @@ export const REPRICE_ARGV = Object.freeze({
     "--async", ...scope(target), "--format=json"],
   executionDescribe: (target, execution) => ["gcloud", "run", "jobs", "executions", "describe", execution,
     ...scope(target), "--format=json"],
-  receiptLog: (target, execution) => ["gcloud", "logging", "read",
+  receiptLog: (target, execution, version = ANALYTICS_REPRICE_RECEIPT_VERSION) => ["gcloud", "logging", "read",
     `resource.type="cloud_run_job" AND resource.labels.job_name="${target.job}"`
       + ` AND labels."run.googleapis.com/execution_name"="${execution}"`
-      + ` AND jsonPayload.schemaVersion="${ANALYTICS_REPRICE_RECEIPT_VERSION}"`,
+      + ` AND jsonPayload.schemaVersion="${version}"`,
     `--project=${target.project}`, "--format=json", "--limit=10", "--freshness=1d"],
 });
 
@@ -593,12 +649,12 @@ async function awaitExecution(context, target, name) {
 }
 
 /** Exactly one receipt line for this execution, read again boundedly while none has been ingested. */
-async function readJobReceipt(context, target, name) {
+async function readJobReceipt(context, target, name, version) {
   for (let attempt = 0; attempt < RECEIPT_READ_ATTEMPTS; attempt += 1) {
-    const entries = parseJson(runChecked(context, REPRICE_ARGV.receiptLog(target, name),
+    const entries = parseJson(runChecked(context, REPRICE_ARGV.receiptLog(target, name, version),
       "REPRICE_RECEIPT_UNAVAILABLE"), "REPRICE_RECEIPT_UNAVAILABLE");
     if (!Array.isArray(entries)) fail("REPRICE_RECEIPT_UNAVAILABLE");
-    const receipts = entries.filter((entry) => entry?.jsonPayload?.schemaVersion === ANALYTICS_REPRICE_RECEIPT_VERSION
+    const receipts = entries.filter((entry) => entry?.jsonPayload?.schemaVersion === version
       && entry?.labels?.["run.googleapis.com/execution_name"] === name
       && entry?.resource?.labels?.job_name === target.job);
     if (receipts.length > 1) fail("REPRICE_RECEIPT_AMBIGUOUS");
@@ -642,6 +698,7 @@ function summary(receipt) {
     kernel: receipt.kernel,
     planSha256: receipt.planSha256,
     runId: receipt.runId,
+    ...correctionFields(receipt),
     ...(receipt.result === null ? {} : receipt.mode === "plan"
       ? { counts: receipt.result.counts, caps: receipt.result.caps,
         executable: !Object.values(receipt.result.caps).some(Boolean) && receipt.result.counts.heads > 0 }
@@ -680,6 +737,7 @@ export async function runAnalyticsRepriceVerb(argv, dependencies = {}) {
   target = validateRepriceTarget(target, args.environment);
   const registry = await (dependencies.readKernelRegistry ?? defaultReadKernelRegistry)();
   const kernel = registeredKernel(registry, args.expectedKernel);
+  if (args.inputSource !== undefined) assertCorrectionCatalog(registry, args.sourceKernelId, kernel);
   const plan = args.mode === "execute" ? await readPlanReceipt(args.planReceipt, registry) : null;
   if (plan !== null) assertMatchingPlan(plan, { args, target, nowMs: context.now() });
   if ((await lstat(args.receiptOut).catch(() => null)) !== null) fail("REPRICE_RECEIPT_EXISTS");
@@ -693,6 +751,7 @@ export async function runAnalyticsRepriceVerb(argv, dependencies = {}) {
       commit: args.commit,
       kernel: { kernelId: kernel.kernelId },
       bounds: args.bounds,
+      ...correctionFields(args),
       ...(plan === null ? {} : { planSha256: plan.planSha256, imageDigest: plan.imageDigest, runId: args.runId }),
       lockRef: deploymentLockRef(args.environment),
       steps: [
@@ -700,7 +759,7 @@ export async function runAnalyticsRepriceVerb(argv, dependencies = {}) {
         ...[target.job, target.refreshJob, target.migrationJob].map((job) => REPRICE_ARGV.executionsList(target, job)),
         REPRICE_ARGV.jobExecute(target, jobArgs),
         REPRICE_ARGV.executionDescribe(target, "<execution>"),
-        REPRICE_ARGV.receiptLog(target, "<execution>"),
+        REPRICE_ARGV.receiptLog(target, "<execution>", jobReceiptVersion(args)),
       ].map((step) => ({ argv: step })),
     });
   }
@@ -715,13 +774,15 @@ export async function runAnalyticsRepriceVerb(argv, dependencies = {}) {
       "REPRICE_EXECUTION_FAILED");
     const execution = executionName(started, target);
     const outcome = await awaitExecution(context, target, execution);
-    const receipt = validateJobReceipt(await readJobReceipt(context, target, execution), {
+    const receipt = validateJobReceipt(await readJobReceipt(context, target, execution, jobReceiptVersion(args)), {
       mode: args.mode, environment: args.environment, bounds: args.bounds, kernel,
       expectedPlanSha256: args.expectedPlanSha256, manifestVersion: plan?.kernel.manifestVersion ?? null,
+      ...correctionFields(args),
     });
     if ((outcome === "succeeded") !== (receipt.status === "ok")) fail("REPRICE_RECEIPT_INVALID");
     const sealed = sealRepriceReceipt({
-      schema: REPRICE_RECEIPT_SCHEMA,
+      schema: args.inputSource === undefined ? REPRICE_RECEIPT_SCHEMA : CURRENT_CORRECTION_RECEIPT_SCHEMA,
+      ...correctionFields(args),
       mode: args.mode,
       outcome: receipt.status,
       environment: args.environment,

@@ -104,7 +104,7 @@ function validEnv(profileName = "10k", overrides = {}) {
 }
 
 function fakeMigrations() {
-  return Array.from({ length: 79 }, (_, index) => ({
+  return Array.from({ length: 80 }, (_, index) => ({
     version: index + 1,
     name: `${String(index + 1).padStart(4, "0")}_${index === 38
       ? "analytics_applied_projection_v1" : index === 39
@@ -136,7 +136,8 @@ function fakeMigrations() {
                                                           ? "classification_correction_links" : index === 76
                                                             ? "analytics_v2_reprice" : index === 77
                                                               ? "classification_link_lookup_indexes" : index === 78
-                                                                ? "performance_telemetry" : `test_${index + 1}`}.sql`,
+                                                                ? "performance_telemetry" : index === 79
+                                                                  ? "analytics_v2_current_correction" : `test_${index + 1}`}.sql`,
     sha256: (index + 1).toString(16).padStart(64, "0"),
   }));
 }
@@ -443,8 +444,8 @@ test("migration receipt is compared row-for-row and fails closed on drift", asyn
   const receipt = await verifyPostgresCommunityGraphBenchmarkMigrationReceipt(
     pool, POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["10k"].schema, migrations,
   );
-  assert.equal(receipt.count, 79);
-  assert.equal(receipt.tail, "0079_performance_telemetry.sql");
+  assert.equal(receipt.count, 80);
+  assert.equal(receipt.tail, "0080_analytics_v2_current_correction.sql");
   assert.match(receipt.sha256, /^[a-f0-9]{64}$/u);
   assert.equal(pool.releases, 1);
   assert.ok(pool.statements.some((sql) => sql.includes('ORDER BY version')));
@@ -454,8 +455,8 @@ test("migration receipt is compared row-for-row and fails closed on drift", asyn
   const insightsReceipt = await verifyPostgresCommunityGraphBenchmarkMigrationReceipt(
     insightsPool, insightsSchema, migrations,
   );
-  assert.equal(insightsReceipt.count, 79);
-  assert.equal(insightsReceipt.tail, "0079_performance_telemetry.sql");
+  assert.equal(insightsReceipt.count, 80);
+  assert.equal(insightsReceipt.tail, "0080_analytics_v2_current_correction.sql");
   assert.match(insightsReceipt.sha256, /^[a-f0-9]{64}$/u);
 
   const pagedSchema = POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["100k-paged"].schema;
@@ -463,31 +464,31 @@ test("migration receipt is compared row-for-row and fails closed on drift", asyn
   const pagedReceipt = await verifyPostgresCommunityGraphBenchmarkMigrationReceipt(
     pagedPool, pagedSchema, migrations,
   );
-  assert.equal(pagedReceipt.count, 79);
-  assert.equal(pagedReceipt.tail, "0079_performance_telemetry.sql");
+  assert.equal(pagedReceipt.count, 80);
+  assert.equal(pagedReceipt.tail, "0080_analytics_v2_current_correction.sql");
   const readpagedSchema = POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["100k-readpaged"].schema;
   const readpagedPool = migrationPool(rows, readpagedSchema);
   const readpagedReceipt = await verifyPostgresCommunityGraphBenchmarkMigrationReceipt(
     readpagedPool, readpagedSchema, migrations,
   );
-  assert.equal(readpagedReceipt.count, 79);
-  assert.equal(readpagedReceipt.tail, "0079_performance_telemetry.sql");
+  assert.equal(readpagedReceipt.count, 80);
+  assert.equal(readpagedReceipt.tail, "0080_analytics_v2_current_correction.sql");
   assert.match(readpagedReceipt.sha256, /^[a-f0-9]{64}$/u);
   const readindexedSchema = POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["100k-readindexed"].schema;
   const readindexedPool = migrationPool(rows, readindexedSchema);
   const readindexedReceipt = await verifyPostgresCommunityGraphBenchmarkMigrationReceipt(
     readindexedPool, readindexedSchema, migrations,
   );
-  assert.equal(readindexedReceipt.count, 79);
-  assert.equal(readindexedReceipt.tail, "0079_performance_telemetry.sql");
+  assert.equal(readindexedReceipt.count, 80);
+  assert.equal(readindexedReceipt.tail, "0080_analytics_v2_current_correction.sql");
   assert.match(readindexedReceipt.sha256, /^[a-f0-9]{64}$/u);
   const batchedSchema = POSTGRES_COMMUNITY_GRAPH_BENCHMARK_PROFILES["100k-batched"].schema;
   const batchedPool = migrationPool(rows, batchedSchema);
   const batchedReceipt = await verifyPostgresCommunityGraphBenchmarkMigrationReceipt(
     batchedPool, batchedSchema, migrations,
   );
-  assert.equal(batchedReceipt.count, 79);
-  assert.equal(batchedReceipt.tail, "0079_performance_telemetry.sql");
+  assert.equal(batchedReceipt.count, 80);
+  assert.equal(batchedReceipt.tail, "0080_analytics_v2_current_correction.sql");
   assert.match(batchedReceipt.sha256, /^[a-f0-9]{64}$/u);
   assert.match(pagedReceipt.sha256, /^[a-f0-9]{64}$/u);
 
@@ -501,16 +502,19 @@ test("migration receipt is compared row-for-row and fails closed on drift", asyn
   );
 });
 
-test("migration source requires exact appended 79 and retained 78 prefix before database access", async () => {
+test("migration source requires exact appended 80 and retained 78/79 prefix before database access", async () => {
   const valid = fakeMigrations();
   assert.equal(valid[76].name, "0077_analytics_v2_reprice.sql");
   assert.equal(valid[77].name, "0078_classification_link_lookup_indexes.sql");
   assert.equal(valid[78].name, "0079_performance_telemetry.sql");
+  assert.equal(valid[79].name, "0080_analytics_v2_current_correction.sql");
   const variants = [
     valid.slice(0, 78),
-    [...valid, { version: 80, name: "0080_unexpected.sql", sha256: "a".repeat(64) }],
+    valid.slice(0, 79),
+    [...valid, { version: 81, name: "0081_unexpected.sql", sha256: "a".repeat(64) }],
     valid.map((entry, index) => index === 77 ? { ...entry, name: "0078_wrong.sql" } : entry),
     valid.map((entry, index) => index === 78 ? { ...entry, name: "0079_wrong.sql" } : entry),
+    valid.map((entry, index) => index === 79 ? { ...entry, name: "0080_wrong.sql" } : entry),
     valid.map((entry, index) => index === 50 ? { ...entry, version: 50 } : entry),
     valid.map((entry, index) => index === 50 ? { ...entry, version: 52 } : entry),
     valid.map((entry, index) => index === 50 ? { ...entry, sha256: "invalid" } : entry),
@@ -533,7 +537,7 @@ test("bundled migration loader pins the image migration directory", async () => 
   const migrations = await readPostgresCommunityGraphBenchmarkMigrations({
     async readMigrations(actual) { options = actual; return fakeMigrations(); },
   });
-  assert.equal(migrations.length, 79);
+  assert.equal(migrations.length, 80);
   assert.deepEqual(options, {
     role: "primary",
     rootDirectory: POSTGRES_COMMUNITY_GRAPH_BENCHMARK_MIGRATION_ROOT,

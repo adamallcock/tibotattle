@@ -945,10 +945,11 @@ test("PG17: 0059 applies within the primary migration chain and creates exactly 
     const stock = await readPostgresMigrations({ role: "primary" });
     const { schema, applied } = await createSchema();
     const stagedCount = applied.staged.length;
-    assert.equal(stock.length + stagedCount, 79,
-      "the 79-migration primary chain including repricing, classification links and performance telemetry");
-    assert.deepEqual(stock.slice(-3).map(({ name }) => name), [
+    assert.equal(stock.length + stagedCount, 80,
+      "the 80-migration primary chain including repricing, classification links, performance telemetry and current correction");
+    assert.deepEqual(stock.slice(-4).map(({ name }) => name), [
       "0077_analytics_v2_reprice.sql", "0078_classification_link_lookup_indexes.sql", "0079_performance_telemetry.sql",
+      "0080_analytics_v2_current_correction.sql",
     ], "the deployed primary migration tail remains intact");
     const history = await pool.query(`SELECT count(*)::integer AS n FROM ${quoted(schema, "_tibotattle_migration_history")}`);
     assert.equal(history.rows[0].n, stock.length, "staged SQL is not recorded as a migration receipt");

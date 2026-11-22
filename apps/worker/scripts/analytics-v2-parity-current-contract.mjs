@@ -13,7 +13,7 @@ const SOURCE_COMMIT = "d43c8f92a059d9c577776f7eca8a331eb305b8a6";
 const CORPUS_SHA256 = "be042b9a72c00a8bbeef592619d7d7ab00be5b02a557629340d27bbf36b5521e";
 const NOW_MS = 1790856000000;
 const OLD_CATALOG = "reviewed-model-catalog-2026-09-23.1";
-const CURRENT_CATALOG = "reviewed-model-catalog-2026-10-26.1";
+const CURRENT_CATALOG = "reviewed-model-catalog-2026-11-17.1";
 const OLD_BASIS = "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d";
 const CURRENT_BASIS = "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_promax25";
 const OLD_MODEL_BASIS = "seven_day_codex_pro20x_equivalent_per_model_composition";
@@ -35,15 +35,25 @@ const RETAINED_PUBLIC_MODEL_METADATA = [
   { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", family: "sol", order: 5 },
   { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", family: "luna", order: 6 },
 ];
-// The only October 26 catalog addition. Existing wire IDs stay in order;
-// current presentation places Terra before its predecessor. This oracle is
-// independent of production catalog imports and accepts no actual output.
+// The wire order retains Terra before the three November additions. The public
+// order starts with the new models and keeps existing entries in relative
+// order. This oracle is independent of production catalog imports.
 const TERRA_ADMIN_METADATA = { modelId: "gpt-6.1-terra", label: "GPT-6.1 Terra",
   allowanceTrack: "primary", pricingStatus: "published" };
-const CURRENT_PUBLIC_MODEL_METADATA = [
+const NOVEMBER_ADMIN_METADATA = [
+  { modelId: "gpt-6.2-astra", label: "GPT-6.2 Astra", allowanceTrack: "primary", pricingStatus: "published" },
+  { modelId: "gpt-6.2-sol", label: "GPT-6.2 Sol", allowanceTrack: "primary", pricingStatus: "published" },
+  { modelId: "gpt-6.2-astra-law", label: "GPT-6.2 Astra for Law", allowanceTrack: "primary", pricingStatus: "published" },
+];
+const OCTOBER_PUBLIC_MODEL_METADATA = [
   ...RETAINED_PUBLIC_MODEL_METADATA.slice(0, 4),
   { id: "gpt-6.1-terra", label: "GPT-6.1 Terra", family: "terra", order: 4 },
   ...RETAINED_PUBLIC_MODEL_METADATA.slice(4).map((model) => ({ ...model, order: model.order + 1 })),
+];
+const CURRENT_PUBLIC_MODEL_METADATA = [
+  { id: "gpt-6.2-astra", label: "GPT-6.2 Astra", family: "astra", order: 0 },
+  { id: "gpt-6.2-sol", label: "GPT-6.2 Sol", family: "sol", order: 1 },
+  ...OCTOBER_PUBLIC_MODEL_METADATA.map((model) => ({ ...model, order: model.order + 2 })),
 ];
 // Raw-byte pins include every source-data file in the historical SOURCE.json.
 // The generator script named there is provenance, not an input to this loader.
@@ -196,7 +206,7 @@ export async function loadQ1CurrentContract(options) {
     && retainedAdminMetadata.every((entry) => exactKeys(entry, ["modelId", "label", "allowanceTrack", "pricingStatus"]))
     && isDeepStrictEqual(retainedAdminMetadata[42], { modelId: "gpt-6.1-sol", label: "GPT-6.1 Sol", allowanceTrack: "primary", pricingStatus: "published" })
     && isDeepStrictEqual(retainedPublicMetadata, RETAINED_PUBLIC_MODEL_METADATA), "METADATA_INVALID");
-  const adminMetadata = [...retainedAdminMetadata, TERRA_ADMIN_METADATA];
+  const adminMetadata = [...retainedAdminMetadata, TERRA_ADMIN_METADATA, ...NOVEMBER_ADMIN_METADATA];
   const publicMetadata = CURRENT_PUBLIC_MODEL_METADATA;
   const original = deepFreeze({ golden: JSON.parse(texts["community-daily-response.json"]),
     goldenPreview: JSON.parse(texts["preview.json"]), perDateExpected: JSON.parse(perDateText) });
@@ -210,7 +220,7 @@ export async function loadQ1CurrentContract(options) {
     requireThat(exactKeys(spend, SPEND_KEYS) && spend.pricingMethodVersion === "server-api-price-equivalent-v0.5"
       && spend.registrySha256 === "48119389ecbcaced58837bc24fa852c3c4a99835289b417e69f34fb0166a63b9");
     spend.pricingMethodVersion = "server-api-price-equivalent-v0.6";
-    spend.registrySha256 = "206544769b43e4b9645284258edd38f7c07a226022db10f5ec0181335df236ab";
+    spend.registrySha256 = "eca860219a79a24a2cc1ba07471e2ecc321281508dc7e8d48412deef77609c77";
   }
   golden.allowanceBreakdowns = currentBreakdowns(original.golden.allowanceBreakdowns, publicMetadata);
   const perDateExpected = structuredClone(original.perDateExpected);

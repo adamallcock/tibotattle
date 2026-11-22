@@ -6,6 +6,7 @@ import { buildCommunityDailyPayload, createV11DailyProjectionValues, publicInput
 import { analyticsV2DailyContentSha256 } from "./store-run";
 import { assertAnalyticsV2PricesMatchDaily, decodeAnalyticsV2PriceInputs, priceAnalyticsV2Input,
   ANALYTICS_V2_PRICE_STATUS, type AnalyticsV2PriceInput, type AnalyticsV2PricedEvent,
+  type AnalyticsV2PriceInputEvent,
   } from "./price-attribution";
 
 export const ANALYTICS_V2_REPRICE_TABLES = Object.freeze({
@@ -19,7 +20,7 @@ export const ANALYTICS_V2_REPRICE_LIMITS = Object.freeze({ days: 32, members: 1_
 export const ANALYTICS_V2_REPRICE_AUDIT_TABLES = Object.freeze({ runs: ANALYTICS_V2_REPRICE_TABLES.runs,
   equivalences: ANALYTICS_V2_REPRICE_TABLES.equivalences,publicationLog: ANALYTICS_V2_REPRICE_TABLES.publicationLog });
 export const ANALYTICS_V2_REPRICE_AUDIT_COLUMNS = Object.freeze({
-  runs: ["run_id","plan_sha256","kernel_id","manifest_version","registry_sha256","pricing_method_version","bounds","receipt","finished_at"],
+  runs: ["run_id","plan_sha256","kernel_id","manifest_version","registry_sha256","pricing_method_version","bounds","receipt","finished_at","input_source","source_kernel_id"],
   equivalences: ["day","revision","payload_sha256","source_sha256","exclusions_sha256","kernel_id","manifest_version","registry_sha256","pricing_method_version","run_id"],
   publicationLog: ["day","revision","released_at","payload","payload_sha256","run_id","kernel_id","manifest_version"],
 });
@@ -120,11 +121,18 @@ export async function repriceAnalyticsV2Contribution(day: string, member: Analyt
   }
   const decoded = await decodeAnalyticsV2PriceInputs(member.inputs);
   assertAnalyticsV2PricesMatchDaily(day, decoded.events, values);
+  return priceAnalyticsV2ContributionValues(values, decoded.events, price);
+}
+
+/** Shared arithmetic only. Each caller must independently prove its input association. */
+export function priceAnalyticsV2ContributionValues(values: V11DailyProjectionValues,
+  events: readonly AnalyticsV2PriceInputEvent[],
+  price: (input: AnalyticsV2PriceInput) => AnalyticsV2PricedEvent = priceAnalyticsV2Input): V11DailyProjectionValues {
   values.pricing = emptyPricing();
   values.omitted.pricing = emptyPricing();
   for (const cell of values.cells) cell.pricing = emptyPricing();
   const cells = new Map(values.cells.map((cell) => [canonicalJson([cell.provider, cell.modelId]), cell]));
-  for (const event of decoded.events) {
+  for (const event of events) {
     const priced = price(event.input);
     addPricing(values.pricing, priced);
     const cell = cells.get(canonicalJson([event.input.provider, event.input.modelId ?? ""]));

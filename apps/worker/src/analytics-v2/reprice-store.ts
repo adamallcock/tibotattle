@@ -18,6 +18,9 @@ import { analyticsV2RepriceTarget, readAnalyticsV2RepriceMetadata, loadAnalytics
   readAnalyticsV2RepriceEquivalences,validAnalyticsV2RepriceStoredReceipt } from "./reprice-read";
 export { readAnalyticsV2RepriceEquivalences } from "./reprice-read";
 export { ANALYTICS_V2_REPRICE_LIMITS, AnalyticsV2RepriceError } from "./reprice";
+export { planAnalyticsV2CurrentCorrection, executeAnalyticsV2CurrentCorrection } from "./current-correction-store";
+export { ANALYTICS_V2_CURRENT_CORRECTION_LIMITS, ANALYTICS_V2_CURRENT_CORRECTION_REFUSALS,
+  ANALYTICS_V2_CURRENT_CORRECTION_ERROR_CODES, validAnalyticsV2CurrentCorrectionStoredReceipt } from "./current-correction";
 
 const REFUSALS = ["owner_set_unavailable","member_link_unavailable","price_inputs_unavailable",
   "price_input_association_unproven","price_inputs_corrupt","contribution_invalid",

@@ -70,6 +70,47 @@ function changed(field: string): never {
   return fail("ANALYTICS_V2_OWNER_SET_CHANGED", field);
 }
 
+/** Preserve genuine saved-version inputs before the caller replaces mutable owner-days. */
+export async function preserveAnalyticsV2ContributionPriceInputs(client: PostgresClient, schema: string,
+  computedOwners: readonly string[], ownerDayFromDay: AnalyticsV2Day): Promise<void> {
+  if (computedOwners.length === 0) return;
+  const tables = ANALYTICS_V2_TABLES;
+  // A saved version can outlive the mutable owner-day without changing its
+  // values. Preserve its original codec bytes and stamps before the cascade;
+  // a later run with merely equal totals is never an association proof.
+  const candidates = `SELECT c.day,c.owner_digest,c.version,c.values_sha256,
+      p.projection_version,p.codec,p.inputs,p.inputs_sha256,p.inputs_sha256 AS source_inputs_sha256,
+      p.input_events,c.run_id,c.price_kernel_id AS kernel_id
+    FROM ${relation(schema, tables.ownerDay)} d
+    JOIN ${relation(schema, tables.ownerDayPrice)} p ON p.day=d.day AND p.owner_digest=d.owner_digest
+      AND p.run_id=d.run_id AND p.kernel_id=d.kernel_id AND p.manifest_version=d.manifest_version
+    JOIN ${relation(schema, tables.dailyContributions)} c ON c.day=d.day AND c.owner_digest=d.owner_digest
+      AND c.run_id=p.run_id AND c.price_kernel_id=p.kernel_id AND c.manifest_version=p.manifest_version
+      AND c.daily_values=d.daily
+    WHERE d.owner_digest=ANY($1::text[]) AND d.day >= $2::date`;
+  const archive = relation(schema, tables.contributionPriceInputs);
+  const scope = [computedOwners, ownerDayFromDay];
+  await client.query(`INSERT INTO ${archive}
+    (day,owner_digest,version,values_sha256,projection_version,codec,inputs,inputs_sha256,
+     source_inputs_sha256,input_events,run_id,kernel_id)
+    ${candidates}
+    ON CONFLICT (day,owner_digest,version) DO NOTHING`, scope);
+  // An existing archive is immutable. Accept an identical prior copy only;
+  // a conflict aborts the caller's transaction before any derived deletion.
+  const checked = rowsOf<{ conflict: unknown }>(await client.query(`SELECT EXISTS (
+    SELECT 1 FROM (${candidates}) candidate
+    LEFT JOIN ${archive} saved USING(day,owner_digest,version)
+    WHERE (saved.values_sha256,saved.projection_version,saved.codec,saved.inputs,saved.inputs_sha256,
+      saved.source_inputs_sha256,saved.input_events,saved.run_id,saved.kernel_id)
+      IS DISTINCT FROM
+      (candidate.values_sha256,candidate.projection_version,candidate.codec,candidate.inputs,candidate.inputs_sha256,
+      candidate.source_inputs_sha256,candidate.input_events,candidate.run_id,candidate.kernel_id)
+    ) AS conflict`, scope), "ANALYTICS_V2_WRITE_FAILED");
+  if (checked.length !== 1 || checked[0]?.conflict !== false) {
+    fail("ANALYTICS_V2_STATE_INVALID", "contributionPriceInputs");
+  }
+}
+
 /**
  * Record the owner sets and contributions of the published candidates (see
  * the module comment); returns the run's owner-set write summary.

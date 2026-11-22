@@ -2,7 +2,7 @@
 // accountless performance intake schema and the community publication heads.
 //
 // Every schema is built through the production runner on the promoted
-// primary chain (applyPostgresMigrations), which ends at 0079; the
+// primary chain (applyPostgresMigrations), which ends at 0080; the
 // pre-migration case uses promoted-migration-prefix.mjs. Fixtures come from
 // postgres-test/fixtures/performance-telemetry.mjs and are synthetic and
 // content-free. Each test drops only the schemas it created (prefix g1_perf_).
@@ -111,11 +111,12 @@ async function newSchemaName(label) {
   return schema;
 }
 
-/** A schema on the full promoted chain; asserts it ends at 0079. */
+/** A schema on the full promoted chain; asserts it ends at 0080. */
 async function promotedSchema(label) {
   const schema = await newSchemaName(label);
   const applied = await applyPostgresMigrations({ role: "primary", schema, pool });
-  assert.equal(applied.migrations.at(-1)?.name, PERFORMANCE_MIGRATION_NAME);
+  assert.equal(applied.migrations.at(-2)?.name, PERFORMANCE_MIGRATION_NAME);
+  assert.equal(applied.migrations.at(-1)?.name, "0080_analytics_v2_current_correction.sql");
   return schema;
 }
 
@@ -218,7 +219,7 @@ test("fixtures: synthetic records pass the telemetry contract under their dictio
   }
 });
 
-test("0079 is the promoted tail: a pre-0079 schema lacks it and is not current; new functions pin search_path", {
+test("0079 stays in the promoted prefix: a pre-0079 schema lacks it and is not current; new functions pin search_path", {
   skip, timeout: 240_000,
 }, async () => {
   const before = await newSchemaName("prefix");
@@ -227,8 +228,9 @@ test("0079 is the promoted tail: a pre-0079 schema lacks it and is not current; 
   assert.equal(prefix.applied, 78);
   const full = await promotedSchema("full");
   const expected = modules.runtime.POSTGRES_RUNTIME_MIGRATIONS.primary;
-  assert.equal(expected.length, 79);
-  assert.equal(expected.at(-1).name, PERFORMANCE_MIGRATION_NAME);
+  assert.equal(expected.length, 80);
+  assert.equal(expected.at(-2).name, PERFORMANCE_MIGRATION_NAME);
+  assert.equal(expected.at(-1).name, "0080_analytics_v2_current_correction.sql");
   for (const table of NEW_TABLES) {
     const absent = await pool.query("SELECT to_regclass($1)::text AS name", [performanceTable(before, table)]);
     assert.equal(absent.rows[0].name, null, `${table} is absent before 0079`);
@@ -264,6 +266,8 @@ test("0079 is the promoted tail: a pre-0079 schema lacks it and is not current; 
   assert.deepEqual(added.map((row) => row.proname).sort(), [
     "accountless_telemetry_performance_authorization_admission",
     "accountless_telemetry_performance_authorization_immutable",
+    "analytics_v2_correction_provenance_valid",
+    "analytics_v2_current_correction_receipt_valid",
     "analytics_v2_published_performance_forward_only",
     "telemetry_performance_capability_admission",
     "telemetry_performance_capability_immutable",

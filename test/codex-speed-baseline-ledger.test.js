@@ -242,17 +242,20 @@ test("an invalid clock never opens a window even when the ledger starts empty", 
 // including near-miss casing/whitespace, resolves to null - never a guess.
 // ---------------------------------------------------------------------------
 
-test("codexServiceTierSpeedMode only recognises the two published tokens", () => {
-  assert.equal(codexServiceTierSpeedMode("priority"), "fast");
-  assert.equal(codexServiceTierSpeedMode("default"), "standard");
+test("codexServiceTierSpeedMode recognises reviewed aliases only for declarable baseline modes", () => {
+  for (const [token, mode] of Object.entries({
+    priority: "fast", fast: "fast", default: "standard", standard: "standard",
+  })) {
+    assert.equal(codexServiceTierSpeedMode(token), mode, `token: ${token}`);
+  }
   for (const token of [
     "turbo",
     "PRIORITY",
     "Default",
     "priority ",
     " default",
-    "fast",
-    "standard",
+    // The raw provider vocabulary is broader than this two-mode ledger.
+    "ultrafast",
     "",
     null,
     undefined,

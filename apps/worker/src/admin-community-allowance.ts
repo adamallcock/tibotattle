@@ -1,6 +1,8 @@
 import {
   ADMIN_MODEL_CONFIG,
   ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+  OCTOBER26_ADMIN_MODEL_CONFIG,
+  OCTOBER26_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
   SEPTEMBER29_ADMIN_MODEL_CONFIG,
   SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
   projectAdminModelHistoryDay,
@@ -75,10 +77,16 @@ export const ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG = ADMIN_MODEL_CONFIG;
 // 29 roster. Neither retained header may acquire a later model by slicing the
 // current catalog, whose append-only wire roster continues to grow.
 const SEPTEMBER23_ADMIN_MODEL_CONFIG = Object.freeze(SEPTEMBER29_ADMIN_MODEL_CONFIG.slice(0, 42));
+const MODEL_CONFIG_BY_CATALOG = new Map<string, typeof ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG>([
+  ["reviewed-model-catalog-2026-09-23.1", SEPTEMBER23_ADMIN_MODEL_CONFIG],
+  [SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION, SEPTEMBER29_ADMIN_MODEL_CONFIG],
+  [OCTOBER26_ADMIN_MODEL_HISTORY_CATALOG_VERSION, OCTOBER26_ADMIN_MODEL_CONFIG],
+  [ADMIN_MODEL_HISTORY_CATALOG_VERSION, ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG],
+]);
+const REVIEWED_MODEL_CONFIGS = [...MODEL_CONFIG_BY_CATALOG.values()];
+
 function reviewedModelConfig(length: number) {
-  if (length === ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.length) return ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG;
-  if (length === SEPTEMBER29_ADMIN_MODEL_CONFIG.length) return SEPTEMBER29_ADMIN_MODEL_CONFIG;
-  return length === SEPTEMBER23_ADMIN_MODEL_CONFIG.length ? SEPTEMBER23_ADMIN_MODEL_CONFIG : null;
+  return REVIEWED_MODEL_CONFIGS.find((models) => models.length === length) ?? null;
 }
 
 // The per-model view uses the current plan roster: values are in Pro 20x-week
@@ -291,7 +299,6 @@ function validAdminCommunityAllowanceModels(
   const expectedModels = reviewedModelConfig(models.modelConfig.length);
   if (expectedModels === null) return false;
   const september23Catalog = expectedModels === SEPTEMBER23_ADMIN_MODEL_CONFIG;
-  const historicalCatalog = expectedModels !== ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG;
   for (const [index, expected] of expectedModels.entries()) {
     const model = record(models.modelConfig[index]);
     if (model === null
@@ -310,11 +317,11 @@ function validAdminCommunityAllowanceModels(
   }
   let previousDay = "";
   for (const candidate of models.days) {
-    if (!validModelCompositionDay(candidate)
-        // A retained header cannot claim coverage from a newer catalog, even
-        // when the newer day's sparse values omit the appended model.
-        || (historicalCatalog && candidate.catalogVersion === ADMIN_MODEL_HISTORY_CATALOG_VERSION)
-        || (september23Catalog && candidate.catalogVersion === SEPTEMBER29_ADMIN_MODEL_HISTORY_CATALOG_VERSION)) return false;
+    if (!validModelCompositionDay(candidate)) return false;
+    // A retained header cannot claim coverage from a newer catalog, even
+    // when the newer day's sparse values omit the appended models.
+    const dayConfig = MODEL_CONFIG_BY_CATALOG.get(candidate.catalogVersion);
+    if (dayConfig === undefined || dayConfig.length > expectedModels.length) return false;
     if (candidate.day <= previousDay || candidate.day > latestAllowedDay) {
       return false;
     }

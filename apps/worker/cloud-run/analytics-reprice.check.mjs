@@ -5,6 +5,7 @@ import test from "node:test";
 import { ANALYTICS_REFRESH_USAGE } from "./analytics-refresh.mjs";
 import {
   ANALYTICS_REPRICE_LIMITS, ANALYTICS_REPRICE_REFUSALS, ANALYTICS_REPRICE_USAGE,
+  ANALYTICS_CURRENT_CORRECTION_REFUSALS,
   analyticsRepriceFailureReceipt, parseAnalyticsRepriceArguments, runAnalyticsReprice,
 } from "./analytics-reprice.mjs";
 
@@ -193,4 +194,112 @@ test("native source help/refusal is content-free and requires no TypeScript or d
   assert.deepEqual(JSON.parse(invalid.stderr), { schemaVersion: "analytics-reprice-receipt-v1", status: "failed", code: "ANALYTICS_V2_REPRICE_ARGUMENT_INVALID" });
   const refresh = spawnSync(process.execPath, [new URL("./analytics-refresh.mjs", import.meta.url).pathname, "--help"], { encoding: "utf8" });
   assert.equal(refresh.status, 0); assert.equal(refresh.stdout, ANALYTICS_REFRESH_USAGE); assert.equal(refresh.stderr, "");
+});
+
+const CURRENT = ["--input-source=current-owner-day", "--source-kernel=12"];
+function correctionPlan() {
+  return { ...planResult(), schema: "analytics-v2-current-correction-plan-v1",
+    inputSource: "current-owner-day", sourceKernelId: 12 };
+}
+function correctionExecution() {
+  return { schema: "analytics-v2-current-correction-execution-v1", status: "complete", planSha256: HASH,
+    inputSource: "current-owner-day", sourceKernelId: 12,
+    counts: { planned: 2, changed: 1, unchanged: 0, refused: 1, contributionVersions: 2,
+      currentSourceVersions: 1, archiveSourceVersions: 1 },
+    refusals: { ...Object.fromEntries(ANALYTICS_CURRENT_CORRECTION_REFUSALS.map(key => [key, 0])),
+      current_source_non_spend_drift: 1 }, replayed: false };
+}
+function correctionFixture({ plan = async () => correctionPlan(), execute = async () => correctionExecution(), close } = {}) {
+  const f = fixture({ close });
+  Object.assign(f.modules.reprice, {
+    ANALYTICS_V2_CURRENT_CORRECTION_LIMITS: { ...ANALYTICS_REPRICE_LIMITS },
+    ANALYTICS_V2_CURRENT_CORRECTION_REFUSALS: [...ANALYTICS_CURRENT_CORRECTION_REFUSALS],
+    async planAnalyticsV2CurrentCorrection(_pool, options) { f.calls.push(["correction-plan", options]); return plan(options); },
+    async executeAnalyticsV2CurrentCorrection(_pool, options) { f.calls.push(["correction-execute", options]); return execute(options); },
+  });
+  return f;
+}
+test("current-source mode requires an explicit paired source kernel and never changes the legacy default", () => {
+  const parsed = parseAnalyticsRepriceArguments([...ARGS, ...CURRENT]);
+  assert.equal(parsed.inputSource, "current-owner-day"); assert.equal(parsed.sourceKernelId, 12);
+  assert.equal(Object.hasOwn(parseAnalyticsRepriceArguments(ARGS), "inputSource"), false);
+  for (const flags of [[CURRENT[0]], [CURRENT[1]], ["--input-source=saved-snapshot", CURRENT[1]],
+    ...["0", "01", "1e1", "32768", "-1", "sentinel"].map(value => [CURRENT[0], `--source-kernel=${value}`])]) {
+    assert.throws(() => parseAnalyticsRepriceArguments([...ARGS, ...flags]),
+      { code: "ANALYTICS_V2_REPRICE_ARGUMENT_INVALID" });
+  }
+});
+test("current-source planning and execution dispatch once with source identity and distinct receipts", async () => {
+  for (const mode of ["plan", "execute"]) {
+    const f = correctionFixture();
+    const receipt = await f.run([...(mode === "plan" ? ARGS : EXECUTE), ...CURRENT]);
+    assert.deepEqual(f.calls.map(call => call[0]), ["pool", `correction-${mode}`, "close"]);
+    assert.equal(f.calls[1][1].sourceKernelId, 12);
+    assert.equal(f.calls[1][1].stamp.kernel.kernelId, 13);
+    assert.equal(receipt.schemaVersion, "analytics-reprice-receipt-v2");
+    assert.equal(receipt.inputSource, "current-owner-day"); assert.equal(receipt.sourceKernelId, 12);
+    assert.deepEqual(Object.keys(receipt).sort(), ["clock", "inputSource", "kernel", "mode", "now", "result", "schemaVersion", "sourceKernelId", "status", "target"]);
+    if (mode === "execute") {
+      assert.equal(f.calls[1][1].runId, RUN); assert.equal(f.calls[1][1].expectedPlanSha256, HASH);
+      assert.equal(Object.hasOwn(receipt.result.counts, "equivalent"), false);
+    }
+  }
+});
+test("current-source runtime contract drift and future source kernels refuse before connecting", async () => {
+  for (const mutate of [f => { delete f.modules.reprice.planAnalyticsV2CurrentCorrection; },
+    f => { f.modules.reprice.ANALYTICS_V2_CURRENT_CORRECTION_LIMITS.events += 1; },
+    f => { f.modules.reprice.ANALYTICS_V2_CURRENT_CORRECTION_REFUSALS.pop(); }]) {
+    const f = correctionFixture(); mutate(f);
+    await assert.rejects(f.run([...ARGS, ...CURRENT]), { code: "ANALYTICS_V2_REPRICE_MODULES_UNAVAILABLE" });
+    assert.deepEqual(f.calls.map(call => call[0]), ["close"]);
+  }
+  const f = correctionFixture();
+  await assert.rejects(f.run([...ARGS, CURRENT[0], "--source-kernel=14"]), { code: "ANALYTICS_V2_REPRICE_INVALID" });
+  assert.deepEqual(f.calls.map(call => call[0]), ["close"]);
+});
+test("current-source receipts reject cross-mode results, raw data and inconsistent source or outcome counts", async () => {
+  for (const [mode, make, mutations] of [
+    ["plan", correctionPlan, [r => { r.schema = planResult().schema; }, r => { r.sourceKernelId = 11; },
+      r => { r.inputSource = "saved-snapshot"; }, r => { r.target.kernelId = 12; },
+      r => { r.ownerDigest = "sentinel"; }, r => { r.counts.inputBytes = 1025; }]],
+    ["execute", correctionExecution, [r => { r.schema = executionResult().schema; }, r => { r.planSha256 = REGISTRY; },
+      r => { r.counts.equivalent = 0; }, r => { r.counts.currentSourceVersions = 3; },
+      r => { r.counts.planned = 3; }, r => { r.counts.changed = 0; }, r => { r.refusals.current_source_non_spend_drift = 0; },
+      r => { r.refusals.ownerDigest = 0; }, r => { r.sourceKernelId = 13; }]],
+  ]) for (const mutate of mutations) {
+    const result = make(); mutate(result);
+    const f = correctionFixture({ [mode]: async () => result });
+    await assert.rejects(f.run([...(mode === "plan" ? ARGS : EXECUTE), ...CURRENT]),
+      { code: "ANALYTICS_V2_REPRICE_RECEIPT_INVALID" });
+  }
+});
+test("current-source operation and cleanup failures preserve the source binding without leaking driver details", async () => {
+  for (const options of [{ execute: async () => { throw new Error("SELECT private sentinel"); } },
+    { close: async () => { throw new Error("SELECT private sentinel"); } }]) {
+    const f = correctionFixture(options);
+    await assert.rejects(f.run([...EXECUTE, ...CURRENT]), error => {
+      const receipt = analyticsRepriceFailureReceipt(error);
+      assert.deepEqual(receipt, { schemaVersion: "analytics-reprice-receipt-v2", inputSource: "current-owner-day",
+        sourceKernelId: 12, status: "failed", code: "ANALYTICS_V2_REPRICE_FAILED",
+        phase: options.close ? "cleanup" : "execute" });
+      assert.doesNotMatch(JSON.stringify(receipt), /SELECT|private|sentinel/u);
+      return true;
+    });
+    assert.equal(f.calls.filter(call => call[0] === "correction-execute").length, 1);
+  }
+});
+test("current-source early schema refusals retain a discoverable v2 receipt before modules or connections", async () => {
+  for (const schema of [undefined, "pg_catalog", "bad;SELECT sentinel"]) {
+    const f = correctionFixture();
+    await assert.rejects(f.run([...ARGS.filter(arg => !arg.startsWith("--schema=")), ...CURRENT],
+      { ...PRODUCTION, PRIMARY_SCHEMA: schema }), error => {
+      assert.deepEqual(analyticsRepriceFailureReceipt(error), { schemaVersion: "analytics-reprice-receipt-v2",
+        ...{ inputSource: "current-owner-day", sourceKernelId: 12 }, status: "failed",
+        code: "ANALYTICS_V2_REPRICE_ARGUMENT_INVALID", phase: "configuration" });
+      return true;
+    });
+    assert.deepEqual(f.calls, []);
+  }
+  assert.throws(() => parseAnalyticsRepriceArguments([...ARGS, CURRENT[0], "--source-kernel=12", "--source-kernel=13"]),
+    error => analyticsRepriceFailureReceipt(error).schemaVersion === "analytics-reprice-receipt-v1");
 });

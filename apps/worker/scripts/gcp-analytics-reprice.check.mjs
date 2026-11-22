@@ -10,7 +10,8 @@ import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { ANALYTICS_REPRICE_REFUSALS, ANALYTICS_REPRICE_USAGE } from "../cloud-run/analytics-reprice.mjs";
+import { ANALYTICS_REPRICE_REFUSALS, ANALYTICS_REPRICE_USAGE,
+  ANALYTICS_CURRENT_CORRECTION_REFUSALS } from "../cloud-run/analytics-reprice.mjs";
 import * as manifest from "./gcp-ops-infra-manifest.mjs";
 import * as verb from "./gcp-analytics-reprice.mjs";
 
@@ -544,4 +545,124 @@ test("the source keeps every command an argv, mutates only through execute, and 
     assert.equal(argv[0], "gcloud");
     assert.equal(argv.some((part) => /^(?:delete|update|replace|deploy|remove-iam-policy-binding)$/u.test(part)), false);
   }
+});
+
+const CURRENT_FLAGS = ["--input-source=current-owner-day", "--source-kernel=16"];
+const CURRENT_REGISTRY = { kernels: REGISTRY.kernels.map(entry => ({ ...entry, priceRegistrySha256: REGISTRY_SHA })) };
+const currentDeps = (gcloud, overrides = {}) => deps(gcloud, { readKernelRegistry: async () => CURRENT_REGISTRY, ...overrides });
+const CURRENT_FIELDS = Object.freeze({ inputSource: "current-owner-day", sourceKernelId: 16 });
+function currentPlan() {
+  return { ...planResult(), schema: "analytics-v2-current-correction-plan-v1", ...CURRENT_FIELDS };
+}
+function currentExecution() {
+  return { schema: "analytics-v2-current-correction-execution-v1", status: "complete", ...CURRENT_FIELDS,
+    planSha256: PLAN_HASH, counts: { planned: 3, changed: 2, unchanged: 0, refused: 1,
+      contributionVersions: 3, currentSourceVersions: 2, archiveSourceVersions: 1 },
+    refusals: { ...Object.fromEntries(ANALYTICS_CURRENT_CORRECTION_REFUSALS.map(key => [key, 0])),
+      current_source_non_spend_drift: 1 }, replayed: false };
+}
+function currentReceipt(mode, result, overrides = {}) {
+  return okReceipt(mode, result, { schemaVersion: "analytics-reprice-receipt-v2", ...CURRENT_FIELDS, ...overrides });
+}
+function currentPlanBody(body) {
+  return { ...body, schema: verb.CURRENT_CORRECTION_RECEIPT_SCHEMA, ...CURRENT_FIELDS, result: currentPlan() };
+}
+test("current correction binds explicit source identity into distinct authorization and job arguments", () => {
+  const out = "--receipt-out=/private/synthetic/current.json";
+  const args = planArgs([out, ...CURRENT_FLAGS, `--authorize=current-correction-plan:production:16:${COMMIT}`, "--execute"]);
+  const parsed = verb.parseRepriceArguments(args);
+  assert.equal(parsed.sourceKernelId, 16); assert.equal(parsed.inputSource, "current-owner-day");
+  assert.deepEqual([...verb.repriceJobArguments(parsed)].slice(-2), CURRENT_FLAGS);
+  for (const flags of [[CURRENT_FLAGS[0]], [CURRENT_FLAGS[1]], ["--input-source=archive", CURRENT_FLAGS[1]],
+    ...["0", "016", "1e1", "18", "32768"].map(value => [CURRENT_FLAGS[0], `--source-kernel=${value}`])]) {
+    assert.throws(() => verb.parseRepriceArguments(planArgs([out, ...flags])), { code: "REPRICE_SOURCE_INVALID" });
+  }
+  for (const authorization of [`reprice-plan:production:${COMMIT}`, `current-correction-plan:production:15:${COMMIT}`,
+    `current-correction-execute:production:16:${COMMIT}`]) {
+    assert.throws(() => verb.parseRepriceArguments(planArgs([out, ...CURRENT_FLAGS, `--authorize=${authorization}`])),
+      { code: "REPRICE_AUTHORIZATION_MISMATCH" });
+  }
+});
+test("current correction dry run remains offline and refuses an unregistered source before provider calls", async () => {
+  await withDirectory(async directory => {
+    const gcloud = stubGcloud();
+    const args = planArgs([`--receipt-out=${join(directory, "dry.json")}`, ...CURRENT_FLAGS]);
+    const result = await verb.runAnalyticsRepriceVerb(args, currentDeps(gcloud));
+    assert.equal(result.status, "dry-run"); assert.equal(result.sourceKernelId, 16);
+    assert.equal(gcloud.calls.length, 0);
+    assert.match(result.steps.at(-1).argv[3], /analytics-reprice-receipt-v2/u);
+    await assert.rejects(verb.runAnalyticsRepriceVerb(args, currentDeps(gcloud, {
+      readKernelRegistry: async () => ({ kernels: REGISTRY.kernels.filter(entry => entry.kernelId === KERNEL) }),
+    })), { code: "REPRICE_KERNEL_UNREGISTERED" });
+    assert.equal(gcloud.calls.length, 0);
+    await assert.rejects(verb.runAnalyticsRepriceVerb(args, currentDeps(gcloud, {
+      readKernelRegistry: async () => REGISTRY,
+    })), { code: "REPRICE_SOURCE_CATALOG_MISMATCH" });
+    assert.equal(gcloud.calls.length, 0);
+  });
+});
+test("current correction plans and executes once with closed source-bound receipts under the existing lock", async () => {
+  await withDirectory(async directory => {
+    for (const mode of ["plan", "execute"]) {
+      const planPath = await writePlanReceipt(directory, currentPlanBody);
+      const out = join(directory, `${mode}.json`);
+      const gcloud = stubGcloud({ payloads: [currentReceipt(mode, mode === "plan" ? currentPlan() : currentExecution())] });
+      const dependency = currentDeps(gcloud);
+      const flags = [`--receipt-out=${out}`, ...CURRENT_FLAGS, "--execute",
+        `--authorize=current-correction-${mode}:production:16:${mode === "plan" ? COMMIT : PLAN_HASH}`];
+      const result = await verb.runAnalyticsRepriceVerb(mode === "plan" ? planArgs(flags) : executeArgs(planPath, flags), dependency);
+      const receipt = JSON.parse(await readFile(out, "utf8"));
+      assert.equal(result.sourceKernelId, 16); assert.equal(result.inputSource, "current-owner-day");
+      assert.equal(receipt.schema, verb.CURRENT_CORRECTION_RECEIPT_SCHEMA);
+      assert.deepEqual(Object.keys(receipt).sort(), [...verb.CURRENT_CORRECTION_RECEIPT_KEYS].sort());
+      assert.deepEqual(verb.verifyRepriceReceipt(receipt, { registry: CURRENT_REGISTRY }), receipt);
+      assert.deepEqual(dependency.lockEvents, ["acquired", "released"]);
+      assert.equal(gcloud.calls.filter(argv => argv[3] === "execute").length, 1);
+      assert.match(gcloud.calls.find(argv => argv[3] === "execute").join(" "), /--input-source=current-owner-day,--source-kernel=16/u);
+      assert.equal((await stat(out)).mode & 0o777, 0o600);
+    }
+  });
+});
+test("current correction refuses cross-mode plans and changed source identity before execution", async () => {
+  await withDirectory(async directory => {
+    const legacy = await writePlanReceipt(directory);
+    const current = await writePlanReceipt(directory, currentPlanBody);
+    for (const [path, flags] of [[legacy, CURRENT_FLAGS], [current, []],
+      [current, [CURRENT_FLAGS[0], `--source-kernel=${KERNEL}`]]]) {
+      const gcloud = stubGcloud();
+      await assert.rejects(verb.runAnalyticsRepriceVerb(executeArgs(path,
+        [`--receipt-out=${join(directory, "out.json")}`, ...flags]), currentDeps(gcloud)),
+      { code: "REPRICE_PLAN_SOURCE_MISMATCH" });
+      assert.equal(gcloud.calls.length, 0);
+    }
+  });
+});
+test("current correction receipt validation binds every layer and rejects legacy or raw-field receipts", () => {
+  const options = { mode: "plan", environment: "production", bounds: BOUNDS_OBJECT,
+    kernel: { kernelId: KERNEL, priceRegistrySha256: REGISTRY_SHA }, ...CURRENT_FIELDS };
+  for (const mutate of [r => { r.schemaVersion = "analytics-reprice-receipt-v1"; },
+    r => { r.sourceKernelId = 15; }, r => { r.result.sourceKernelId = 15; },
+    r => { r.result = planResult(); }, r => { r.rawInput = "sentinel"; }]) {
+    const receipt = currentReceipt("plan", currentPlan()); mutate(receipt);
+    assert.throws(() => verb.validateJobReceipt(receipt, options), { code: "REPRICE_RECEIPT_INVALID" });
+  }
+  assert.throws(() => verb.validateJobReceipt(currentReceipt("plan", currentPlan()),
+    { ...options, inputSource: undefined, sourceKernelId: undefined }), { code: "REPRICE_RECEIPT_INVALID" });
+  const failed = { schemaVersion: "analytics-reprice-receipt-v2", ...CURRENT_FIELDS,
+    status: "failed", code: "ANALYTICS_V2_REPRICE_PLAN_CHANGED", phase: "execute" };
+  assert.equal(verb.validateJobReceipt(failed, options).status, "failed");
+  assert.throws(() => verb.validateJobReceipt({ ...failed, sourceKernelId: 15 }, options), { code: "REPRICE_RECEIPT_INVALID" });
+});
+test("current correction failed executions write a source-bound failure receipt and never retry", async () => {
+  await withDirectory(async directory => {
+    const out = join(directory, "failure.json");
+    const gcloud = stubGcloud({ outcome: "failed", payloads: [{ schemaVersion: "analytics-reprice-receipt-v2",
+      ...CURRENT_FIELDS, status: "failed", code: "ANALYTICS_V2_REPRICE_SCHEMA_UNAVAILABLE", phase: "plan" }] });
+    await assert.rejects(verb.runAnalyticsRepriceVerb(planArgs([`--receipt-out=${out}`, ...CURRENT_FLAGS,
+      "--execute", `--authorize=current-correction-plan:production:16:${COMMIT}`]), currentDeps(gcloud)), { code: "REPRICE_JOB_REFUSED" });
+    const receipt = JSON.parse(await readFile(out, "utf8"));
+    assert.equal(receipt.sourceKernelId, 16); assert.equal(receipt.outcome, "failed");
+    assert.deepEqual(verb.verifyRepriceReceipt(receipt, { registry: CURRENT_REGISTRY }), receipt);
+    assert.equal(gcloud.calls.filter(argv => argv[3] === "execute").length, 1);
+  });
 });

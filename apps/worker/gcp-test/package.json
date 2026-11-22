@@ -13,5 +13,10 @@
   "dependencies": {
     "@google-cloud/cloud-sql-connector": "1.12.0",
     "pg": "8.23.0"
+  },
+  "overrides": {
+    "rimraf@5.0.10": {
+      "glob": "14.0.3"
+    }
   }
 }

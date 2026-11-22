@@ -3,7 +3,7 @@
 // it (cloud-run/routes/admin-performance-intake.mjs).
 //
 // Every schema is built through the production runner on the promoted
-// primary chain (applyPostgresMigrations), which ends at 0079; the
+// primary chain (applyPostgresMigrations), which ends at 0080; the
 // pre-migration case uses promoted-migration-prefix.mjs applyMigrationsBefore.
 // Rows are synthetic and content-free, written through the live guards with
 // the shared SPD-G1 fixtures (fixtures/performance-telemetry.mjs). Each test
@@ -254,7 +254,8 @@ async function newSchemaName(label) {
 async function promotedSchema(label) {
   const schema = await newSchemaName(label);
   const applied = await applyPostgresMigrations({ role: "primary", schema, pool });
-  assert.equal(applied.migrations.at(-1)?.name, PERFORMANCE_MIGRATION_NAME);
+  assert.equal(applied.migrations.at(-2)?.name, PERFORMANCE_MIGRATION_NAME);
+  assert.equal(applied.migrations.at(-1)?.name, "0080_analytics_v2_current_correction.sql");
   return schema;
 }
 

@@ -1,14 +1,14 @@
 // The one import surface for the production analytics kernels on the GCP line.
 //
-// Every other source file in this directory is a byte copy of commit 76179fd4f21816693e958e436d3c84fd8555da60
-// (the reviewed Terra catalog source on the preserved historical kernel graph), written by scripts/vendor-analytics-kernels.mjs and
+// Every other source file in this directory is a byte copy of commit 2175b2c6960a8ef71c74161c25a71de80460e612
+// (the reviewed GPT-6.2 pricing source on the preserved historical kernel graph), written by scripts/vendor-analytics-kernels.mjs and
 // verified by scripts/vendor-analytics-kernels.check.mjs against MANIFEST.json.
 // The only edits are eight `export ` tokens and the reviewed, semantics-preserving
 // source patches (SOURCE_PATCHES in the generator) that MANIFEST.json lists. The
 // apps/worker/src/*.d.ts files (MANIFEST.json typeStubs) are tsc declarations of
-// 76179fd4f21816693e958e436d3c84fd8555da60 modules the copies import only for types; they keep tsc-checked
+// 2175b2c6960a8ef71c74161c25a71de80460e612 modules the copies import only for types; they keep tsc-checked
 // consumers compiling and are never loaded at runtime. The three
-// workspace packages are vendored at 76179fd4f21816693e958e436d3c84fd8555da60 too: tsconfig.json `paths` (for
+// workspace packages are vendored at 2175b2c6960a8ef71c74161c25a71de80460e612 too: tsconfig.json `paths` (for
 // esbuild) and vitest.analytics-v2.config.mjs (for Vitest) resolve
 // @app-usagemonitor/* imports made inside this directory to those copies, so
 // the kernels never run against the GCP line's own packages.

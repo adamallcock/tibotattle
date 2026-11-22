@@ -18,8 +18,8 @@ export const MAX_TELEMETRY_BROWSER_BYTES = 1_310_720;
 // openai/codex codex-rs/protocol/src/auth.rs (KnownPlan). "unknown" is our
 // sentinel for a plan Codex has not (yet) named. Product allowance ratios and
 // display labels are separate policy; renaming Pro does not change this identity.
-// promax is source-verified but remains provisional until binary and allowance
-// semantics are reviewed for release.
+// promax is verified in reviewed source and installed binary plan vocabulary.
+// Provider allowance and window semantics remain unverified.
 export const TELEMETRY_PLAN_TYPES = Object.freeze([
   "free",
   "go",
@@ -27,6 +27,31 @@ export const TELEMETRY_PLAN_TYPES = Object.freeze([
   "pro",
   "prolite",
   "promax",
+  "team",
+  "self_serve_business_prolite",
+  "self_serve_business_usage_based",
+  "business",
+  "ent26",
+  "enterprise_cbp_automation",
+  "enterprise_cbp_usage_based",
+  "enterprise",
+  "edu",
+  "edu_plus",
+  "edu_pro",
+  "unknown",
+  // Append reviewed identities without reindexing the existing vocabulary.
+  "sci",
+  "sci_plus",
+]);
+
+// Frozen contribution-v0.2 vocabulary. Later reviewed plans remain unknown
+// when projected into this predecessor; its wire schemas must not expand.
+export const TELEMETRY_V02_PLAN_TYPES = Object.freeze([
+  "free",
+  "go",
+  "plus",
+  "pro",
+  "prolite",
   "team",
   "self_serve_business_prolite",
   "self_serve_business_usage_based",
@@ -62,6 +87,8 @@ export const TELEMETRY_PLAN_DISPLAY_NAMES = Object.freeze({
   edu: "Edu",
   edu_plus: "Edu Plus",
   edu_pro: "Edu Pro",
+  sci: "Academic Researchers",
+  sci_plus: "Academic Researchers Plus",
 });
 
 export const TELEMETRY_TOOL_CLASSES = Object.freeze([
