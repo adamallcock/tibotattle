@@ -154,7 +154,7 @@ async function infrastructure(schema) {
 }
 /** Old stamps and pricing are hand-built; all non-price values use the real kernel fold. */
 async function seedDay(schema, { day = DAY, owners = [1], quotaOnly = false, changedCost = false,
-  wrongAssociation = false, excluded = [] } = {}) {
+  wrongAssociation = false, excluded = [], eventCount = 1, stalePublicSpend = false } = {}) {
   const runId = randomUUID(), members = [];
   await transaction(async (client) => {
     await insert(client, schema, "analytics_v2_daily_owner_set_bootstrap", { day, provenance: 1,
@@ -169,11 +169,17 @@ async function seedDay(schema, { day = DAY, owners = [1], quotaOnly = false, cha
       if (quotaOnly) values.counts.quota = n;
       else {
         const record = JSON.parse(usage(syntheticOwner(1), n, dayMs(day) + n * 1000).recordJson);
-        values = kernels.foldV11DailyProjectionValues(values, [record]);
+        const projection = kernels.foldV11DailyProjectionValues(values, [record]);
+        // Distinct synthetic occurrences have identical pricing projections.
+        // Merge their fold in groups while respecting the normal fold page limit.
+        for (let remaining = eventCount, group = projection; remaining > 0; remaining = Math.floor(remaining / 2)) {
+          if (remaining % 2 !== 0) values = kernels.mergeV11DailyProjectionValues(values, group);
+          if (remaining > 1) group = kernels.mergeV11DailyProjectionValues(group, group);
+        }
         const input = prices.analyticsV2PriceInput(record);
         const priced = prices.priceAnalyticsV2Input(input);
         assert.equal(priced.status, prices.ANALYTICS_V2_PRICE_STATUS.fullyPriced);
-        events = [{ input, priced: changedCost ? { ...priced, costNanousd: 1 } : priced }];
+        events = Array(eventCount).fill({ input, priced: changedCost ? { ...priced, costNanousd: 1 } : priced });
         if (changedCost) { values.pricing.knownNanousd = "1"; values.cells[0].pricing.knownNanousd = "1"; }
       }
       values.registrySha256 = old.kernel.priceRegistrySha256;
@@ -191,8 +197,8 @@ async function seedDay(schema, { day = DAY, owners = [1], quotaOnly = false, cha
         await insert(client, schema, "analytics_v2_owner_day", { day, owner_digest: ownerDigest,
           daily: JSON.stringify(values), refusal: null, run_id: priceRun, kernel_id: old.kernel.kernelId, manifest_version: 1 });
         await insert(client, schema, "analytics_v2_owner_day_price", { day, owner_digest: ownerDigest, price_basis_id: 1,
-          usage_events: 1, unpriced_events: 0, partially_priced_events: 0, projection_version: inputs.projectionVersion,
-          codec: inputs.codec, inputs: Buffer.from(inputs.data, "base64"), inputs_sha256: inputs.sha256, input_events: 1,
+          usage_events: eventCount, unpriced_events: 0, partially_priced_events: 0, projection_version: inputs.projectionVersion,
+          codec: inputs.codec, inputs: Buffer.from(inputs.data, "base64"), inputs_sha256: inputs.sha256, input_events: eventCount,
           run_id: priceRun, kernel_id: old.kernel.kernelId, manifest_version: 1 });
       }
       if (excluded.includes(n)) await insert(client, schema, "community_aggregate_exclusions", {
@@ -207,8 +213,9 @@ async function seedDay(schema, { day = DAY, owners = [1], quotaOnly = false, cha
       pricingMethodVersion: kernels.createV11DailyProjectionValues(day).pricingMethodVersion }));
     const payload = kernels.buildCommunityDailyPayload({ day, revision: 4, releasedAt: RELEASED,
       ...kernels.publicInputs(normalized, folded.map((m) => m.devices)) });
-    payload.apiEquivalentSpend.registrySha256 = old.kernel.priceRegistrySha256;
-    payload.apiEquivalentSpend.pricingMethodVersion = "server-api-price-equivalent-v0.5";
+    payload.apiEquivalentSpend.registrySha256 = stalePublicSpend ? hash("synthetic-stale-spend") : old.kernel.priceRegistrySha256;
+    payload.apiEquivalentSpend.pricingMethodVersion = stalePublicSpend ? "server-api-price-equivalent-v0.1"
+      : "server-api-price-equivalent-v0.5";
     await insert(client, schema, "analytics_v2_published_daily", { day, revision: 4, released_at: RELEASED,
       payload: JSON.stringify(payload), payload_sha256: await store.analyticsV2DailyContentSha256(payload),
       run_id: runId, kernel_id: old.kernel.kernelId, manifest_version: 1 });
@@ -676,4 +683,134 @@ test("PG: the runtime grant policy alone plans, executes and replays (the repric
     await pool.query(`DROP OWNED BY "${runtimeRole}"`);
     await pool.query(`DROP ROLE "${runtimeRole}"`);
   }
+});
+
+test("PG: independent completed proofs survive the writer's cross-day event cap in public reads", { skip: SKIP }, async () => {
+  await withSchema(async (schema) => {
+    await infrastructure(schema);
+    const days = [DAY, NEXT_DAY, "2026-09-22"];
+    const limits = domain.ANALYTICS_V2_REPRICE_LIMITS;
+    const eventCount = Math.floor(limits.events / days.length) + 1;
+    const maximums = { maxDays: limits.days, maxMembers: limits.members, maxInputBytes: limits.inputBytes };
+    for (const day of days) {
+      await seedDay(schema, { day, eventCount, stalePublicSpend: true });
+      const single = { ...maximums, fromDay: day, throughDay: day };
+      const singlePlan = await plan(schema, single);
+      assert.deepEqual(singlePlan.caps, { heads: false, members: false, inputBytes: false });
+      const receipt = await execute(schema, singlePlan, { bounds: bounds(single) });
+      assert.deepEqual(receipt.counts, { planned: 1, changed: 0, equivalent: 1, unchanged: 0,
+        refused: 0, contributionVersions: 0 });
+    }
+
+    const wide = { ...maximums, fromDay: days[0], throughDay: days.at(-1) };
+    const widePlan = await plan(schema, wide);
+    assert.deepEqual(widePlan.caps, { heads: false, members: false, inputBytes: true });
+    const size = await pool.query(`SELECT sum(input_events)::int AS events, sum(octet_length(inputs))::int AS bytes
+      FROM ${q(schema, "analytics_v2_owner_day_price")}`);
+    assert.equal(size.rows[0].events, eventCount * days.length);
+    assert.ok(size.rows[0].bytes < limits.inputBytes, "the compressed inputs do not reach the byte cap");
+    const values = await pool.query(`SELECT sum(octet_length(daily_values::text))::int AS bytes
+      FROM ${q(schema, "analytics_v2_daily_contributions")}`);
+    assert.ok(values.rows[0].bytes < limits.inputBytes, "the saved values do not reach the byte cap");
+    await expectCode(execute(schema, widePlan, { bounds: bounds(wide) }), "ANALYTICS_V2_REPRICE_LIMIT");
+
+    const read = async (from, to, readPool = pool) => {
+      const response = await route.createAnalyticsV2CommunityDailyRoute({ pool: readPool, schema }).handler(
+        new Request(`http://127.0.0.1/api/v1/community/daily?from=${from}&to=${to}`));
+      assert.equal(response.status, 200);
+      return (await response.json()).days;
+    };
+    const narrow = (await Promise.all(days.map((day) => read(day, day)))).flat();
+    assert.equal(narrow.length, days.length);
+    for (const { payload } of narrow) {
+      assert.equal(payload.apiEquivalentSpend.registrySha256, target.kernel.priceRegistrySha256);
+    }
+    const withoutSpend = ({ payload, ...row }) => {
+      const { apiEquivalentSpend: _spend, ...nonSpend } = payload;
+      return { ...row, payload: nonSpend };
+    };
+    const combined = await read(days[0], days.at(-1));
+    assert.deepEqual(combined.map(withoutSpend), narrow.map(withoutSpend), "revisions and non-spend payloads agree");
+    assert.deepEqual(combined, narrow, "a wider query must retain the exact same individually proved spend");
+
+    // Every day carries a stale published head. Only the last three have
+    // completed proofs. Trace the normal PostgreSQL route at its range limit.
+    const lastDay = days.at(-1);
+    const firstDay = new Date(dayMs(lastDay) - 365 * 86_400_000).toISOString().slice(0, 10);
+    const storedHead = await headRow(schema);
+    await transaction(async (client) => {
+      for (let epoch = dayMs(firstDay); epoch < dayMs(days[0]); epoch += 86_400_000) {
+        const day = new Date(epoch).toISOString().slice(0, 10);
+        const payload = { ...storedHead.payload, day, aggregateId: `community-daily:${day}:r${storedHead.revision}` };
+        await insert(client, schema, "analytics_v2_published_daily", { day, revision: storedHead.revision,
+          released_at: payload.releasedAt, payload: JSON.stringify(payload),
+          payload_sha256: await store.analyticsV2DailyContentSha256(payload),
+          run_id: storedHead.run_id, kernel_id: storedHead.kernel_id, manifest_version: 1 });
+      }
+    });
+    const queries = [];
+    const tracedPool = { connect: async () => {
+      const client = await pool.connect();
+      return { release: () => client.release(), query: async (sql, params) => {
+        const result = await client.query(sql, params);
+        queries.push({ sql, params, rows: result.rowCount });
+        // Preserve compatibility with adapters that return SQL integer
+        // revisions as decimal strings in both related statements.
+        if (/^SELECT (?:e\.)?day::text,(?:e\.)?revision,/u.test(sql)) {
+          result.rows = result.rows.map((row) => ({ ...row, revision: String(row.revision) }));
+        }
+        return result;
+      } };
+    } };
+    const year = await read(firstDay, lastDay, tracedPool);
+    assert.equal(year.length, 366);
+    assert.deepEqual(year.slice(-days.length), narrow);
+    assert.ok(year.slice(0, -days.length).every(({ payload }) => !("apiEquivalentSpend" in payload)));
+    const proofReads = queries.filter(({ sql }) => sql.includes(`FROM ${q(schema, "analytics_v2_price_equivalences")} e`));
+    assert.equal(proofReads.length, 12);
+    assert.equal(proofReads.reduce((total, { params }) => total + params[0].length, 0), 366);
+    for (const { sql, params, rows } of proofReads) {
+      assert.match(sql, /LIMIT 1001$/u);
+      assert.ok(params[0].length <= limits.days && rows <= 1001);
+    }
+    const memberReads = queries.filter(({ sql }) => sql.includes("AS input_bytes"));
+    assert.equal(memberReads.length, 1, "only a batch with completed proofs reads source metadata");
+    assert.deepEqual(memberReads[0].params, [days, limits.members + 1]);
+    assert.equal(memberReads[0].rows, days.length);
+    assert.ok(queries.every(({ sql }) => !/SELECT daily_values,version|\bAS inputs\b/u.test(sql)),
+      "the public reader fetches neither private values documents nor compressed input bodies");
+
+    const single = { ...maximums, fromDay: days[0], throughDay: days[0] };
+    const prior = await readReprice.readAnalyticsV2RepriceMetadata(pool, { schema, stamp: target, bounds: bounds(single) });
+    // A corrupt over-cap replacement retains the original declared digest.
+    // Length checks must refuse it even though every proof binding still agrees.
+    const priceTable = q(schema, "analytics_v2_owner_day_price");
+    await pool.query(`WITH prior AS (DELETE FROM ${priceTable} WHERE day=$1 RETURNING *)
+      INSERT INTO ${priceTable} (day,owner_digest,price_basis_id,usage_events,unpriced_events,partially_priced_events,
+        projection_version,codec,inputs,inputs_sha256,input_events,run_id,kernel_id,manifest_version)
+      SELECT day,owner_digest,price_basis_id,usage_events,unpriced_events,partially_priced_events,
+        projection_version,codec,inputs || decode(repeat('00',$2),'hex'),inputs_sha256,input_events,run_id,kernel_id,manifest_version
+      FROM prior`, [days[0], limits.inputBytes]);
+    const overCap = await readReprice.readAnalyticsV2RepriceMetadata(pool, { schema, stamp: target, bounds: bounds(single) });
+    assert.equal(overCap.sourceSha256.get(days[0]), prior.sourceSha256.get(days[0]));
+    assert.equal(overCap.exclusionsSha256, prior.exclusionsSha256);
+    assert.equal(overCap.caps.inputBytes, true);
+    const measured = await read(days[0], lastDay);
+    assert.deepEqual(measured.map(withoutSpend), narrow.map(withoutSpend));
+    assert.equal("apiEquivalentSpend" in measured[0].payload, false);
+    assert.deepEqual(measured.slice(1), narrow.slice(1), "one over-cap day cannot displace a sibling's proof");
+    assert.equal("apiEquivalentSpend" in (await read(days[0], days[0]))[0].payload, false);
+
+    // An additive version changes the source digest even with identical values.
+    await pool.query(`INSERT INTO ${q(schema, "analytics_v2_daily_contributions")}
+      (day,owner_digest,version,daily_values,values_schema,values_sha256,stable_values_sha256,
+       devices,price_kernel_id,first_revision,run_id,kernel_id,manifest_version)
+      SELECT day,owner_digest,version+1,daily_values,values_schema,values_sha256,stable_values_sha256,
+        devices,price_kernel_id,first_revision+1,run_id,kernel_id,manifest_version
+      FROM ${q(schema, "analytics_v2_daily_contributions")} WHERE day=$1`, [days[1]]);
+    const drifted = await read(days[0], lastDay);
+    assert.deepEqual(drifted.map(withoutSpend), narrow.map(withoutSpend));
+    assert.equal("apiEquivalentSpend" in drifted[1].payload, false);
+    assert.deepEqual(drifted[2], narrow[2]);
+  });
 });
