@@ -187,12 +187,19 @@ rescanned. Once indexing returns, the UI reports accounting calculation without
 retaining the scan's file counter; only the terminal refresh receipt establishes
 success.
 
-An interrupted incremental index pass can reuse committed lineage groups
-from its private SQLite checkpoint. Newly discovered unrelated logs do not
-invalidate those groups. A changed completed group, changed discovery
-quarantines, or an incompatible or corrupt checkpoint restarts incremental
-work from the last published index. Cold rebuilds use their existing staged
-workflow.
+After an interrupted incremental refresh, use **Update local usage** again.
+The client validates its private SQLite checkpoint and reuses completed groups
+whose files, selected parent, and source order still match. A new log can be
+processed on retry. If it changes a completed group's ordering or lineage,
+the client starts a fresh incremental pass from the last published index.
+The dashboard continues to serve that generation until publication succeeds.
+If finalization runs out of disk space, free space and retry. The completed
+checkpoint is retained. On a filesystem without copy-on-write support, allow
+space for a publication copy the size of the checkpoint.
+
+If the client reports that a newer writer is required, preserve the checkpoint
+alongside the live index and resume with a compatible client. A temporary
+file-access failure also leaves the checkpoint available for a later attempt.
 
 ## 4. Classify before acting
 

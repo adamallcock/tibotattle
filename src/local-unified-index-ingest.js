@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import { constants } from "node:fs";
 import { copyFile } from "node:fs/promises";
 import { resolve } from "node:path";
@@ -16,6 +17,7 @@ import {
   createEventSink,
   defaultRebuildWorkerCount,
   lineageComponents,
+  localUnifiedIndexStageFile,
   persistingCollector,
   rebuildLocalUnifiedIndex,
   sourceIdentityForInfo,
@@ -36,6 +38,7 @@ import {
   acquireLocalUnifiedIndexCheckpointLock,
   assertLocalUnifiedIndexNotNewer,
   assertSafeLocalUnifiedIndexTarget,
+  assertVacantLocalUnifiedIndexAttemptStage,
   beginUnifiedIndexCheckpointRun,
   createUnifiedIndexWriter,
   beginUnifiedIndexGeneration,
@@ -48,12 +51,13 @@ import {
   LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION,
   LOCAL_UNIFIED_INDEX_USER_VERSION,
   openLocalUnifiedIndex,
+  openLocalUnifiedIndexCheckpoint,
   publishStagedUnifiedIndex,
   recoverUnifiedIndexGenerations,
   readOrCreateDeviceSalt,
   readUnifiedIndexGenerationDescriptor,
   removeAbandonedLocalUnifiedIndexStages,
-  removeIfPresent,
+  removeLocalUnifiedIndexCheckpoint,
   sessionLocal,
   snapshotLocal,
   sourceLocal,
@@ -74,9 +78,12 @@ const LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION = "local-unified-index-v1";
 // fact or cursor semantics changed.
 const MINIMUM_ADDITIVE_INDEX_MIGRATION_USER_VERSION = 10;
 const CHECKPOINT_CONTEXT_KEY = "incremental_checkpoint_context";
+const CHECKPOINT_BASE_KEY = "incremental_checkpoint_base";
 const CHECKPOINT_COMPONENT_PREFIX = "incremental_checkpoint_component:";
 
-function checkpointSourceMaterial(info) {
+function checkpointSourceMaterial(info, ordinal) {
+  const lineage = info.lineage;
+  const base = lineage?.historyBase;
   return [
     sourceIdentityForInfo(info),
     sourceRepresentationIdentityForInfo(info),
@@ -86,19 +93,53 @@ function checkpointSourceMaterial(info) {
     Number(info.physicalSize ?? 0),
     info.compressed === true,
     info.quarantineReason ?? null,
+    ordinal ?? null,
+    // A selected leaf may change without moving in component order or altering
+    // any file. Its descendants still inherit a different lineage seed.
+    info.resolvedHead === true,
+    info.threadId ?? null,
+    info.rolloutId ?? null,
+    lineage?.sessionId ?? null,
+    lineage?.parentId ?? null,
+    lineage?.isInlineFork === true,
+    lineage?.historyMode ?? null,
+    base == null ? null : [base.rolloutId, base.endOrdinalExclusive, base.endByteOffset],
+    surfaceRow(lineage?.surfaceClassification),
   ];
 }
 
-function checkpointDigest(deviceSalt, material) {
-  return sourceLocal(deviceSalt, JSON.stringify(material)).toString("hex");
+function checkpointDigest(deviceSalt, kind, context, infos, ordinals = null) {
+  const digest = createHmac("sha256", deviceSalt)
+    .update(`app-usagemonitor/unified-index-checkpoint/${kind}/v2\0`);
+  // One JSON value per frame. JSON escapes any literal newlines in path or
+  // identifier strings, so a large component or quarantine set can be
+  // streamed without relaxing the bound on individual local digest subjects.
+  digest.update(JSON.stringify(context)).update("\n");
+  for (const info of infos) {
+    digest.update(JSON.stringify(checkpointSourceMaterial(info, ordinals?.get(info))))
+      .update("\n");
+  }
+  return digest.digest("hex");
 }
 
-function readPublishedGeneration(indexFile) {
-  // Read only the base generation here. The staged writer may be about to
-  // repair a supported index whose secondary indexes fail normal read checks.
+function readPublishedGeneration(indexFile, sourceOrdinals = null) {
+  // Read only the base generation and its source order. The staged writer may
+  // be about to repair a supported index whose secondary indexes fail normal
+  // read checks.
   const database = new DatabaseSync(indexFile, { readOnly: true, timeout: 5_000 });
   try {
     assertKnownLocalUnifiedIndexIdentity(database);
+    if (sourceOrdinals !== null) {
+      for (const row of database.prepare(
+        "SELECT source_local, source_ordinal FROM source_cursor",
+      ).iterate()) {
+        if (Number.isSafeInteger(row.source_ordinal) && row.source_ordinal >= 0) {
+          sourceOrdinals.set(
+            Buffer.from(row.source_local).toString("hex"), row.source_ordinal,
+          );
+        }
+      }
+    }
     return database.prepare(
       "SELECT value FROM meta WHERE key = 'current_generation_id'",
     ).get()?.value ?? null;
@@ -113,9 +154,86 @@ function checkpointBaseIdentity(metadata) {
   ].join(":");
 }
 
+function planIncrementalSourceOrdinals(deviceSalt, publishedOrdinals, infos, quarantined) {
+  const ordinals = new Map();
+  let nextOrdinal = -1;
+  for (const ordinal of publishedOrdinals.values()) {
+    nextOrdinal = Math.max(nextOrdinal, ordinal);
+  }
+  for (const info of infos) {
+    const sourceKey = sourceLocal(deviceSalt, sourceIdentityForInfo(info)).toString("hex");
+    ordinals.set(info, publishedOrdinals.get(sourceKey) ?? ++nextOrdinal);
+  }
+  for (const info of quarantined) ordinals.set(info, ++nextOrdinal);
+  return ordinals;
+}
+
+async function revalidateCheckpointSources(components, signal) {
+  for (const component of components) {
+    for (const info of component.members) {
+      if (signal?.aborted) throw fixedError("local_unified_index_aborted");
+      // Validate the discovery snapshot using the same descriptor and
+      // append-only rules as a scan, without parsing the reused byte range.
+      await withStableRolloutSource(info, () => null);
+    }
+  }
+}
+
+function incrementalCheckpointBaseKey(deviceSalt, metadata, generation) {
+  return checkpointDigest(deviceSalt, "base", [checkpointBaseIdentity(metadata), generation], []);
+}
+
+async function copyIndexExclusively(source, target) {
+  try {
+    // FICLONE uses a reflink where supported, with a regular copy fallback in Node.
+    await copyFile(source, target, constants.COPYFILE_EXCL | (constants.COPYFILE_FICLONE ?? 0));
+  } catch (error) {
+    if (["ENOSPC", "EDQUOT"].includes(error?.code)) {
+      throw fixedError("local_unified_index_space_unavailable");
+    }
+    throw fixedError("local_unified_index_unavailable");
+  }
+}
+
+async function pruneObsoleteIncrementalCheckpoint(indexFile, deviceSalt, {
+  lockHeld = false,
+} = {}) {
+  const stageFile = `${indexFile}.incremental-checkpoint`;
+  let releaseLock;
+  let database;
+  try {
+    if (await assertSafeLocalUnifiedIndexTarget(stageFile) === null) return;
+    if (!lockHeld) releaseLock = acquireLocalUnifiedIndexCheckpointLock(indexFile);
+    const stageMetadata = await assertSafeLocalUnifiedIndexTarget(stageFile);
+    const liveMetadata = await assertSafeLocalUnifiedIndexTarget(indexFile);
+    if (stageMetadata === null || liveMetadata === null) return;
+    const liveGeneration = readPublishedGeneration(indexFile);
+    const currentBase = incrementalCheckpointBaseKey(deviceSalt, liveMetadata, liveGeneration);
+    database = openLocalUnifiedIndex(stageFile, { readOnly: true, checkpoint: true });
+    assertKnownLocalUnifiedIndexIdentity(database);
+    const savedBase = database.prepare("SELECT value FROM meta WHERE key = ?").get(
+      CHECKPOINT_BASE_KEY,
+    )?.value;
+    database.close();
+    const checkedLive = await assertSafeLocalUnifiedIndexTarget(indexFile);
+    if (typeof savedBase === "string" && /^[0-9a-f]{64}$/u.test(savedBase)
+        && savedBase !== currentBase
+        && checkpointBaseIdentity(liveMetadata) === checkpointBaseIdentity(checkedLive)) {
+      await removeLocalUnifiedIndexCheckpoint(stageFile, stageMetadata);
+    }
+  } catch {
+    // Cleanup is best effort. An active writer, uncertain identity, or unreadable
+    // artifact cannot invalidate an already authoritative live generation.
+  } finally {
+    if (database?.isOpen) database.close();
+    releaseLock?.();
+  }
+}
+
 function readIncrementalCheckpoint(database, expected) {
   const meta = database.prepare("SELECT value FROM meta WHERE key = ?");
   if (meta.get(CHECKPOINT_CONTEXT_KEY)?.value !== expected.context
+      || meta.get(CHECKPOINT_BASE_KEY)?.value !== expected.baseKey
       || (meta.get("current_generation_id")?.value ?? null) !== expected.baseGeneration
       || database.prepare("PRAGMA quick_check").get()?.quick_check !== "ok") {
     return null;
@@ -626,6 +744,8 @@ export async function ingestLocalUnifiedIndexIncrement({
               "SELECT COUNT(*) AS count FROM usage_event_boundary",
             ).get()?.count ?? 0,
           );
+          unchangedDatabase.close();
+          await pruneObsoleteIncrementalCheckpoint(resolvedIndexFile, deviceSalt);
           return {
             status: "ingested",
             unchanged: true,
@@ -666,68 +786,77 @@ export async function ingestLocalUnifiedIndexIncrement({
       // The normal staged path handles missing/legacy indexes and any cursor
       // shape mismatch. Preflight is an optimization, never a gate.
     } finally {
-      unchangedDatabase?.close();
+      if (unchangedDatabase?.isOpen) unchangedDatabase.close();
     }
   }
   if (coldRebuildReason !== null) {
-    const parallelBackfillRequested = coldBackfillWorkerCount !== null
-      || sourceBytes >= MINIMUM_AUTOMATIC_PARALLEL_BACKFILL_BYTES;
-    const workerCount = parallelBackfillRequested
-      ? coldBackfillWorkerCount ?? defaultRebuildWorkerCount()
-      : 1;
-    const rebuilt = await rebuildLocalUnifiedIndex({
-      codexHome,
-      indexFile: resolvedIndexFile,
-      secretFile: secretFile
-        ?? defaultLocalUnifiedIndexSecretPath(resolvedIndexFile),
-      startAt,
-      endAt,
-      contractVersion,
-      workerCount,
-      commitRows,
-      maximumLineBytes,
-      attemptToken,
-      signal,
-      onProgress,
-      discoveryLimits,
-    });
-    return {
-      ...rebuilt,
-      status: "ingested",
-      unchanged: false,
-      rebuilt: true,
-      rebuildReason: coldRebuildReason,
-      sourcesSkipped: 0,
-      sourcesTouched: 0,
-      sourcesResumed: 0,
-      sourcesRescanned: rebuilt.sourcesScanned,
-      sourcesReparsedForParserVersion: 0,
-      usageRowsDeletedForReparse: 0,
-      quotaOccurrenceRowsDeletedForRescan: 0,
-      insertedUsageEvents: rebuilt.usageEvents,
-      insertedBoundaryLinks: rebuilt.boundaryLinks ?? 0,
-      totalUsageEvents: rebuilt.usageEvents,
-      totalBoundaryLinks: rebuilt.boundaryLinks ?? 0,
-    };
+    const releaseLock = acquireLocalUnifiedIndexCheckpointLock(resolvedIndexFile);
+    try {
+      const checkedLive = await assertSafeLocalUnifiedIndexTarget(resolvedIndexFile);
+      if (checkpointBaseIdentity(existingIndexMetadata) !== checkpointBaseIdentity(checkedLive)) {
+        throw fixedError("local_unified_index_checkpoint_base_changed");
+      }
+      const parallelBackfillRequested = coldBackfillWorkerCount !== null
+        || sourceBytes >= MINIMUM_AUTOMATIC_PARALLEL_BACKFILL_BYTES;
+      const workerCount = parallelBackfillRequested
+        ? coldBackfillWorkerCount ?? defaultRebuildWorkerCount()
+        : 1;
+      const rebuilt = await rebuildLocalUnifiedIndex({
+        codexHome,
+        indexFile: resolvedIndexFile,
+        secretFile: secretFile
+          ?? defaultLocalUnifiedIndexSecretPath(resolvedIndexFile),
+        startAt,
+        endAt,
+        contractVersion,
+        workerCount,
+        commitRows,
+        maximumLineBytes,
+        attemptToken,
+        signal,
+        onProgress,
+        discoveryLimits,
+      });
+      await pruneObsoleteIncrementalCheckpoint(resolvedIndexFile, deviceSalt, { lockHeld: true });
+      return {
+        ...rebuilt,
+        status: "ingested",
+        unchanged: false,
+        rebuilt: true,
+        rebuildReason: coldRebuildReason,
+        sourcesSkipped: 0,
+        sourcesTouched: 0,
+        sourcesResumed: 0,
+        sourcesRescanned: rebuilt.sourcesScanned,
+        sourcesReparsedForParserVersion: 0,
+        usageRowsDeletedForReparse: 0,
+        quotaOccurrenceRowsDeletedForRescan: 0,
+        insertedUsageEvents: rebuilt.usageEvents,
+        insertedBoundaryLinks: rebuilt.boundaryLinks ?? 0,
+        totalUsageEvents: rebuilt.usageEvents,
+        totalBoundaryLinks: rebuilt.boundaryLinks ?? 0,
+      };
+    } finally {
+      releaseLock();
+    }
   }
   // Keep one private SQLite stage beside the publication. The stage itself is
   // the checkpoint: its source cursors and facts commit together, while the
   // live index remains the last complete generation until final publication.
   const stageFile = `${resolvedIndexFile}.incremental-checkpoint`;
   const components = lineageComponents(infos, { groupThreadMembers: true });
-  const componentKeys = new Map(components.map((component) => [
-    component,
-    CHECKPOINT_COMPONENT_PREFIX + checkpointDigest(
-      deviceSalt, component.members.map(checkpointSourceMaterial),
-    ),
-  ]));
+  const quarantined = discovery.quarantined.toSorted((left, right) => (
+    left.rolloutKey.localeCompare(right.rolloutKey) || left.path.localeCompare(right.path)
+  ));
   const releaseLock = acquireLocalUnifiedIndexCheckpointLock(resolvedIndexFile);
   let database = null;
   let writer = null;
   let checkpointResume = null;
-  let copiedBase = false;
+  let copiedBase = null;
   let checkpointInitialized = false;
-  let publicationReady = false;
+  let publicationFile = null;
+  let publicationMetadata = null;
+  let publicationDatabase = null;
   try {
     const liveMetadata = await assertSafeLocalUnifiedIndexTarget(
       resolvedIndexFile,
@@ -735,10 +864,23 @@ export async function ingestLocalUnifiedIndexIncrement({
     );
     const liveExists = liveMetadata !== null;
     const baseIdentity = checkpointBaseIdentity(liveMetadata);
+    const publishedOrdinals = new Map();
     const expectedBaseGeneration = liveExists
-      ? readPublishedGeneration(resolvedIndexFile) : null;
-    const context = checkpointDigest(deviceSalt, [
-      "local-unified-index-checkpoint-v1",
+      ? readPublishedGeneration(resolvedIndexFile, publishedOrdinals) : null;
+    // A staged cursor may belong to a later component that completed first.
+    // Plan against the published base so retry uses uninterrupted discovery
+    // order, including when a newly discovered source sorts ahead of it.
+    const sourceOrdinals = planIncrementalSourceOrdinals(
+      deviceSalt, publishedOrdinals, infos, quarantined,
+    );
+    const componentKeys = new Map(components.map((component) => [
+      component,
+      CHECKPOINT_COMPONENT_PREFIX + checkpointDigest(
+        deviceSalt, "component", null, component.members, sourceOrdinals,
+      ),
+    ]));
+    const baseKey = incrementalCheckpointBaseKey(deviceSalt, liveMetadata, expectedBaseGeneration);
+    const context = checkpointDigest(deviceSalt, "context", [
       expectedBaseGeneration,
       baseIdentity,
       LOCAL_UNIFIED_INDEX_PARSER_VERSION,
@@ -748,52 +890,36 @@ export async function ingestLocalUnifiedIndexIncrement({
       contractVersion,
       startAt,
       endAt,
+      maximumLineBytes === undefined,
       maximumLineBytes ?? null,
-      discovery.quarantined.map(checkpointSourceMaterial),
-    ]);
-    if (await assertSafeLocalUnifiedIndexTarget(stageFile, { allowMissing: true })
-        !== null) {
-      let checkpointDatabase = null;
+    ], quarantined);
+    const candidate = localUnifiedIndexStageFile(resolvedIndexFile, "incremental", attemptToken);
+    const stageMetadata = await assertSafeLocalUnifiedIndexTarget(stageFile);
+    if (stageMetadata !== null && stageMetadata.size > 0) {
       try {
-        checkpointDatabase = openLocalUnifiedIndex(stageFile, {
-          recoverCheckpointJournal: true,
-        });
-        checkpointResume = readIncrementalCheckpoint(checkpointDatabase, {
+        database = await openLocalUnifiedIndexCheckpoint(stageFile, candidate);
+        checkpointResume = readIncrementalCheckpoint(database, {
           baseGeneration: expectedBaseGeneration,
+          baseKey,
           contractVersion,
           context,
           componentKeys: new Set(componentKeys.values()),
         });
-      } catch {
-        checkpointResume = null;
-      } finally {
-        checkpointDatabase?.close();
-      }
-      if (checkpointResume === null) await removeIfPresent(stageFile);
-    }
-    if (liveExists) {
-      const stageExists = await assertSafeLocalUnifiedIndexTarget(
-        stageFile,
-        { allowMissing: true },
-      ) !== null;
-      if (!stageExists) {
-        try {
-          await copyFile(
-            resolvedIndexFile,
-            stageFile,
-            constants.COPYFILE_EXCL | (constants.COPYFILE_FICLONE ?? 0),
-          );
-        } catch (error) {
-          if (error?.code === "EEXIST") throw error;
-          // APFS clone is the cheap path, but not every filesystem supports it.
-          await copyFile(resolvedIndexFile, stageFile, constants.COPYFILE_EXCL);
-        }
-        copiedBase = true;
+      } catch (error) {
+        if (error?.code !== "local_unified_index_checkpoint_corrupt") throw error;
       }
     }
-    database = openLocalUnifiedIndex(stageFile, {
-      create: !liveExists,
-    });
+    if (checkpointResume === null) {
+      if (database?.isOpen) database.close();
+      // Also clears a leftover journal after a crash between discarding a
+      // checkpoint and removing its journal. Never replay it into a fresh clone.
+      await removeLocalUnifiedIndexCheckpoint(stageFile, stageMetadata);
+      if (liveExists) {
+        await copyIndexExclusively(resolvedIndexFile, stageFile);
+        copiedBase = await assertSafeLocalUnifiedIndexTarget(stageFile, { allowMissing: false });
+      }
+      database = openLocalUnifiedIndex(stageFile, { create: !liveExists });
+    }
     const previousGenerationValue = database.prepare(
       "SELECT value FROM meta WHERE key = 'current_generation_id'",
     ).get()?.value;
@@ -828,8 +954,10 @@ export async function ingestLocalUnifiedIndexIncrement({
       ingestRunId: generation.ingestRunId,
     });
     const completed = checkpointResume?.completed ?? new Set();
+    const reusedComponents = [];
     if (checkpointResume === null) {
       writer.writeMeta(CHECKPOINT_CONTEXT_KEY, context);
+      writer.writeMeta(CHECKPOINT_BASE_KEY, baseKey);
       writer.flush();
     }
     checkpointInitialized = true;
@@ -936,33 +1064,6 @@ export async function ingestLocalUnifiedIndexIncrement({
     // id, so a child seeds from the selected head's freshest values. Retired
     // physical generations still emit facts but cannot replace that authority.
     const finalBySessionId = new Map();
-    const sourceOrdinals = new Map();
-    let nextSourceOrdinal = -1;
-    for (const cursor of cursors.values()) {
-      const ordinal = Number(cursor.source_ordinal);
-      if (Number.isSafeInteger(ordinal) && ordinal >= 0) {
-        nextSourceOrdinal = Math.max(nextSourceOrdinal, ordinal);
-      }
-    }
-    for (const info of infos) {
-      const sourceKey = sourceLocal(
-        deviceSalt,
-        sourceIdentityForInfo(info),
-      ).toString("hex");
-      const existing = cursors.get(sourceKey);
-      const stored = Number(existing?.source_ordinal);
-      if (Number.isSafeInteger(stored) && stored >= 0) {
-        sourceOrdinals.set(info, stored);
-      } else {
-        // Allocate missing ordinals in deterministic discovery order. The
-        // ordinal is only a local ordering token; no path is persisted.
-        sourceOrdinals.set(info, ++nextSourceOrdinal);
-      }
-    }
-    for (const info of discovery.quarantined
-      .toSorted((left, right) => left.rolloutKey.localeCompare(right.rolloutKey))) {
-      sourceOrdinals.set(info, ++nextSourceOrdinal);
-    }
     const currentSourceKeys = new Set([...infos, ...discovery.quarantined].map((info) => (
       sourceLocal(deviceSalt, sourceIdentityForInfo(info)).toString("hex")
     )));
@@ -1486,17 +1587,22 @@ export async function ingestLocalUnifiedIndexIncrement({
       if (signal?.aborted) throw fixedError("local_unified_index_aborted");
       const checkpointKey = componentKeys.get(component);
       if (completed.has(checkpointKey)) {
+        reusedComponents.push(component);
         diagnostics.sourcesSkipped += component.members.length;
+        let hasRuntimeIssues = false;
         for (const info of component.members) {
           const cursor = cursorByInfo.get(info);
           if (typeof cursor?.quarantine_code !== "string") continue;
+          if (!hasRuntimeIssues) writer.beginCheckpointGroup();
+          hasRuntimeIssues = true;
           const sessionKey = localForSession(info.lineage?.sessionId ?? info.rolloutKey);
           recordRuntimeIssue(info, cursor.quarantine_code, { sessionLocal: sessionKey });
           markUnavailable(info);
         }
+        if (hasRuntimeIssues) writer.completeCheckpointGroup({ changed: false });
         continue;
       }
-      writer.begin();
+      writer.beginCheckpointGroup();
       for (const info of component.members) {
         const sessionId = info.lineage?.sessionId ?? info.rolloutKey;
         if (!replacementSessionIds.has(sessionId)) continue;
@@ -1812,7 +1918,18 @@ export async function ingestLocalUnifiedIndexIncrement({
               && (startOffset === 0
                 || Number(cursor?.snapshots_persisted ?? 0) === 1),
           });
-          writer.writeSourceDiagnostics(state.sourceLocal, sourceDiagnostics);
+          if (resuming) {
+            // These flags describe the start of the file. An append seeds
+            // extraction from the cursor and does not add another start.
+            delete sourceDiagnostics.modelSeededFromLineage;
+            delete sourceDiagnostics.tierSeededFromLineage;
+          }
+          writer.writeSourceDiagnostics(state.sourceLocal, sourceDiagnostics, {
+            // A full, successful scan supersedes an earlier retained-history
+            // diagnostic. A tail scan must preserve the published prefix.
+            replace: !resuming && cursor !== undefined,
+            prefixGenerationId: resuming ? previousGenerationId : null,
+          });
           writer.writeGenerationSource({
             sourceLocal: state.sourceLocal,
             sourceOrdinal: state.sourceOrdinal,
@@ -1826,9 +1943,9 @@ export async function ingestLocalUnifiedIndexIncrement({
           });
           if (plans.length > 1) await reportProgress();
         }
+        if (componentChanged) writer.writeMeta(checkpointKey, "complete");
+        writer.completeCheckpointGroup({ changed: componentChanged });
         if (componentChanged) {
-          writer.writeMeta(checkpointKey, "complete");
-          writer.flush();
           completed.add(checkpointKey);
           await reportProgress();
         }
@@ -1852,22 +1969,47 @@ export async function ingestLocalUnifiedIndexIncrement({
       WHERE generation_id = ? AND status <> 'failed'`).get(
       generation.generationId,
     );
-    writer.writeMeta("source_count", discovery.discoveredSourceCount);
-    writer.writeMeta("source_bytes", sourceBytes);
-    writer.writeMeta("usage_events", totalUsageEvents);
-    writer.writeMeta("boundary_links", totalBoundaryLinks);
-    writer.writeMeta("generated_at", new Date().toISOString());
-    writer.writeMeta("contract_version", contractVersion);
-    writer.writeMeta(
+    if (signal?.aborted) throw fixedError("local_unified_index_aborted");
+    const closed = await writer.close({ integrityCheck: false, optimize: false });
+    writer = null;
+    const completedCheckpoint = await assertSafeLocalUnifiedIndexTarget(
+      stageFile, { allowMissing: false },
+    );
+    if (signal?.aborted) throw fixedError("local_unified_index_aborted");
+    // Finalization changes generation status and removes the resume markers.
+    // Do it on an attempt-owned clone so cancellation or an I/O failure right
+    // up to rename leaves the full checkpoint recoverable.
+    assertVacantLocalUnifiedIndexAttemptStage(candidate);
+    await copyIndexExclusively(stageFile, candidate);
+    publicationFile = candidate;
+    publicationMetadata = await assertSafeLocalUnifiedIndexTarget(
+      candidate, { allowMissing: false },
+    );
+    if (signal?.aborted) throw fixedError("local_unified_index_aborted");
+    assertVacantLocalUnifiedIndexAttemptStage(candidate, { allowMain: true });
+    publicationDatabase = openLocalUnifiedIndex(candidate, { staging: true });
+    const publicationWriter = createUnifiedIndexWriter(publicationDatabase, {
+      manualCommit: true,
+      contractVersion,
+      generationId: generation.generationId,
+      parserVersionId: generation.parserVersionId,
+      ingestRunId: generation.ingestRunId,
+    });
+    publicationWriter.writeMeta("source_count", discovery.discoveredSourceCount);
+    publicationWriter.writeMeta("source_bytes", sourceBytes);
+    publicationWriter.writeMeta("usage_events", totalUsageEvents);
+    publicationWriter.writeMeta("boundary_links", totalBoundaryLinks);
+    publicationWriter.writeMeta("generated_at", new Date().toISOString());
+    publicationWriter.writeMeta("contract_version", contractVersion);
+    publicationWriter.writeMeta(
       "source_identity_version",
       LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION,
     );
-    writer.writeMeta("rollout_discovery_fingerprint", discovery.fingerprint);
-    writer.writeMeta(
+    publicationWriter.writeMeta("rollout_discovery_fingerprint", discovery.fingerprint);
+    publicationWriter.writeMeta(
       "rollout_quarantine_fingerprint",
       discovery.quarantineFingerprint,
     );
-    if (signal?.aborted) throw fixedError("local_unified_index_aborted");
     const totalSkippedSourceCount = [...issueTotals.values()]
       .reduce((sum, totals) => sum + totals.sourceCount, 0);
     const totalSkippedSourceBytes = [...issueTotals.values()]
@@ -1875,10 +2017,11 @@ export async function ingestLocalUnifiedIndexIncrement({
     const generationStatus = totalSkippedSourceCount > 0
       ? "partial"
       : "complete";
-    writer.deleteMeta(CHECKPOINT_CONTEXT_KEY);
-    for (const key of completed) writer.deleteMeta(key);
-    writer.writeMeta("status", generationStatus);
-    writer.finalizeGeneration({
+    publicationWriter.deleteMeta(CHECKPOINT_CONTEXT_KEY);
+    publicationWriter.deleteMeta(CHECKPOINT_BASE_KEY);
+    for (const key of completed) publicationWriter.deleteMeta(key);
+    publicationWriter.writeMeta("status", generationStatus);
+    publicationWriter.finalizeGeneration({
       status: generationStatus,
       blockReason: generationStatus === "partial"
         ? "codex_rollout_sources_quarantined"
@@ -1894,15 +2037,10 @@ export async function ingestLocalUnifiedIndexIncrement({
       diagnosticsComplete: true,
     });
     const generationDescriptor = readUnifiedIndexGenerationDescriptor(
-      database,
+      publicationDatabase,
       generation.generationId,
     );
-    publicationReady = true;
-    const closed = await writer.close({
-      integrityCheck: true,
-      fsyncPath: stageFile,
-    });
-    writer = null;
+    const finalized = await publicationWriter.close();
     if (signal?.aborted) throw fixedError("local_unified_index_aborted");
     const liveBeforePublish = await assertSafeLocalUnifiedIndexTarget(resolvedIndexFile);
     if (baseIdentity !== checkpointBaseIdentity(liveBeforePublish)
@@ -1910,7 +2048,18 @@ export async function ingestLocalUnifiedIndexIncrement({
           && readPublishedGeneration(resolvedIndexFile) !== expectedBaseGeneration)) {
       throw fixedError("local_unified_index_checkpoint_base_changed");
     }
-    await publishStagedUnifiedIndex(stageFile, resolvedIndexFile, { signal });
+    await revalidateCheckpointSources(reusedComponents, signal);
+    await publishStagedUnifiedIndex(publicationFile, resolvedIndexFile, {
+      expectedTarget: liveMetadata,
+      signal,
+    });
+    publicationFile = null;
+    try {
+      await removeLocalUnifiedIndexCheckpoint(stageFile, completedCheckpoint);
+    } catch {
+      // Publication already advanced the base. A later pass can prune the
+      // obsolete checkpoint without downgrading this successful result.
+    }
     return {
       status: "ingested",
       indexFile: resolvedIndexFile,
@@ -1925,20 +2074,37 @@ export async function ingestLocalUnifiedIndexIncrement({
       insertedBoundaryLinks: closed.boundaryRows,
       totalUsageEvents,
       totalBoundaryLinks,
-      batches: closed.batches,
+      batches: closed.batches + finalized.batches,
       discoveryWallMs: discoveredAt - startedAt,
       scanWallMs: scannedAt - discoveredAt,
       wallMs: performance.now() - startedAt,
       peakRssBytes: process.memoryUsage.rss(),
     };
   } catch (error) {
-    // Closing SQLite rolls back the unfinished group. Earlier group commits
-    // and their checkpoint markers stay durable even after a scan exception.
-    if (database?.isOpen) database.close();
-    if (publicationReady || (copiedBase && !checkpointInitialized)) {
-      await removeIfPresent(stageFile);
+    if (database?.isOpen) {
+      try {
+        writer?.preserveCheckpointGroups();
+      } catch {
+        // Preserve the original failure. Closing rolls back any unsettled batch.
+      }
+      database.close();
     }
-    if (signal?.aborted) throw fixedError("local_unified_index_aborted");
+    if (publicationDatabase?.isOpen) publicationDatabase.close();
+    try {
+      if (publicationFile !== null && publicationMetadata !== null) {
+        await removeLocalUnifiedIndexCheckpoint(publicationFile, publicationMetadata, {
+          removeJournal: false,
+        });
+      }
+      if (copiedBase !== null && !checkpointInitialized) {
+        await removeLocalUnifiedIndexCheckpoint(stageFile, copiedBase);
+      }
+    } catch {
+      // Cleanup failures do not replace the indexing or publication error.
+    }
+    if (signal?.aborted && error?.published !== true) {
+      throw fixedError("local_unified_index_aborted");
+    }
     throw error;
   } finally {
     releaseLock();
