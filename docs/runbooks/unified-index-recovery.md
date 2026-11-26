@@ -187,6 +187,13 @@ rescanned. Once indexing returns, the UI reports accounting calculation without
 retaining the scan's file counter; only the terminal refresh receipt establishes
 success.
 
+An interrupted incremental index pass can reuse committed lineage groups
+from its private SQLite checkpoint. Newly discovered unrelated logs do not
+invalidate those groups. A changed completed group, changed discovery
+quarantines, or an incompatible or corrupt checkpoint restarts incremental
+work from the last published index. Cold rebuilds use their existing staged
+workflow.
+
 ## 4. Classify before acting
 
 | Observation | Classification | Next action |

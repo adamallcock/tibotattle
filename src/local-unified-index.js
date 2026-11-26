@@ -938,6 +938,38 @@ export async function assertSafeLocalUnifiedIndexTarget(
   return metadata;
 }
 
+// A separate SQLite write lock serializes checkpoint owners. SQLite releases
+// it when a worker exits, including after a crash. Keep the inode in place so
+// another process cannot acquire a lock on a replacement file.
+export function acquireLocalUnifiedIndexCheckpointLock(indexFile) {
+  const lockFile = `${indexFile}.checkpoint-lock.sqlite`;
+  const chain = captureSafeLocalUnifiedIndexDirectoryChain(lockFile);
+  if (safeLocalUnifiedIndexTargetSync(lockFile, { allowMissing: true }) === null) {
+    try {
+      reserveNewLocalUnifiedIndexTarget(lockFile, chain);
+    } catch (error) {
+      if (safeLocalUnifiedIndexTargetSync(lockFile, { allowMissing: true }) === null) {
+        throw error;
+      }
+    }
+  }
+  const target = safeLocalUnifiedIndexTargetSync(lockFile);
+  recheckLocalUnifiedIndexDirectoryChain(lockFile, chain);
+  const lock = new DatabaseSync(lockFile);
+  try {
+    recheckLocalUnifiedIndexDirectoryChain(lockFile, chain);
+    if (!sameLocalUnifiedIndexTarget(target, safeLocalUnifiedIndexTargetSync(lockFile))) {
+      throw fixedError("local_unified_index_file_invalid");
+    }
+    lock.exec("BEGIN IMMEDIATE");
+    return () => lock.close();
+  } catch (error) {
+    lock.close();
+    if (error?.errcode === 5) throw fixedError("local_unified_index_checkpoint_busy");
+    throw error;
+  }
+}
+
 /**
  * The device salt. 32 random bytes, owner-only, created once and never
  * rotated: it is the key for `session_local`, which is the join key of the
@@ -1632,6 +1664,7 @@ export function openLocalUnifiedIndex(indexFile, {
   readOnly = false,
   create = false,
   staging = false,
+  recoverCheckpointJournal = false,
   deferSecondaryIndexes = false,
   allowRecoveryLock = false,
 } = {}) {
@@ -1684,7 +1717,9 @@ export function openLocalUnifiedIndex(indexFile, {
           directoryChain,
         );
         preflight = new DatabaseSync(resolvedIndexFile, {
-          readOnly: true,
+          // A private checkpoint can have a hot rollback journal after a
+          // crash. SQLite must recover it before the compatibility read.
+          readOnly: !recoverCheckpointJournal,
           timeout: 5_000,
         });
         const preflightMetadata = safeLocalUnifiedIndexTargetSync(
@@ -1826,6 +1861,51 @@ export function beginUnifiedIndexGeneration(database, {
       database.exec("ROLLBACK");
     } catch {
       // Preserve original failure.
+    }
+    throw error;
+  }
+}
+
+/** Start a new writer run against an already durable in-progress checkpoint. */
+export function beginUnifiedIndexCheckpointRun(database, {
+  generationId,
+  parserVersion,
+  contractVersion,
+  receivedAtMs = Date.now(),
+} = {}) {
+  if (!Number.isSafeInteger(generationId) || generationId < 1
+      || typeof parserVersion !== "string" || parserVersion.length < 1
+      || typeof contractVersion !== "string" || contractVersion.length < 1
+      || !Number.isSafeInteger(receivedAtMs) || receivedAtMs < 0) {
+    throw fixedError("local_unified_index_generation_invalid");
+  }
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    const parserVersionId = Number(database.prepare(`
+      SELECT id FROM parser_version
+      WHERE parser_version = ? AND contract_version = ?
+    `).get(parserVersion, contractVersion)?.id);
+    const generation = database.prepare(`
+      SELECT status, parser_version_id, contract_version
+      FROM index_generation WHERE id = ?
+    `).get(generationId);
+    if (!Number.isSafeInteger(parserVersionId) || parserVersionId < 1
+        || generation?.status !== "in_progress"
+        || Number(generation.parser_version_id) !== parserVersionId
+        || generation.contract_version !== contractVersion) {
+      throw fixedError("local_unified_index_checkpoint_invalid");
+    }
+    const ingestRunId = Number(database.prepare(`
+      INSERT INTO ingest_run(received_at_ms, parser_version_id)
+      VALUES (?, ?)
+    `).run(receivedAtMs, parserVersionId).lastInsertRowid);
+    database.exec("COMMIT");
+    return { generationId, parserVersionId, ingestRunId };
+  } catch (error) {
+    try {
+      database.exec("ROLLBACK");
+    } catch {
+      // Preserve the original failure.
     }
     throw error;
   }
@@ -2059,6 +2139,7 @@ async function syncFile(path) {
  * to 36.3s with 10,000-row batches and this persistent connection.
  */
 export function createUnifiedIndexWriter(database, {
+  manualCommit = false,
   commitRows = DEFAULT_COMMIT_ROWS,
   receivedAtMs = Date.now(),
   parserVersion = LOCAL_UNIFIED_INDEX_PARSER_VERSION,
@@ -2361,6 +2442,7 @@ export function createUnifiedIndexWriter(database, {
     meta: database.prepare(`
       INSERT INTO meta(key, value) VALUES (?, ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value`),
+    deleteMeta: database.prepare("DELETE FROM meta WHERE key = ?"),
   };
 
   // Interning caches. Every dimension in this schema has at most a few
@@ -2399,7 +2481,7 @@ export function createUnifiedIndexWriter(database, {
 
   function step() {
     pending += 1;
-    if (pending >= commitRows) commit();
+    if (!manualCommit && pending >= commitRows) commit();
   }
 
   function internParserVersion(version) {
@@ -2961,6 +3043,12 @@ export function createUnifiedIndexWriter(database, {
       step();
     },
 
+    deleteMeta(key) {
+      begin();
+      statements.deleteMeta.run(key);
+      step();
+    },
+
     finalizeGeneration({
       status = "complete",
       blockReason = null,
@@ -3181,6 +3269,8 @@ export function createUnifiedIndexWriter(database, {
     flush() {
       commit();
     },
+
+    begin,
 
     /**
      * Settle the whole run: one optimize, one integrity check, one fsync.

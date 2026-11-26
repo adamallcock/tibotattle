@@ -327,7 +327,7 @@ export function surfaceRow(surfaceClassification) {
  * model, and keeping a component whole is what lets the same inheritance work
  * when components are spread across worker threads.
  */
-export function lineageComponents(infos) {
+export function lineageComponents(infos, { groupThreadMembers = false } = {}) {
   const byThreadId = new Map();
   const byRolloutId = new Map();
   for (const info of infos) {
@@ -341,6 +341,14 @@ export function lineageComponents(infos) {
   }
   const dependencies = new Map(infos.map((info) => [info, new Set()]));
   const neighbors = new Map(infos.map((info) => [info, new Set()]));
+  if (groupThreadMembers) {
+    for (const [first, ...rest] of byThreadId.values()) {
+      for (const member of rest) {
+        neighbors.get(first).add(member);
+        neighbors.get(member).add(first);
+      }
+    }
+  }
   function connect(info, dependency) {
     if (dependency === undefined || dependency === info) return;
     dependencies.get(info).add(dependency);

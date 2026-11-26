@@ -291,6 +291,22 @@ unfinished tails, or other closed source-level issues are quarantined rather
 than guessed. A malformed quota observation is omitted with a closed diagnostic
 without discarding other valid facts from that source.
 
+Incremental refreshes keep an owner-only SQLite checkpoint beside the published
+index. A separate SQLite write lock gives one refresh exclusive ownership of
+the checkpoint. Each changed lineage group commits its facts, diagnostics,
+cursors, and completion marker together using a durable rollback journal. The
+published generation stays readable until the staged generation is validated
+and atomically renamed into place.
+
+After an interruption, SQLite rolls back the unfinished transaction. A later
+refresh checks checkpoint integrity, the published base, the indexing
+versions and scan settings, and the physical state of each completed lineage
+group. New unrelated logs and changes to unfinished groups can be indexed
+without rereading completed groups. A change inside a completed group, a change
+to discovery quarantines, or an incompatible checkpoint restarts incremental
+work from the published index. Cold rebuilds keep their separate publication
+path.
+
 Historical usage plan attribution joins admitted `quota_occurrence` facts on
 source, byte offset, ordinal and observation time inside the published
 `generation_source` membership and scanned-byte boundary. The canonical
