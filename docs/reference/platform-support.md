@@ -7,19 +7,58 @@ status: maintained
 
 # Platform support and qualification
 
-[TiboTattle 0.1.30](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.30)
+[TiboTattle 0.1.31](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.31)
 ships Electron installers for macOS Apple silicon, macOS Intel, Windows x64 and
 Linux x86_64. [Current status](../current-status.md) ·
-[0.1.30 artifact hashes and assurances](https://github.com/adamallcock/tibotattle/releases/download/v0.1.30/release-manifest.json)
+[0.1.31 artifact hashes and assurances](https://github.com/adamallcock/tibotattle/releases/download/v0.1.31/release-manifest.json)
 
 ## Status matrix
 
-### 0.1.31 source candidate
+### 0.1.31 artifact qualification
 
-Candidate 0.1.31 targets macOS 14+ on Apple silicon and Intel, Windows x64,
-and Linux x86_64. The packaging build is `2026112701`, and both Mac
-architectures share bundle version `1039`. Final artifact and installed
-qualification for these targets are pending. [Candidate notes](../../release-notes/0.1.31.md)
+The tested installers bind to application source
+`a8a650092ca371db9df54279b86c34b947636909` and packaging build `2026112701`.
+Both Mac installers use bundle version `1039`.
+
+| Platform | Tested distribution | Proven final-artifact boundary | Qualification limits |
+|---|---|---|---|
+| macOS 14+ arm64 | 0.1.31 Apple silicon DMG | Developer ID, hardened runtime, notarization, stapling and Gatekeeper verified. [Clean install](https://github.com/adamallcock/tibotattle/actions/runs/45924618074), [isolated native Sparkle upgrade](https://github.com/adamallcock/tibotattle/actions/runs/45924618061) and [named Keychain scenarios](https://github.com/adamallcock/tibotattle/actions/runs/45925115092) passed. | Credential evidence covers the named Apple silicon fixtures. The initial locked test and identical-input retry are recorded below. |
+| macOS 14+ x86_64 | 0.1.31 Intel DMG | Developer ID, hardened runtime, notarization, stapling and Gatekeeper verified. [Clean install](https://github.com/adamallcock/tibotattle/actions/runs/45924871358) and [isolated native Sparkle upgrade](https://github.com/adamallcock/tibotattle/actions/runs/45924871972) passed. | Existing Keychain scenarios remain unqualified on Intel. |
+| Windows x64 | 0.1.31 NSIS installer | [Authenticode, timestamp and clean install](https://github.com/adamallcock/tibotattle/actions/runs/45923617244) passed. [Signed 0.1.30 to 0.1.31 replacement](https://github.com/adamallcock/tibotattle/actions/runs/45924645340) retained synthetic history, projects, threads, settings and opt-out through cold restart. | The run covers direct NSIS replacement. Automatic updater replacement, credential persistence, hosted enrollment and notifications remain unqualified by this run. |
+| Linux x86_64 | 0.1.31 AppImage | [AppImage package and extracted runtime](https://github.com/adamallcock/tibotattle/actions/runs/45923617306) and [native Xvfb/FUSE lifecycle](https://github.com/adamallcock/tibotattle/actions/runs/45924083368) passed. The lifecycle covered clean install, mismatched checksum refusal, isolated-feed 0.1.30 replacement, cold restart, retained state and host cleanup. | The disposable Ubuntu runner used an isolated feed. Physical desktop and production-feed installed replacement remain unqualified. |
+
+The first Apple silicon credential run passed the modern and invalid
+fixtures, then stopped at the process-group launch step of the locked
+fixture. A second dispatch with byte-identical inputs passed all three.
+Both archives were preserved and verified. These receipts cover the
+disposable 0.1.20 predecessor and the named fixtures.
+[Initial credential run](https://github.com/adamallcock/tibotattle/actions/runs/45924618257) ·
+[Successful identical-input run](https://github.com/adamallcock/tibotattle/actions/runs/45925115092)
+
+Both signed Mac ASARs also passed a synthetic companion recovery test. Host
+Node 26.2.0 on Apple silicon executed digest-verified JavaScript from each
+bundle, including the Intel ASAR. The isolated harness verified cancellation,
+the unchanged published index, reuse of saved work after a companion restart,
+and equality with uninterrupted totals. The installed GUI and updater evidence
+comes from the separate platform runs.
+[Release receipt](../receipts/2026-11-27-v0-1-31-release-publication.md)
+
+Both production native Sparkle runs upgraded the signed 0.1.18 predecessor
+to the exact 0.1.31 app through the retained feeds. The updater installed and
+relaunched the candidate, migrated the native state, preserved the retained
+rows, preferences, salt and opt-out, and verified restart without duplicates.
+[Apple silicon production Sparkle upgrade](https://github.com/adamallcock/tibotattle/actions/runs/45927919205) ·
+[Intel production Sparkle upgrade](https://github.com/adamallcock/tibotattle/actions/runs/45927985823)
+
+The production Electron updater upgraded the exact published 0.1.30
+predecessor on both architectures through the stable Electron feeds. After
+cold restart, the normal dashboard refresh indexed new synthetic activity once.
+A repeat refresh kept the published generation and added no duplicate usage
+or quota observations. The installed runs verified retained state and used the
+production feeds directly. The synthetic credential fixture remains a
+separate test.
+[Apple silicon production Electron update](https://github.com/adamallcock/tibotattle/actions/runs/45927636861) ·
+[Intel production Electron update](https://github.com/adamallcock/tibotattle/actions/runs/45927662967)
 
 ### 0.1.30 artifact qualification
 
