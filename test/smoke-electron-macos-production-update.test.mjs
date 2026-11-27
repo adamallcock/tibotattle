@@ -710,7 +710,10 @@ test('v6 post-restart activity adds one indexed event and quota observation with
   const codexHome = join(directory, 'codex'), stateRoot = join(directory, 'state');
   await mkdir(codexHome, { mode: 0o700 });
   await mkdir(join(codexHome, 'sessions'), { mode: 0o700 });
-  const before = await runner.seedProductionUpdateRetainedNativeState(stateRoot, codexHome, currentIndex, ingestLocalUnifiedIndexIncrement);
+  await runner.seedProductionUpdateRetainedNativeState(stateRoot, codexHome, currentIndex, ingestLocalUnifiedIndexIncrement);
+  const before = await runner.readProductionUpdateHistoryPartition(stateRoot, currentIndex);
+  assert.equal(before.quotaOccurrences, 2);
+  assert.equal(before.additional.quotaOccurrences, 0);
   const settings = { language: 'es', appearance: 'dark', refreshIntervalSeconds: 900, startAtLogin: false };
   const sharing = { enabled: false, transportStatus: 'off', noticeDue: false, basis: 'legacy_preserved' };
   const check = { stateRoot, before, settings, sharing };
@@ -722,7 +725,7 @@ test('v6 post-restart activity adds one indexed event and quota observation with
   const added = await ingestLocalUnifiedIndexIncrement(options);
   assert.equal(added.insertedUsageEvents, 1);
   const additional = await runner.readProductionUpdatePostRestartActivity(check);
-  assert.deepEqual([additional.usageRows, additional.quotaRows, additional.tokensInUncached], [1, 1, 105]);
+  assert.deepEqual([additional.usageRows, additional.quotaRows, additional.quotaOccurrences, additional.tokensInUncached], [1, 1, 1, 105]);
   const replay = await ingestLocalUnifiedIndexIncrement(options);
   assert.equal(replay.unchanged, true);
   assert.equal(replay.insertedUsageEvents, 0);
@@ -731,29 +734,145 @@ test('v6 post-restart activity adds one indexed event and quota observation with
     { updateStage: 'restart_activity_continuity' });
   await assert.rejects(runner.readProductionUpdatePostRestartActivity({ ...check, before: { ...before, recordDigest: 'wrong' } }),
     { replacementStage: 'retained_state_changed' });
+  // Canonical quota and usage rows cannot reveal a repeated source occurrence.
+  const canonicalState = await readSignedReplacementState(stateRoot);
+  const database = openLocalUnifiedIndex(options.indexFile);
+  try {
+    const insert = database.prepare(`INSERT INTO quota_occurrence
+      (generation_id, source_local, source_offset, source_ordinal, surface_id, canonical_observation_id, observed_at_ms,
+        provider, plan_type, limit_id, slot, slot_order, used_percent, resets_at_ms, duration_mins, admission)
+      SELECT generation_id, source_local, source_offset + 1, source_ordinal, surface_id, canonical_observation_id,
+        observed_at_ms, provider, plan_type, limit_id, slot, slot_order, used_percent, resets_at_ms, duration_mins, admission
+      FROM quota_occurrence ORDER BY observed_at_ms DESC LIMIT 1`);
+    assert.equal(insert.run().changes, 1);
+  } finally { database.close(); }
+  assert.deepEqual(await readSignedReplacementState(stateRoot), canonicalState);
+  await assert.rejects(runner.readProductionUpdatePostRestartActivity({ ...check, priorAdditional: additional }),
+    { updateStage: 'restart_activity_continuity' });
 });
 
-test('v6 detailed refresh requires a new successful ordinary dashboard action', async () => {
-  const make = values => {
-    let now = 0, clicks = 0;
-    const clock = { now: () => now, sleep: async ms => { now += ms; } };
-    const dashboard = { evaluate: async script => {
-      if (script.startsWith('Boolean(')) return true;
-      if (script.includes('b.click()')) { clicks += 1; return true; }
-      assert.match(script, /fetch\('\/api\/local\/refresh'/u);
-      return values.length > 1 ? values.shift() : values[0];
-    } };
-    return { dashboard, clock, clicks: () => clicks };
+const REFRESH_ACCEPTED = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const REFRESH_COMPETING = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+const REFRESH_GENERATION = { id: 4, fingerprint: 'generation-v2-' + 'a'.repeat(64) };
+const REFRESH_TERMINAL = { id: REFRESH_ACCEPTED, status: 'succeeded', mode: 'detailed', buttonReady: true,
+  indexStatus: 'ingested', unchanged: false, insertedUsageEvents: 1, usageEvents: 3, quotaOccurrences: 3,
+  generationId: REFRESH_GENERATION.id, generationFingerprint: REFRESH_GENERATION.fingerprint };
+
+function productionRefreshDashboard({ initialDisabled = 0, clickedStatus = 202, emitClickedRequest = true,
+  statusReads = [REFRESH_TERMINAL] } = {}) {
+  const url = 'http://127.0.0.1:49123/api/local/refresh';
+  const frame = { id: 'main', loaderId: 'dashboard', url: 'http://127.0.0.1:49123/' };
+  const listeners = new Map(), bodyRequests = [];
+  const emit = (event, params) => listeners.get(event)?.(params);
+  const post = (requestId, functionName, status) => {
+    emit('Network.requestWillBeSent', { requestId, frameId: frame.id, loaderId: frame.loaderId,
+      request: { method: 'POST', url }, initiator: { stack: { callFrames: [{ functionName }] } } });
+    emit('Network.responseReceived', { requestId, response: { url, status } });
+    emit('Network.loadingFinished', { requestId, encodedDataLength: 400 });
   };
-  const old = { id: 'before', status: 'succeeded', mode: 'detailed' };
-  const pass = make([old, old, { id: 'quick', status: 'succeeded', mode: 'quick' },
-    { id: 'after', status: 'succeeded', mode: 'detailed' }]);
-  assert.equal(await runner.runProductionUpdateDetailedRefresh(pass.dashboard, pass.clock), 'after');
-  assert.equal(pass.clicks(), 1);
-  const stale = make([old]);
-  await assert.rejects(runner.runProductionUpdateDetailedRefresh(stale.dashboard, stale.clock), { updateStage: 'restart_refresh_completion' });
-  const failed = make([old, { id: 'after', status: 'failed', mode: 'detailed' }]);
-  await assert.rejects(runner.runProductionUpdateDetailedRefresh(failed.dashboard, failed.clock), { updateStage: 'restart_refresh_failed' });
+  const requests = { Page: 0, Runtime: 0, Network: 0 };
+  let now = 0, clicks = 0, buttonReads = 0, polls = 0;
+  const dashboard = {
+    on(event, listener) {
+      assert.equal(listeners.has(event), false);
+      listeners.set(event, listener);
+      return () => listeners.delete(event);
+    },
+    async request(method, params) {
+      if (method === 'Page.getFrameTree') { requests.Page++; return { frameTree: { frame } }; }
+      if (method === 'Runtime.enable') { requests.Runtime++; return {}; }
+      if (method === 'Runtime.setMaxCallStackSizeToCapture') {
+        assert.deepEqual(params, { size: 20 });
+        requests.Runtime++;
+        return {};
+      }
+      if (method === 'Network.enable') { requests.Network++; return {}; }
+      assert.equal(method, 'Network.getResponseBody');
+      bodyRequests.push(params.requestId);
+      return { body: JSON.stringify({ refresh: { refreshId: REFRESH_ACCEPTED, status: 'running', mode: 'detailed' } }) };
+    },
+    async evaluate(script) {
+      if (script.includes('function productionUpdateRefreshClick')) {
+        assert.match(script, /if \(!button \|\| button\.disabled\) return false/u);
+        assert.match(script, /button\.click\(\)/u);
+        if (buttonReads++ < initialDisabled) return false;
+        clicks++;
+        post('background', 'automaticRefresh', 202);
+        if (emitClickedRequest) post('clicked', 'productionUpdateRefreshClick', clickedStatus);
+        return true;
+      }
+      polls++;
+      assert.match(script, /fetch\('\/api\/local\/refresh'/u);
+      return statusReads.length > 1 ? statusReads.shift() : statusReads[0];
+    },
+  };
+  const clock = { now: () => now, sleep: async ms => { now += ms; } };
+  return { dashboard, clock, bodyRequests, requests, listeners,
+    counts: () => ({ clicks, buttonReads, polls }) };
+}
+
+test('v6 waits for the button and binds the click to its accepted response and terminal attempt', async () => {
+  const fixture = productionRefreshDashboard({ initialDisabled: 2,
+    statusReads: [{ id: REFRESH_ACCEPTED, status: 'running', mode: 'detailed' },
+      REFRESH_TERMINAL] });
+  assert.deepEqual(await runner.runProductionUpdateDetailedRefresh(fixture.dashboard, fixture.clock), REFRESH_GENERATION);
+  assert.deepEqual(fixture.bodyRequests, ['clicked']);
+  assert.deepEqual(fixture.requests, { Page: 1, Runtime: 2, Network: 1 });
+  assert.deepEqual(fixture.counts(), { clicks: 1, buttonReads: 3, polls: 2 });
+  assert.equal(fixture.listeners.size, 0);
+});
+
+test('v6 waits for a successful startup attempt and enabled button before adding the new source', async () => {
+  const states = [{ id: null, status: 'idle', buttonReady: true },
+    { id: REFRESH_ACCEPTED, status: 'running', mode: 'quick', buttonReady: false },
+    { id: REFRESH_ACCEPTED, status: 'succeeded', mode: 'quick', buttonReady: false },
+    { id: REFRESH_ACCEPTED, status: 'succeeded', mode: 'quick', buttonReady: true }];
+  const fixture = productionRefreshDashboard({ statusReads: states });
+  await runner.waitForProductionUpdateStartupRefresh(fixture.dashboard, fixture.clock);
+  assert.deepEqual(fixture.counts(), { clicks: 0, buttonReads: 0, polls: 4 });
+  const failed = productionRefreshDashboard({ statusReads: [{ id: REFRESH_ACCEPTED, status: 'failed' }] });
+  await assert.rejects(runner.waitForProductionUpdateStartupRefresh(failed.dashboard, failed.clock),
+    { updateStage: 'restart_startup_refresh_failed' });
+});
+
+test('v6 requires three usage and quota occurrences and an unchanged indexed generation on replay', async () => {
+  const receipt = { ...REFRESH_TERMINAL, insertedUsageEvents: 0, unchanged: true };
+  const valid = productionRefreshDashboard({ statusReads: [receipt] });
+  assert.deepEqual(await runner.runProductionUpdateDetailedRefresh(valid.dashboard,
+    { ...valid.clock, previousGeneration: REFRESH_GENERATION }), REFRESH_GENERATION);
+  for (const patch of [{ quotaOccurrences: 4 }, { usageEvents: 4 }, { insertedUsageEvents: 1 },
+    { unchanged: false }, { generationId: 5 }, { generationFingerprint: 'generation-v2-' + 'b'.repeat(64) }]) {
+    const invalid = productionRefreshDashboard({ statusReads: [{ ...receipt, ...patch }] });
+    await assert.rejects(runner.runProductionUpdateDetailedRefresh(invalid.dashboard,
+      { ...invalid.clock, previousGeneration: REFRESH_GENERATION }), { updateStage: 'restart_refresh_index_result' });
+    assert.equal(invalid.counts().clicks, 1);
+  }
+  const activityAlreadyIngested = productionRefreshDashboard({ statusReads: [receipt] });
+  await assert.rejects(runner.runProductionUpdateDetailedRefresh(activityAlreadyIngested.dashboard, activityAlreadyIngested.clock),
+    { updateStage: 'restart_refresh_index_result' });
+});
+
+for (const options of [{ clickedStatus: 409 }, { emitClickedRequest: false }])
+  test(`v6 fails an unaccepted click despite a competing success (${Object.keys(options)[0]})`, async () => {
+    const fixture = productionRefreshDashboard({ ...options,
+      statusReads: [{ id: REFRESH_COMPETING, status: 'succeeded', mode: 'detailed' }] });
+    await assert.rejects(runner.runProductionUpdateDetailedRefresh(fixture.dashboard, fixture.clock),
+      { updateStage: 'restart_refresh_acceptance' });
+    assert.deepEqual(fixture.counts(), { clicks: 1, buttonReads: 1, polls: 0 });
+    assert.deepEqual(fixture.bodyRequests, []);
+    assert.equal(fixture.listeners.size, 0);
+  });
+
+for (const [statusReads, updateStage] of [
+  [[{ id: REFRESH_COMPETING, status: 'succeeded', mode: 'detailed' }], 'restart_refresh_attempt_replaced'],
+  [[{ id: REFRESH_ACCEPTED, status: 'failed', mode: 'detailed' }], 'restart_refresh_failed'],
+  [[{ id: REFRESH_ACCEPTED, status: 'running', mode: 'detailed' }], 'restart_refresh_completion'],
+]) test(`v6 accepts no terminal substitute and never repeats an accepted POST on ${updateStage}`, async () => {
+  const fixture = productionRefreshDashboard({ statusReads });
+  await assert.rejects(runner.runProductionUpdateDetailedRefresh(fixture.dashboard, fixture.clock), { updateStage });
+  assert.equal(fixture.counts().clicks, 1);
+  assert.deepEqual(fixture.bodyRequests, ['clicked']);
+  assert.equal(fixture.listeners.size, 0);
 });
 
 test('retained-source fixture refuses unsafe directories and never retires a changed usage source', async t => {

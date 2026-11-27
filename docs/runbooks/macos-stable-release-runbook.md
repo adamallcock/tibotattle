@@ -168,11 +168,15 @@ final application/helper absence checks pass. Persistent uncertainty at the
 deadline, unavailable inventory, and initial or pre-signal identity failures
 remain fatal.
 V6 checks retained history on the updater-created launch and after a controlled
-restart. It then adds one synthetic usage-and-quota observation to the
-disposable Codex home. Two ordinary detailed Refresh actions must index that
-observation once, retain the original rows and reproduce the added rows on
-replay without duplicates. This installed journey covers continuity and
-repeated refresh. Checkpoint interruption and recovery have their own
+restart. It waits for startup refresh to finish before adding one synthetic
+usage-and-quota observation to the disposable Codex home. For each of two ordinary detailed Refresh actions,
+the runner binds the accepted POST from the dashboard click to its terminal
+refresh ID. The first refresh must index the observation once. The replay must
+report zero inserts and the same generation, with three usage events and three
+source-scoped quota occurrences. Read-only SQLite checks bind the counts and
+digests of the original and added usage, canonical quota and source-scoped
+quota occurrence rows. This installed journey covers continuity
+and repeated refresh. Checkpoint interruption and recovery have their own
 [source tests](../../test/local-unified-index-checkpoint-batches.test.js).
 
 Retain the separate `tibotattle-signed-macos-production-update-v6` receipt for

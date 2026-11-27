@@ -202,31 +202,137 @@ export async function writeProductionUpdatePostRestartActivity(codexHome) {
     { flag: 'wx', mode: 0o600 });
 }
 
+export function readProductionUpdateHistoryPartition(stateRoot, index) {
+  return readSignedReplacementState(stateRoot, index, { partitionAt: POST_RESTART_ACTIVITY_TIME });
+}
+
 export async function readProductionUpdatePostRestartActivity({ stateRoot, before, settings, sharing, priorAdditional } = {}) {
-  const state = await readSignedReplacementState(stateRoot, undefined, { partitionAt: POST_RESTART_ACTIVITY_TIME });
+  const state = await readProductionUpdateHistoryPartition(stateRoot);
   assertSignedReplacementContinuity(before, state, settings, sharing);
   const { additional } = state;
-  if (additional.usageRows !== 1 || additional.quotaRows !== 1
+  if (before.quotaOccurrences !== 2 || state.quotaOccurrences !== before.quotaOccurrences
+    || state.quotaOccurrenceDigest !== before.quotaOccurrenceDigest
+    || additional.usageRows !== 1 || additional.quotaRows !== 1 || additional.quotaOccurrences !== 1
     || additional.tokensInUncached !== POST_RESTART_UNCACHED_TOKENS
-    || (priorAdditional && additional.recordDigest !== priorAdditional.recordDigest)) fail('restart_activity_continuity');
+    || (priorAdditional && (additional.recordDigest !== priorAdditional.recordDigest
+      || additional.quotaOccurrenceDigest !== priorAdditional.quotaOccurrenceDigest))) fail('restart_activity_continuity');
   return additional;
 }
 
-export async function runProductionUpdateDetailedRefresh(dashboard, clock) {
-  const button = 'document.querySelector("#refresh-button")';
-  const read = () => dashboard.evaluate(`(async()=>{
+const REFRESH_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const REFRESH_RECEIPT_LIMIT = 64 * 1024;
+const REFRESH_GENERATION_FINGERPRINT = /^generation-v2-[0-9a-f]{64}$/u;
+
+async function acceptProductionUpdateDetailedRefresh(dashboard, clock) {
+  const { frameTree } = await dashboard.request('Page.getFrameTree');
+  const frame = frameTree?.frame;
+  const page = URL.parse(frame?.url ?? '');
+  if (page?.protocol !== 'http:' || page.hostname !== '127.0.0.1' || !page.port
+    || typeof frame.id !== 'string' || !frame.id || typeof frame.loaderId !== 'string' || !frame.loaderId) {
+    fail('restart_refresh_frame');
+  }
+  const endpoint = new URL('/api/local/refresh', page).href;
+  let requestId = null, responseStatus = null, finished = false, invalid = false;
+  const listeners = [
+    dashboard.on('Network.requestWillBeSent', event => {
+      if (requestId !== null && event.requestId === requestId) { invalid = true; return; }
+      // The dashboard invokes fetch synchronously from its click handler.
+      // Distinguish that call from timers and other refresh sources on the same page.
+      const calls = event.initiator?.stack?.callFrames;
+      if (event.request?.method !== 'POST' || event.request.url !== endpoint
+        || event.frameId !== frame.id || event.loaderId !== frame.loaderId
+        || !Array.isArray(calls) || !calls.some(call => call?.functionName === 'productionUpdateRefreshClick')) return;
+      if (requestId !== null || typeof event.requestId !== 'string' || !event.requestId
+        || event.redirectResponse) { invalid = true; return; }
+      requestId = event.requestId;
+    }),
+    dashboard.on('Network.responseReceived', event => {
+      if (requestId === null || event.requestId !== requestId) return;
+      if (event.response?.url !== endpoint || responseStatus !== null) invalid = true;
+      responseStatus = event.response?.status;
+    }),
+    dashboard.on('Network.loadingFinished', event => {
+      if (requestId === null || event.requestId !== requestId) return;
+      if (!Number.isFinite(event.encodedDataLength) || event.encodedDataLength > REFRESH_RECEIPT_LIMIT) invalid = true;
+      finished = true;
+    }),
+    dashboard.on('Network.loadingFailed', event => {
+      if (requestId !== null && event.requestId === requestId) invalid = true;
+    }),
+  ];
+  try {
+    // Chromium's default reports only the leaf fetch call.
+    await dashboard.request('Runtime.enable');
+    await dashboard.request('Runtime.setMaxCallStackSizeToCapture', { size: 20 });
+    await dashboard.request('Network.enable', { maxResourceBufferSize: REFRESH_RECEIPT_LIMIT });
+    await until(() => dashboard.evaluate(`(function productionUpdateRefreshClick(){
+      const button=document.querySelector('#refresh-button');
+      if (!button || button.disabled) return false;
+      button.click();
+      return true;
+    })()`), 60000, 'restart_refresh_button', clock);
+    await until(() => {
+      if (invalid || (responseStatus !== null && responseStatus !== 202)) fail('restart_refresh_acceptance');
+      return finished && responseStatus === 202;
+    }, 60000, 'restart_refresh_acceptance', clock);
+    const response = await dashboard.request('Network.getResponseBody', { requestId });
+    if (invalid || typeof response?.body !== 'string' || response.body.length > REFRESH_RECEIPT_LIMIT) fail('restart_refresh_acceptance');
+    let refresh;
+    try {
+      const body = response.base64Encoded ? Buffer.from(response.body, 'base64').toString('utf8') : response.body;
+      refresh = JSON.parse(body)?.refresh;
+    } catch { fail('restart_refresh_acceptance'); }
+    if (refresh?.mode !== 'detailed' || refresh.status !== 'running'
+      || typeof refresh.refreshId !== 'string' || !REFRESH_ID.test(refresh.refreshId)) fail('restart_refresh_acceptance');
+    return refresh.refreshId;
+  } finally {
+    for (const unsubscribe of listeners) unsubscribe();
+  }
+}
+
+const REFRESH_FAILURE_STATUSES = ['failed', 'cancelled', 'degraded'];
+
+function readProductionUpdateRefresh(dashboard) {
+  return dashboard.evaluate(`(async()=>{
     const r=await fetch('/api/local/refresh',{cache:'no-store'});
     const v=r.ok?(await r.json()).refresh:null;
-    return v?{id:v.refreshId,status:v.status,mode:v.mode}:null;
+    if (!v) return null;
+    const button=document.querySelector('#refresh-button');
+    const index=v.result?.unifiedIndex, generation=index?.generation;
+    return { id:v.refreshId, status:v.status, mode:v.mode, buttonReady:!!button && !button.disabled,
+      indexStatus:index?.status, unchanged:index?.unchanged, insertedUsageEvents:index?.insertedUsageEvents,
+      usageEvents:generation?.usageEvents, quotaOccurrences:generation?.quotaOccurrences,
+      generationId:generation?.id, generationFingerprint:generation?.fingerprint };
   })()`);
-  await until(() => dashboard.evaluate(`Boolean(${button} && !${button}.disabled)`), 60000, 'restart_refresh_button', clock);
-  const before = await read();
-  if (await dashboard.evaluate(`(()=>{const b=${button};if(!b||b.disabled)return false;b.click();return true})()`) !== true) fail('restart_refresh_action');
+}
+
+export async function waitForProductionUpdateStartupRefresh(dashboard, clock) {
+  await until(async () => {
+    const refresh = await readProductionUpdateRefresh(dashboard);
+    if (REFRESH_FAILURE_STATUSES.includes(refresh?.status)) fail('restart_startup_refresh_failed');
+    return refresh?.buttonReady === true && refresh.status === 'succeeded'
+      && ['quick', 'detailed'].includes(refresh.mode) && typeof refresh.id === 'string' && REFRESH_ID.test(refresh.id);
+  }, 60000, 'restart_startup_refresh_completion', clock);
+}
+
+export async function runProductionUpdateDetailedRefresh(dashboard, { previousGeneration = null, ...clock } = {}) {
+  const refreshId = await acceptProductionUpdateDetailedRefresh(dashboard, clock);
   return until(async () => {
-    const refresh = await read();
-    if (!refresh?.id || refresh.id === before?.id || refresh.mode !== 'detailed') return null;
-    if (['failed', 'cancelled', 'degraded'].includes(refresh.status)) fail('restart_refresh_failed');
-    return refresh.status === 'succeeded' ? refresh.id : null;
+    const refresh = await readProductionUpdateRefresh(dashboard);
+    if (refresh === null) return null;
+    // The installed API exposes only the latest receipt. A later attempt
+    // cannot establish terminal evidence for the accepted request.
+    if (refresh?.id !== refreshId || refresh.mode !== 'detailed') fail('restart_refresh_attempt_replaced');
+    if (REFRESH_FAILURE_STATUSES.includes(refresh.status)) fail('restart_refresh_failed');
+    if (refresh.status !== 'succeeded') return null;
+    const replay = previousGeneration !== null;
+    if (refresh.indexStatus !== 'ingested' || refresh.unchanged !== replay
+      || refresh.insertedUsageEvents !== (replay ? 0 : 1) || refresh.usageEvents !== 3 || refresh.quotaOccurrences !== 3
+      || !Number.isSafeInteger(refresh.generationId) || refresh.generationId < 1
+      || typeof refresh.generationFingerprint !== 'string' || !REFRESH_GENERATION_FINGERPRINT.test(refresh.generationFingerprint)
+      || (replay && (refresh.generationId !== previousGeneration.id
+        || refresh.generationFingerprint !== previousGeneration.fingerprint))) fail('restart_refresh_index_result');
+    return { id: refresh.generationId, fingerprint: refresh.generationFingerprint };
   }, 60000, 'restart_refresh_completion', clock);
 }
 
@@ -539,8 +645,12 @@ export async function runProductionUpdate(options) {
       await until(async () => (await inspectNativeElectronHandoverCompletion({ userDataRoot: profile })).status === 'completed', 120000, 'predecessor_migration');
       const stateRoot = join(profile, 'companion-state'), settingsFile = join(profile, 'desktop-settings', 'desktop-settings-v1.json');
       const sharing = await until(async () => { const value = await active.readSharing(); return value?.available && value?.current ? value : null; }, 30000, 'sharing');
-      const before = await readSignedReplacementState(stateRoot, index);
+      const before = route?.checkPostRestartActivity
+        ? await readProductionUpdateHistoryPartition(stateRoot, index) : await readSignedReplacementState(stateRoot, index);
       assertSignedReplacementContinuity(seeded, before, JSON.parse(await readFile(settingsFile)), sharing);
+      if (route?.checkPostRestartActivity && (before.quotaOccurrences !== 2 || before.additional.quotaOccurrences !== 0)) {
+        fail('predecessor_fixture_state');
+      }
       await absent(join(stateRoot, 'accountless-device-binding-v1.json'));
       // The namespace's static dependencies remain loaded after owned scratch
       // removal; the readiness probe uses only its read-only public API.
@@ -615,15 +725,17 @@ export async function runProductionUpdate(options) {
     assertSignedReplacementContinuity(before, await readSignedReplacementState(stateRoot), JSON.parse(await readFile(settingsFile)), afterSharing);
     await absent(join(stateRoot, 'accountless-device-binding-v1.json'));
     if (route?.checkPostRestartActivity) {
+      stage = 'post_restart_startup_refresh';
+      await waitForProductionUpdateStartupRefresh(active.dashboard);
       stage = 'post_restart_activity';
       await writeProductionUpdatePostRestartActivity(codex);
-      await runProductionUpdateDetailedRefresh(active.dashboard);
+      const generation = await runProductionUpdateDetailedRefresh(active.dashboard);
       const readContinuity = async priorAdditional => readProductionUpdatePostRestartActivity({ stateRoot, before,
         settings: JSON.parse(await readFile(settingsFile)), sharing: await active.readSharing(), priorAdditional });
       const additional = await readContinuity();
       proof.postRestartActivityIndexed = true;
       stage = 'post_restart_refresh_replay';
-      await runProductionUpdateDetailedRefresh(active.dashboard);
+      await runProductionUpdateDetailedRefresh(active.dashboard, { previousGeneration: generation });
       await readContinuity(additional);
       await absent(join(stateRoot, 'accountless-device-binding-v1.json'));
       proof.postRestartRefreshNoDuplicates = true;
