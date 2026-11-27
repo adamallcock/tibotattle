@@ -98,7 +98,7 @@ export const localCodexLogScanner = createLocalCodexLogScanner(
 );
 
 const codexBinaryOptions = { readWindowsPackageBinaries: readWindowsCodexPackageBinaries };
-const resolveLocalCodexBinary = () => findCodexBinary(codexBinaryOptions);
+const resolveLocalCodexBinary = ({ signal } = {}) => findCodexBinary({ ...codexBinaryOptions, signal });
 
 export const localCodexAccount = Object.freeze({
   createAppServerClient: () => new CodexAppServerClient({ resolveBinary: resolveLocalCodexBinary }),

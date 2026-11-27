@@ -250,10 +250,39 @@ test("Windows binary discovery follows package rotation and honors an executable
   assert.equal(queries, 3);
 });
 
+test("Closing the Codex client aborts binary discovery and prevents a late spawn", async () => {
+  const lookup = Promise.withResolvers();
+  let lookupSignal;
+  let lookups = 0;
+  let spawns = 0;
+  const client = new accountFacade.CodexAppServerClient({
+    resolveBinary({ signal }) {
+      lookups += 1;
+      lookupSignal = signal;
+      return lookup.promise;
+    },
+    spawnProcess() {
+      spawns += 1;
+      assert.fail("A closed client must not start a process");
+    },
+  });
+  const starting = client.start();
+  client.close();
+  assert.equal(lookupSignal.aborted, true);
+  lookup.resolve("codex");
+  const closed = { name: "CodexAppServerError", code: "temporary_disconnect" };
+  await assert.rejects(starting, closed);
+  await assert.rejects(client.start(), closed);
+  assert.equal(lookups, 1);
+  assert.equal(spawns, 0);
+});
+
 test("Windows package lookup uses the system shell with a bounded, isolated environment", async () => {
   const location = "D:\\Apps\\Codex fixture 汉";
   let invocation;
+  const { signal } = new AbortController();
   const binaries = await readWindowsCodexPackageBinaries({
+    signal,
     environment: {
       SystemRoot: "C:\\Windows",
       PATH: "C:\\Synthetic\\untrusted",
@@ -288,6 +317,7 @@ test("Windows package lookup uses the system shell with a bounded, isolated envi
     maxBuffer: 16 * 1024,
     timeout: 5_000,
     windowsHide: true,
+    signal,
   });
 });
 

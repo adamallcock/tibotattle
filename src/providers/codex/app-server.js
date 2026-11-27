@@ -60,6 +60,7 @@ async function resolveCodexBinary({
   platform = process.platform,
   applicationsDir = "/Applications",
   readWindowsPackageBinaries = null,
+  signal,
 } = {}) {
   const override = environment.CODEX_BIN;
   if (typeof override === "string" && override.length > 0
@@ -67,7 +68,7 @@ async function resolveCodexBinary({
     return { binary: override, source: "environment_override", location: "explicit_override" };
   }
   if (platform === "win32" && readWindowsPackageBinaries !== null) {
-    for (const binary of await readWindowsPackageBinaries({ environment })) {
+    for (const binary of await readWindowsPackageBinaries({ environment, signal })) {
       if (await isExecutable(binary, accessFile, statFile)) {
         return { binary, source: "codex_bundled", location: "windows_registered_package" };
       }
@@ -185,6 +186,8 @@ function classifyAppServerFailure(error, stderr = "") {
 }
 
 export class CodexAppServerClient extends EventEmitter {
+  #binaryLookupAbort = new AbortController();
+
   constructor({
     timeoutMs = DEFAULT_TIMEOUT_MS,
     spawnProcess = spawn,
@@ -205,8 +208,11 @@ export class CodexAppServerClient extends EventEmitter {
   }
 
   async start() {
+    const { signal } = this.#binaryLookupAbort;
+    signal.throwIfAborted();
     if (this.child) return this;
-    const binary = await this.resolveBinary();
+    const binary = await this.resolveBinary({ signal });
+    signal.throwIfAborted();
     try {
       this.child = this.spawnProcess(binary, ["app-server"], {
         stdio: ["pipe", "pipe", "pipe"],
@@ -329,9 +335,11 @@ export class CodexAppServerClient extends EventEmitter {
   close() {
     if (this.closed) return;
     this.closed = true;
+    const error = new CodexAppServerError("temporary_disconnect", "Codex app-server client closed");
+    this.#binaryLookupAbort.abort(error);
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
-      pending.reject(new CodexAppServerError("temporary_disconnect", "Codex app-server client closed"));
+      pending.reject(error);
     }
     this.pending.clear();
     this.lines?.close();

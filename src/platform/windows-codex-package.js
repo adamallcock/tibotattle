@@ -25,6 +25,7 @@ function isAbsoluteDrivePath(value) {
 export async function readWindowsCodexPackageBinaries({
   environment = process.env,
   runFile = execFileAsync,
+  signal,
 } = {}) {
   const systemRoot = environment.SystemRoot;
   if (!isAbsoluteDrivePath(systemRoot)) return [];
@@ -50,6 +51,7 @@ export async function readWindowsCodexPackageBinaries({
       maxBuffer: 16 * 1024,
       timeout: 5_000,
       windowsHide: true,
+      signal,
     });
     const locations = JSON.parse(stdout);
     if (!Array.isArray(locations) || locations.length > MAXIMUM_PACKAGES) return [];
