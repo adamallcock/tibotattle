@@ -106,9 +106,13 @@ import {
 import { compiledBaselineCatalogManifest } from "../postgres-catalog-store";
 import { ANALYTICS_V2_SINGLETON_ID, ANALYTICS_V2_TABLES, type OriginRouteModule } from "./contract";
 import { analyticsV2BaselineRunStamp, analyticsV2BundledKernelIdentity,
-  analyticsV2KernelRegistry, resolveAnalyticsV2Kernel } from "./kernel";
-import { readAnalyticsV2RepriceEquivalences } from "./reprice-read";
-import { ANALYTICS_V2_REPRICE_LIMITS } from "./reprice";
+  analyticsV2KernelRegistry, resolveAnalyticsV2Kernel, type AnalyticsV2RunStamp } from "./kernel";
+import {
+  analyticsV2RepriceTarget,
+  readAnalyticsV2RepriceMetadata,
+  validAnalyticsV2RepriceStoredReceipt,
+} from "./reprice-read";
+import { ANALYTICS_V2_REPRICE_LIMITS, ANALYTICS_V2_REPRICE_TABLES } from "./reprice";
 import { readAnalyticsV2ExclusionsFromClient } from "./owners";
 import { isKernel10PublishedDailyPayload } from "./published-spend-compatibility";
 import {
@@ -192,6 +196,7 @@ interface StoredDailyRow {
 }
 
 type SpendEquivalence = { readonly registrySha256: string; readonly pricingMethodVersion: string };
+type SpendProofHead = { readonly day: string; readonly revision: number; readonly payloadSha256: string };
 
 interface StoredRead {
   readonly rows: readonly StoredDailyRow[];
@@ -251,6 +256,72 @@ function noStore(response: Response): Response {
 
 function table(schema: string, name: string): string {
   return `${quotePostgresIdentifier(schema)}.${quotePostgresIdentifier(name)}`;
+}
+
+/** A public read validates saved metadata for completed proofs without loading their inputs. */
+async function readDailySpendEquivalences(client: PostgresClient, schema: string, stamp: AnalyticsV2RunStamp,
+  heads: readonly SpendProofHead[]): Promise<ReadonlyMap<string, SpendEquivalence>> {
+  const output = new Map<string, SpendEquivalence>();
+  const target = analyticsV2RepriceTarget(stamp);
+  const { rows: proofs } = await client.query<{
+    day: string; revision: number; payload_sha256: string; source_sha256: string;
+    exclusions_sha256: string; receipt: unknown; plan_sha256: string;
+  }>(`SELECT e.day::text,e.revision,e.payload_sha256::text,e.source_sha256::text,
+    e.exclusions_sha256::text,r.receipt,r.plan_sha256::text
+    FROM ${table(schema, ANALYTICS_V2_REPRICE_TABLES.equivalences)} e
+    JOIN ${table(schema, ANALYTICS_V2_REPRICE_TABLES.runs)} r ON r.run_id=e.run_id
+    WHERE e.day=ANY($1::date[]) AND e.kernel_id=$2 AND e.manifest_version=$3
+      AND e.registry_sha256=$4 AND e.pricing_method_version=$5
+      AND r.kernel_id=e.kernel_id AND r.manifest_version=e.manifest_version
+      AND r.registry_sha256=e.registry_sha256 AND r.pricing_method_version=e.pricing_method_version
+      AND r.receipt ->> 'status'='complete' ORDER BY e.day,e.revision LIMIT 1001`,
+  [heads.map((h) => h.day), target.kernelId, target.manifestVersion, target.registrySha256, target.pricingMethodVersion]);
+  if (proofs.length > 1000) return output;
+  const validProofs = proofs.filter((proof) => validAnalyticsV2RepriceStoredReceipt(proof.receipt, proof.plan_sha256)
+    && (proof.receipt as { counts: { equivalent: number } }).counts.equivalent > 0);
+  const matchesHead = (row: Readonly<Record<string, unknown>>, head: SpendProofHead) =>
+    row.day === head.day && row.payload_sha256 === head.payloadSha256
+      && (row.revision === head.revision || row.revision === String(head.revision));
+  const candidates = heads.filter((head) => validProofs.some((proof) => matchesHead(proof, head)));
+  if (candidates.length === 0) return output;
+
+  const days = candidates.map((head) => head.day).sort();
+  const limits = ANALYTICS_V2_REPRICE_LIMITS;
+  const metadata = await readAnalyticsV2RepriceMetadata(client, {
+    schema, stamp, headDays: days,
+    bounds: { fromDay: days[0]!, throughDay: days.at(-1)!, maxDays: limits.days,
+      maxMembers: limits.members, maxInputBytes: limits.inputBytes },
+  });
+  if (metadata.caps.heads || metadata.caps.members) return output;
+
+  // Planning caps are cumulative because execution loads all selected inputs.
+  // For the public reader, complete bounded metadata is sufficient to check
+  // the same three limits independently for each previously proved day.
+  const sizes = new Map<string, { inputBytes: number; valuesBytes: number; events: number }>();
+  if (metadata.caps.inputBytes) {
+    for (const row of metadata.memberRows) {
+      const day = String(row.day);
+      const size = sizes.get(day) ?? { inputBytes: 0, valuesBytes: 0, events: 0 };
+      // The shared metadata reader validates non-null lengths and event counts.
+      size.inputBytes += Number(row.input_bytes ?? 0);
+      size.valuesBytes += Number(row.values_bytes ?? 0);
+      size.events += Number(row.input_events ?? 0);
+      sizes.set(day, size);
+    }
+  }
+  for (const head of candidates) {
+    const size = sizes.get(head.day);
+    if (size && (size.inputBytes > limits.inputBytes || size.valuesBytes > limits.inputBytes || size.events > limits.events)) {
+      continue;
+    }
+    if (metadata.headRows.some((stored) => matchesHead(stored, head))
+      && validProofs.some((proof) => matchesHead(proof, head)
+        && proof.source_sha256 === metadata.sourceSha256.get(head.day)
+        && proof.exclusions_sha256 === metadata.exclusionsSha256)) {
+      output.set(head.day, { registrySha256: target.registrySha256, pricingMethodVersion: target.pricingMethodVersion });
+    }
+  }
+  return output;
 }
 
 // `day` and `released_at` are cast so the statement serves the same strings
@@ -411,8 +482,8 @@ async function readStored(
         } catch { return []; }
       });
       for (let start = 0; start < heads.length; start += ANALYTICS_V2_REPRICE_LIMITS.days) {
-        const proof = await readAnalyticsV2RepriceEquivalences(client, { schema, stamp,
-          heads: heads.slice(start, start + ANALYTICS_V2_REPRICE_LIMITS.days) });
+        const proof = await readDailySpendEquivalences(client, schema, stamp,
+          heads.slice(start, start + ANALYTICS_V2_REPRICE_LIMITS.days));
         for (const [day, equivalent] of proof) output.set(day, equivalent);
       }
       return output;

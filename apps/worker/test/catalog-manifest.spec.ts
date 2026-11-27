@@ -148,11 +148,22 @@ describe("baseline projection (manifest version 1)", () => {
     const signer = await syntheticSigner();
     const { envelopeText } = await signer.sign(current);
     const verified = await verifyCatalogEnvelope(envelopeText, { trustedKeys: signer.trustedKeys });
+    await assertCatalogManifestSuccessor({ held: compiledBaselineCatalogManifest(), heldDigest: CATALOG_BASELINE_DIGEST,
+      next: verified.manifest, digest: webCryptoSha256Hex });
     const manifestCards = activeCatalogPriceCards(verified.manifest) as unknown as readonly AccountingPriceCard[];
     expect(manifestCards).not.toBe(APP_OFFICIAL_PRICE_CARDS);
     expect(JSON.stringify(manifestCards)).toBe(JSON.stringify(APP_OFFICIAL_PRICE_CARDS));
 
     const context = { priceEpochBasis: "event_time_when_registry_has_effective_evidence" } as const;
+    for (const [pricedAt, totalUsd] of [["2027-03-01T07:59:59.999Z", "0.000006"],
+      ["2027-03-01T08:00:00.000Z", "0.000012"]]) {
+      const price = priceUsageEvent({ provider: "openai", model: "gpt-6.2-sol", apiTier: "ultrafast", pricedAt,
+        totalInputContextTokens: "1", components: { inputUncachedTokens: 1 } }, {
+        priceCards: manifestCards, pricingContext: context,
+      });
+      expect(price).toMatchObject({ totalUsd, coverageStatus: "fully_priced" });
+    }
+
     let events = 0;
     let priced = 0;
     const eventTimes = (card: PriceCard) => {
