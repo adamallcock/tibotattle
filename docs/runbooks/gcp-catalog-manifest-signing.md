@@ -45,6 +45,13 @@ time is beyond a text check; review covers that. KM-4 widens the ratchet's
 allowlist on purpose. The PostgreSQL spec proves an empty store under the
 real pins serves the compiled baseline.
 
+The cutover manifest retains its original canonical payload bytes. For
+successor data, a date-only price-card bound covers the entire UTC day and a
+bound with milliseconds denotes one inclusive UTC instant. Preserve the exact
+strings from the compiled registry in both the card and its provenance. The
+GPT-6.2 Ultrafast launch card ends at `2027-03-01T07:59:59.999Z` and the
+list-price card starts at `2027-03-01T08:00:00.000Z`.
+
 ## Custody
 
 - The four private keys exist only in the owner's macOS login Keychain, as

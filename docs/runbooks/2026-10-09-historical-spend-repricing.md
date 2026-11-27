@@ -133,8 +133,14 @@ membership, usage coverage or other aggregate evidence under a pricing change.
 An equivalence proof binds the old day, revision and payload digest, saved
 source digest, exclusions digest, target kernel/manifest/registry/pricing method
 and completed repricing run. The public reader revalidates these bindings
-before presenting the target price identity. Unknown, capped or unavailable
-proof is withheld; it never rewrites an old amount or asserts current pricing.
+before presenting the target price identity. With complete bounded metadata,
+it checks the compressed input bytes, saved values bytes and input-event limits
+for each proved day independently. Combined totals still cap writer planning
+and execution, which load the selected documents. The public reader handles
+up to 366 requested days, in batches of at most 32 candidates. It reads up to
+1,000 proof rows and 1,000 member rows per batch, with an extra row in each read
+to detect overflow. Incomplete, unavailable or over-limit batch metadata
+withholds proof. The published amount and revision remain immutable.
 
 Publication changes, contribution versions, input archives, equivalences and
 the completed-run receipt commit atomically. A successfully committed run UUID
