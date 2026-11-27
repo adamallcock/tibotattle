@@ -3,31 +3,54 @@ title: Current product and release status
 date: 2026-11-27
 type: status
 status: current
-source_commit: 44aa65f1eb4799e8bd5302180a8757c4eb149d95
+source_commit: a8a650092ca371db9df54279b86c34b947636909
 observation_date: 2026-11-27
 ---
 
 # Current product and release status
 
-TiboTattle 0.1.30 was published on November 21, 2026 at **20:44:46 UTC** for
-macOS Apple silicon, macOS Intel, Windows x64 and Linux x86_64. It was the latest
-GitHub release at readback.
-[Published release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.30) ·
-[Release notes](../release-notes/0.1.30.md) ·
-[Platform qualification](./reference/platform-support.md#status-matrix)
+TiboTattle 0.1.31 was published on November 27, 2026 at **02:10:14 UTC**
+for macOS Apple silicon, macOS Intel, Windows x64 and Linux x86_64. It
+was the latest GitHub release at independent readback.
+[Published release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.31) ·
+[Release notes](../release-notes/0.1.31.md) ·
+[Platform qualification](./reference/platform-support.md#0131-artifact-qualification)
 
-## 0.1.31 source candidate
+## 0.1.31 release record
 
-The candidate includes durable recovery after interrupted incremental local
-history refreshes. When saved inputs still match, **Update local usage** resumes
-saved work. The dashboard continues to show the last completed history until
-the refresh succeeds. [Candidate notes](../release-notes/0.1.31.md) ·
+After an interrupted incremental local history refresh, **Update local usage**
+can reuse saved work when its inputs still match. The dashboard shows the
+last completed history until the refresh succeeds.
 [Recovery guidance](./runbooks/unified-index-recovery.md) ·
-[Merged change](https://github.com/adamallcock/tibotattle/pull/323)
+[Contribution from nexus382](https://github.com/adamallcock/tibotattle/pull/323)
 
-The candidate is allocated packaging build `2026112701` and macOS bundle
-version `1039`. Final artifacts, installed upgrades, and publication await
-qualification for 0.1.31. [Platform qualification](./reference/platform-support.md)
+The immutable release binds the four installers to application source
+`a8a650092ca371db9df54279b86c34b947636909` and packaging build `2026112701`.
+Independent public verification matched all 20 assets. The manifest SHA-256
+is `b3cbec0c09dcb1920022f801dfb27d5d0b24f163489666433f844a983a6ee402`.
+[Versioned release manifest](https://github.com/adamallcock/tibotattle/releases/download/v0.1.31/release-manifest.json)
+
+All four stable Electron feeds and both native Sparkle appcasts passed public
+readback, including exact download objects and signed native enclosures.
+Homebrew audit, install and uninstall passed natively on both Mac
+architectures. The live cask hashes match both published DMGs.
+[Publication and feed readbacks](./receipts/2026-11-27-v0-1-31-release-publication.md#stable-updater-feeds) ·
+[Homebrew workflow](https://github.com/adamallcock/homebrew-tap/actions/runs/45926966311)
+
+Both Mac architectures passed production native Sparkle upgrades from 0.1.18
+and Electron upgrades from 0.1.30. In both Electron runs, the normal dashboard
+refresh after cold restart indexed new synthetic activity. Replay preserved
+the generation without duplicating observations.
+[Installed production updater checks](./reference/platform-support.md#0131-artifact-qualification)
+
+The download website served 0.1.31 at 100% of edge traffic. Independent
+readback matched the live manifest, all 38 generated files and all four
+installer downloads. Desktop and mobile Chrome checks verified all four
+platform tabs and the versioned guide. Production routing and the healthy
+GCP origin were preserved. The site was built from
+`91b819f5c3dc514d7a11f02b9b3d37e5eeca2af9`.
+[Website release receipt](./receipts/2026-11-27-v0-1-31-release-publication.md#website-downloads) ·
+[Website source review](https://github.com/adamallcock/tibotattle/pull/326)
 
 ## 0.1.30 release record
 
