@@ -11,6 +11,7 @@ export const LINUX_FINAL_SCHEMA = 'tibotattle-linux-final-lifecycle-intake-v1';
 export const LINUX_FINAL_SCHEMA_V2 = 'tibotattle-linux-final-lifecycle-intake-v2';
 export const LINUX_FINAL_SCHEMA_V3 = 'tibotattle-linux-final-lifecycle-intake-v3';
 export const LINUX_FINAL_SCHEMA_V4 = 'tibotattle-linux-final-lifecycle-intake-v4';
+export const LINUX_FINAL_SCHEMA_V5 = 'tibotattle-linux-final-lifecycle-intake-v5';
 const FINAL_RELEASES = Object.freeze({
   [LINUX_FINAL_SCHEMA]: Object.freeze({ version: '0.1.27', buildNumber: '2026100301',
     lifecycleSchema: 'tibotattle-linux-final-installed-lifecycle-v1',
@@ -24,6 +25,9 @@ const FINAL_RELEASES = Object.freeze({
   [LINUX_FINAL_SCHEMA_V4]: Object.freeze({ version: '0.1.30', buildNumber: '2026112101',
     lifecycleSchema: 'tibotattle-linux-final-installed-lifecycle-v4',
     publicPredecessorUpdate: 'exact_published_0.1.29_to_final_0.1.30' }),
+  [LINUX_FINAL_SCHEMA_V5]: Object.freeze({ version: '0.1.31', buildNumber: '2026112701',
+    lifecycleSchema: 'tibotattle-linux-final-installed-lifecycle-v5',
+    publicPredecessorUpdate: 'exact_published_0.1.30_to_final_0.1.31' }),
 });
 export const LINUX_FINAL_INPUT = '.release-build/linux-final-qualification';
 export const LINUX_FINAL_PREDECESSOR = Object.freeze({
@@ -45,11 +49,18 @@ export const LINUX_FINAL_PREDECESSOR_V3 = Object.freeze({
   sha256: 'ec40445c6a875ac6581a16df78b554f88481a18e05bc3aacd815088740d993ac',
   manifestSha256: '731b1ffe5d1c5fa9a8e38c23c439d2f77327fa045b25cf31da955a6834da446c',
 });
+export const LINUX_FINAL_PREDECESSOR_V4 = Object.freeze({
+  version: '0.1.30', sourceRevision: '0bb1fa31932a56adeb54d8abbb17118d2e1d434f',
+  file: 'TiboTattle-0.1.30-linux-x86_64.AppImage', bytes: 133081241,
+  sha256: 'f847d70ccd074009b69c466f86737d18ae35559f8c474001d4556fd65b8804c0',
+  manifestSha256: '55e976ef04b8193530d6a33580b16ae0cf1f35ac12bb643054dfbbe9965d6cfe',
+});
 const FINAL_PREDECESSORS = Object.freeze({
   [LINUX_FINAL_SCHEMA]: LINUX_FINAL_PREDECESSOR,
   [LINUX_FINAL_SCHEMA_V2]: LINUX_FINAL_PREDECESSOR,
   [LINUX_FINAL_SCHEMA_V3]: LINUX_FINAL_PREDECESSOR_V2,
   [LINUX_FINAL_SCHEMA_V4]: LINUX_FINAL_PREDECESSOR_V3,
+  [LINUX_FINAL_SCHEMA_V5]: LINUX_FINAL_PREDECESSOR_V4,
 });
 export const LINUX_FINAL_FEED = 'https://updates.tibotattle.com/electron/stable/linux-x64';
 export const linuxFinalFailure = code => { throw Object.assign(new Error(`LINUX_FINAL_LIFECYCLE_${code}`), { code: `LINUX_FINAL_LIFECYCLE_${code}` }); };

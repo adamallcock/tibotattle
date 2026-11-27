@@ -60,6 +60,51 @@ const terraFixture = (target = 'darwin-arm64') => ({ ...fixture(target),
 const modelSupportFixture = (target = 'darwin-arm64') => ({ ...fixture(target),
   schemaVersion: 'tibotattle-production-electron-update-intake-v5', version: '0.1.30',
   buildNumber: '2026112101', bundleVersion: '1038' });
+const published030Asars = {
+  'darwin-arm64': 'b8c0653faa15eeaa82f6bb9c9906b9823e627456cb6de4673d2dc320da923647',
+  'darwin-x64': '16500b99ee4fe665cc7a972d8ef3de5ee4d7a3beeacf81f92063cdbc0f14f028',
+};
+const durableHistoryFixture = (target = 'darwin-arm64') => ({ ...fixture(target),
+  schemaVersion: 'tibotattle-production-electron-update-intake-v6', version: '0.1.31',
+  buildNumber: '2026112701', bundleVersion: '1039', predecessorAsarSha256: published030Asars[target] });
+const published030 = { version: '0.1.30', sourceRevision: '0bb1fa31932a56adeb54d8abbb17118d2e1d434f',
+  buildNumber: '2026112101', bundleVersion: '1038' };
+test('v6 admits only 031 and pins both 030 architectures and their exact signed ASARs', async () => {
+  const bytes = await readFile(new URL('./fixtures/releases/v0.1.30/release-manifest.json', import.meta.url));
+  assert.equal(hash(bytes), '55e976ef04b8193530d6a33580b16ae0cf1f35ac12bb643054dfbbe9965d6cfe');
+  const manifest = JSON.parse(bytes);
+  assert.equal(manifest.commit, published030.sourceRevision);
+  assert.equal(manifest.version, published030.version);
+  for (const [index, target] of Object.keys(published030Asars).entries()) {
+    const identity = durableHistoryFixture(target);
+    const input = runner.validateProductionUpdateIntake(identity);
+    const artifact = manifest.artifacts.find(row => row.platform === 'macos' && row.architecture === input.architecture);
+    assert.equal(input.predecessorDmgSha256, artifact.sha256);
+    assert.equal(input.predecessorUrl, artifact.downloadUrl);
+    assert.equal(input.feedUrl, runner.validateProductionUpdateIntake(modelSupportFixture(target)).feedUrl);
+    assert.equal(input.candidateUrl, `https://github.com/adamallcock/tibotattle/releases/download/v0.1.31/TiboTattle-0.1.31-mac-${input.architecture}.dmg`);
+    const pkg = { name: 'app-usagemonitor', version: published030.version,
+      tibotattleDistribution: createProductionDistributionMetadata({ ...published030, target }) };
+    const plist = { CFBundleIdentifier: 'com.usagemonitor.local', CFBundleShortVersionString: published030.version,
+      CFBundleVersion: published030.bundleVersion };
+    assert.deepEqual(runner.validateProductionUpdatePredecessorMetadata(input, pkg, plist), pkg.tibotattleDistribution);
+    for (const change of [{ schemaVersion: fixture().schemaVersion }, { schemaVersion: modelSupportFixture().schemaVersion },
+      { version: '0.1.30', bundleVersion: '1038' }, { bundleVersion: '1038' }, { bundleVersion: identity.buildNumber },
+      { buildNumber: '2026112702' }, { buildNumber: 2026112701 }, { predecessorAsarSha256: 'f'.repeat(64) },
+      { predecessorAsarSha256: Object.values(published030Asars)[1 - index] },
+      { predecessorUrl: 'https://example.invalid' }, { feedUrl: 'https://example.invalid' }]) {
+      assert.throws(() => runner.validateProductionUpdateIntake({ ...identity, ...change }));
+    }
+    for (const change of [{ sourceRevision: 'a'.repeat(40) }, { buildNumber: identity.buildNumber },
+      { target: Object.keys(published030Asars)[1 - index] }]) {
+      const altered = structuredClone(pkg);
+      Object.assign(altered.tibotattleDistribution, change);
+      assert.throws(() => runner.validateProductionUpdatePredecessorMetadata(input, altered, plist));
+    }
+    assert.throws(() => runner.validateProductionUpdatePredecessorMetadata(input, pkg, { ...plist, CFBundleVersion: '1039' }));
+  }
+});
+
 const published029 = { version: '0.1.29', sourceRevision: '905d9f9682ef472671eb87281fb35ead38711561',
   buildNumber: '2026102601', bundleVersion: '1037' };
 test('v5 admits the allocated 030 successor and binds both immutable 029 predecessor architectures', async () => {
@@ -198,7 +243,7 @@ test('predecessor metadata refuses mixed source, build, bundle, architecture and
 });
 test('live feed must bind both exact artifacts and cannot redirect the updater', () => {
   const identities = [fixture(), { ...fixture(), version: '0.1.23', bundleVersion: '1030' },
-    currentFixture(), replacementFixture(), terraFixture(), modelSupportFixture()];
+    currentFixture(), replacementFixture(), terraFixture(), modelSupportFixture(), durableHistoryFixture()];
   for (const identity of identities) {
     const { version } = identity;
     const zip = Buffer.from('signed ZIP'), dmg = Buffer.from('signed DMG');
@@ -230,7 +275,8 @@ const published028 = ['0.1.28', 'bf84bc6c04372bb2cee64ef4a4f29981432fc3eb', '202
 for (const [make, schema, published] of [[currentFixture, runner.ELECTRON_PRODUCTION_UPDATE_SCHEMA_V2, published026],
   [replacementFixture, runner.ELECTRON_PRODUCTION_UPDATE_SCHEMA_V3, published026],
   [terraFixture, runner.ELECTRON_PRODUCTION_UPDATE_SCHEMA_V4, published028],
-  [modelSupportFixture, runner.ELECTRON_PRODUCTION_UPDATE_SCHEMA_V5, Object.values(published029)]]) test(`${schema} plan retains unqualified native and credential assertions`, async () => {
+  [modelSupportFixture, runner.ELECTRON_PRODUCTION_UPDATE_SCHEMA_V5, Object.values(published029)],
+  [durableHistoryFixture, runner.ELECTRON_PRODUCTION_UPDATE_SCHEMA_V6, Object.values(published030)]]) test(`${schema} plan retains unqualified native and credential assertions`, async () => {
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'production-update-plan-v2-')));
   try {
     for (const target of ['darwin-arm64', 'darwin-x64']) {
@@ -243,6 +289,9 @@ for (const [make, schema, published] of [[currentFixture, runner.ELECTRON_PRODUC
       assert.deepEqual([result.predecessorVersion, result.predecessorSourceRevision,
         result.predecessorBuildNumber, result.predecessorBundleVersion], published);
       assert.equal(result.predecessorProcessesExitedNaturally, false);
+      for (const key of ['postRestartActivityIndexed', 'postRestartRefreshNoDuplicates']) {
+        assert.equal(result[key], schema === runner.ELECTRON_PRODUCTION_UPDATE_SCHEMA_V6 ? false : undefined);
+      }
       for (const key of ['productionFeedVerified', 'signedArtifactVerified', 'disposableAccountVerified',
         'updaterRelaunchedCandidate', 'candidateCopiedByRunner', 'ownedProcessesStopped', 'existingCredentialFixture', 'feedOverrideApplied']) {
         assert.equal(result[key], false, key);
@@ -590,7 +639,7 @@ test('predecessor API loads exact packed archive bytes with private permissions 
 });
 
 for (const schemaVersion of ['tibotattle-production-electron-update-intake-v3', 'tibotattle-production-electron-update-intake-v4',
-  'tibotattle-production-electron-update-intake-v5'])
+  'tibotattle-production-electron-update-intake-v5', 'tibotattle-production-electron-update-intake-v6'])
   test(`${schemaVersion} loads and requires the verified predecessor public ingestion API`, async t => {
   const valid = await predecessorArchiveFixture(t);
   const result = await runner.withProductionUpdatePredecessorIndex({ ...valid.input,
@@ -653,6 +702,58 @@ test('retained-source fixture uses real ingestion and leaves one discoverable co
   await assert.rejects(runner.seedProductionUpdateRetainedNativeState(native, codexHome, currentIndex, ingestLocalUnifiedIndexIncrement), { code: 'EEXIST' });
   assert.equal(await readFile(source, 'utf8'), content);
   assert.deepEqual(await readSignedReplacementState(native), seeded);
+});
+
+test('v6 post-restart activity adds one indexed event and quota observation without changing retired history', async t => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'production-restart-activity-')));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const codexHome = join(directory, 'codex'), stateRoot = join(directory, 'state');
+  await mkdir(codexHome, { mode: 0o700 });
+  await mkdir(join(codexHome, 'sessions'), { mode: 0o700 });
+  const before = await runner.seedProductionUpdateRetainedNativeState(stateRoot, codexHome, currentIndex, ingestLocalUnifiedIndexIncrement);
+  const settings = { language: 'es', appearance: 'dark', refreshIntervalSeconds: 900, startAtLogin: false };
+  const sharing = { enabled: false, transportStatus: 'off', noticeDue: false, basis: 'legacy_preserved' };
+  const check = { stateRoot, before, settings, sharing };
+  await assert.rejects(runner.readProductionUpdatePostRestartActivity(check), { updateStage: 'restart_activity_continuity' });
+  await runner.writeProductionUpdatePostRestartActivity(codexHome);
+  await assert.rejects(runner.writeProductionUpdatePostRestartActivity(codexHome), { code: 'EEXIST' });
+  const options = { codexHome, indexFile: join(stateRoot, 'local-unified-index-v1.sqlite'),
+    secretFile: join(stateRoot, 'local-unified-index-device-salt-v1'), contractVersion: 'telemetry-contribution-v0.1' };
+  const added = await ingestLocalUnifiedIndexIncrement(options);
+  assert.equal(added.insertedUsageEvents, 1);
+  const additional = await runner.readProductionUpdatePostRestartActivity(check);
+  assert.deepEqual([additional.usageRows, additional.quotaRows, additional.tokensInUncached], [1, 1, 105]);
+  const replay = await ingestLocalUnifiedIndexIncrement(options);
+  assert.equal(replay.unchanged, true);
+  assert.equal(replay.insertedUsageEvents, 0);
+  assert.deepEqual(await runner.readProductionUpdatePostRestartActivity({ ...check, priorAdditional: additional }), additional);
+  await assert.rejects(runner.readProductionUpdatePostRestartActivity({ ...check, priorAdditional: { recordDigest: 'wrong' } }),
+    { updateStage: 'restart_activity_continuity' });
+  await assert.rejects(runner.readProductionUpdatePostRestartActivity({ ...check, before: { ...before, recordDigest: 'wrong' } }),
+    { replacementStage: 'retained_state_changed' });
+});
+
+test('v6 detailed refresh requires a new successful ordinary dashboard action', async () => {
+  const make = values => {
+    let now = 0, clicks = 0;
+    const clock = { now: () => now, sleep: async ms => { now += ms; } };
+    const dashboard = { evaluate: async script => {
+      if (script.startsWith('Boolean(')) return true;
+      if (script.includes('b.click()')) { clicks += 1; return true; }
+      assert.match(script, /fetch\('\/api\/local\/refresh'/u);
+      return values.length > 1 ? values.shift() : values[0];
+    } };
+    return { dashboard, clock, clicks: () => clicks };
+  };
+  const old = { id: 'before', status: 'succeeded', mode: 'detailed' };
+  const pass = make([old, old, { id: 'quick', status: 'succeeded', mode: 'quick' },
+    { id: 'after', status: 'succeeded', mode: 'detailed' }]);
+  assert.equal(await runner.runProductionUpdateDetailedRefresh(pass.dashboard, pass.clock), 'after');
+  assert.equal(pass.clicks(), 1);
+  const stale = make([old]);
+  await assert.rejects(runner.runProductionUpdateDetailedRefresh(stale.dashboard, stale.clock), { updateStage: 'restart_refresh_completion' });
+  const failed = make([old, { id: 'after', status: 'failed', mode: 'detailed' }]);
+  await assert.rejects(runner.runProductionUpdateDetailedRefresh(failed.dashboard, failed.clock), { updateStage: 'restart_refresh_failed' });
 });
 
 test('retained-source fixture refuses unsafe directories and never retires a changed usage source', async t => {

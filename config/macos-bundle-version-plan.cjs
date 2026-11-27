@@ -52,6 +52,8 @@ const SIGNED_MACOS_BUNDLE_VERSION_PLAN = Object.freeze({
   "0.1.29": Object.freeze({ stable: "1037" }),
   // 0.1.30 advances both Mac architectures; 2026112101 is provenance only.
   "0.1.30": Object.freeze({ stable: "1038" }),
+  // Durable local history release; 2026112701 is independent provenance.
+  "0.1.31": Object.freeze({ stable: "1039" }),
 });
 
 module.exports = { SIGNED_MACOS_BUNDLE_VERSION_PLAN };

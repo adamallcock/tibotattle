@@ -1,10 +1,10 @@
 ---
 title: Current product and release status
-date: 2026-11-21
+date: 2026-11-27
 type: status
 status: current
-source_commit: 0bb1fa31932a56adeb54d8abbb17118d2e1d434f
-observation_date: 2026-11-21
+source_commit: 44aa65f1eb4799e8bd5302180a8757c4eb149d95
+observation_date: 2026-11-27
 ---
 
 # Current product and release status
@@ -15,6 +15,19 @@ GitHub release at readback.
 [Published release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.30) ·
 [Release notes](../release-notes/0.1.30.md) ·
 [Platform qualification](./reference/platform-support.md#status-matrix)
+
+## 0.1.31 source candidate
+
+The candidate includes durable recovery after interrupted incremental local
+history refreshes. When saved inputs still match, **Update local usage** resumes
+saved work. The dashboard continues to show the last completed history until
+the refresh succeeds. [Candidate notes](../release-notes/0.1.31.md) ·
+[Recovery guidance](./runbooks/unified-index-recovery.md) ·
+[Merged change](https://github.com/adamallcock/tibotattle/pull/323)
+
+The candidate is allocated packaging build `2026112701` and macOS bundle
+version `1039`. Final artifacts, installed upgrades, and publication await
+qualification for 0.1.31. [Platform qualification](./reference/platform-support.md)
 
 ## 0.1.30 release record
 

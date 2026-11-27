@@ -116,16 +116,25 @@ export async function seedSignedReplacementNativeState(nativeRoot, codexHome, in
   return readSignedReplacementState(nativeRoot, index);
 }
 
-export async function readSignedReplacementState(root, index = { openLocalUnifiedIndex }) {
+function summarizeReplacementRows(usage, quota) {
+  return { usageRows: usage.length, quotaRows: quota.length,
+    tokensInUncached: usage.reduce((sum, row) => sum + Number(row.tokens_in_uncached), 0),
+    recordDigest: digest(JSON.stringify({ usage, quota }, (_key, value) => typeof value === 'bigint' ? value.toString() : value)) };
+}
+
+export async function readSignedReplacementState(root, index = { openLocalUnifiedIndex }, { partitionAt } = {}) {
   const database = index.openLocalUnifiedIndex(join(root, INDEX), { readOnly: true });
   let rows;
   try {
     if (database.prepare('PRAGMA quick_check').get().quick_check !== 'ok') fail('database_integrity');
     const usage = database.prepare('SELECT * FROM usage_event ORDER BY event_key').all();
     const quota = database.prepare('SELECT * FROM quota_observation ORDER BY id').all();
-    rows = { usageRows: usage.length, quotaRows: quota.length,
-      tokensInUncached: usage.reduce((sum, row) => sum + Number(row.tokens_in_uncached), 0),
-      recordDigest: digest(JSON.stringify({ usage, quota }, (_key, value) => typeof value === 'bigint' ? value.toString() : value)) };
+    if (partitionAt === undefined) rows = summarizeReplacementRows(usage, quota);
+    else {
+      const retained = row => row.observed_at_ms < partitionAt;
+      rows = { ...summarizeReplacementRows(usage.filter(retained), quota.filter(retained)),
+        additional: summarizeReplacementRows(usage.filter(row => !retained(row)), quota.filter(row => !retained(row))) };
+    }
   } finally { database.close(); }
   return { ...rows, saltDigest: await fileHash(join(root, SALT)),
     optOutDigest: await fileHash(join(root, 'private', 'automatic-contribution-v0.1.json')) };

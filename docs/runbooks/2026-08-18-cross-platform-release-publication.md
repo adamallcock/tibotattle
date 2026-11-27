@@ -553,23 +553,23 @@ after those checks pass. Microsoft Store output is a separate subject.
 #### Final signed installer upgrade
 
 The signing workflow and the default frozen-installer qualification prove a
-fresh installed journey. For 0.1.30, also run the separate installer-upgrade
+fresh installed journey. For 0.1.31, also run the separate installer-upgrade
 mode of `electron-windows-installer-diagnostic.yml` against the exact final
 signing artifact. Select a reviewed runner ref and provide `qualify_installed`
 and `qualify_upgrade` as `true`, the exact `source_revision`, `signing_run_id`,
 `artifact_id`, `installer_sha256`, and a `predecessor_intake` JSON object matching
-`WINDOWS_FINAL_UPGRADE_PREDECESSOR_V3` in
+`WINDOWS_FINAL_UPGRADE_PREDECESSOR_V4` in
 `scripts/smoke-electron-windows-final-upgrade.mjs`. Omit the upgrade mode and
 predecessor intake for the retained diagnostic/fresh-install lanes. The
-0.1.30 route uses provenance build `2026112101` and records both fields in
-a `tibotattle-windows-final-upgrade-v4` receipt. The historical 0.1.27 and
-0.1.28 routes keep their v1 and v2 receipts and pinned 0.1.26 predecessor.
-The 0.1.29 route keeps its v3 receipt and its pinned 0.1.28 predecessor. Each
+0.1.31 route uses provenance build `2026112701` and emits a
+`tibotattle-windows-final-upgrade-v5` receipt. V4 records the 0.1.29 to
+0.1.30 upgrade with build `2026112101`. V3 records 0.1.28 to 0.1.29.
+V1 and v2 use the pinned 0.1.26 predecessor for 0.1.27 and 0.1.28. Each
 route requires the allocated version and build, its pinned predecessor, and
 installed evidence for the exact bytes.
 
-The predecessor comes from the immutable published 0.1.29 release.
-[0.1.29 release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.29)
+The v5 predecessor comes from the immutable published 0.1.30 release.
+[0.1.30 release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.30)
 The closed intake pins its source revision, manifest digest, installer digest,
 size, version and target; it accepts no caller-selected URL or stable-feed
 substitution. The wrapper verifies the immutable GitHub release and pinned
@@ -578,11 +578,11 @@ Authenticode checks require the expected publisher and timestamp before either
 installer is extracted or executed. Extracted comparison stages are explicitly
 marked as such; they are not independent pre-signing evidence or rebuilt apps.
 
-The native Windows x64 lane installs 0.1.29 into a new owned NSIS directory and
+The native Windows x64 lane installs 0.1.30 into a new owned NSIS directory and
 creates one isolated synthetic profile. Its normal rendered journey ingests
 representative history/projects, sets a preference and verifies durable opt-out.
 The lane proves exit of the predecessor's observed main/companion process tree
-using retained process identities, then runs the exact signed 0.1.30 installer
+using retained process identities, then runs the exact signed 0.1.31 installer
 into the same owned installation without recreating or reseeding the profile.
 It requires profile byte equality across the installer operation. Afterward,
 normal runtime migration/cache updates are allowed: two successor launches
@@ -593,8 +593,8 @@ ASAR, executable, source metadata and native closure.
 The qualification reader selects the model-performance contract from those
 authenticated release identities. The pinned 0.1.26/0.1.28 predecessors and
 historical 0.1.27/0.1.28 successors require schema 5 without a time-zone field.
-The 0.1.29 predecessor and the 0.1.29 and 0.1.30 successor launches require
-schema 6 with UTC. Every route still
+The 0.1.29 and 0.1.30 predecessors and 0.1.29 through 0.1.31 successors
+require schema 6 with UTC. Every route
 requires measured speed and first-token latency, complete source coverage, and
 ready, non-stale evidence. The ordinary current-candidate lane remains strict
 schema 6/UTC. Never infer compatibility from the returned payload or rebuild a
@@ -731,14 +731,15 @@ closed intake binds the reviewed runner revision, frozen application revision,
 unchanged `production-source-candidate.json`, successful production packaging
 run, package-receipt digest, final AppImage size/digest, and executable/ASAR
 digests. The application revision must be an ancestor of the runner, with the
-same package version. The explicit v4 intake admits only 0.1.30 with provenance
-build `2026112101` and the immutable published 0.1.29 predecessor. Historical
+same package version. V5 admits 0.1.31 with provenance build `2026112701`
+and the immutable published 0.1.30 predecessor. V4 binds 0.1.30 with build
+`2026112101` to its published 0.1.29 predecessor. Historical
 v1 retains 0.1.27 / `2026100301` and v2 retains 0.1.28 / `2026100901`, both
 with 0.1.26. V3 retains 0.1.29 / `2026102601` with 0.1.28. The exact per-route
 manifest and AppImage digests are pinned in
 `scripts/lib/linux-final-artifact-intake.mjs`. Retain separate owner acceptance
 for the new bytes.
-[0.1.29 release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.29)
+[0.1.30 release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.30)
 
 Dispatch `mode=plan` first with the reviewed intake. Both modes install the
 locked verifier dependencies; plan stops before artifact downloads or application
@@ -783,9 +784,9 @@ Retain the original pair, `apparmor-comparison.json`, `installed-lifecycle.json`
 and `host-lifecycle.json` with the package receipts and successful workflow/run
 and ZIP provenance. The host receipt binds all three original JSON digests and
 the exact candidate-profile identity. The replacement uses
-`tibotattle-linux-final-installed-lifecycle-v4` with
-`publicPredecessorUpdate: exact_published_0.1.29_to_final_0.1.30`.
-Historical v1 through v3 receipts keep their original route identities.
+`tibotattle-linux-final-installed-lifecycle-v5` with
+`publicPredecessorUpdate: exact_published_0.1.30_to_final_0.1.31`.
+Historical v1 through v4 receipts identify their original upgrade pairs.
 All require the same lifecycle assertions.
 Acceptance must require the host's passed status,
 comparison/lifecycle success, no interruption and both container/profile cleanup

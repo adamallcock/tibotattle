@@ -38,7 +38,7 @@ test('future successor derives from package version and reviewed allocation with
 
 for (const [version, bundleVersion, buildNumber] of [['0.1.27', '1035', '2026100301'],
   ['0.1.28', '1036', '2026100901'], ['0.1.29', '1037', '2026102601'],
-  ['0.1.30', '1038', '2026112101']]) test(`${version} admission binds reviewed allocation and independent provenance on both Mac architectures`, () => {
+  ['0.1.30', '1038', '2026112101'], ['0.1.31', '1039', '2026112701']]) test(`${version} admission binds reviewed allocation and independent provenance on both Mac architectures`, () => {
   for (const target of ['darwin-arm64', 'darwin-x64']) {
     const selected = { ...identity, target, version, bundleVersion, buildNumber };
     const selectedContext = { ...context(selected), packageVersion: version, sourceVersion: version,
@@ -166,6 +166,7 @@ for (const [schemaVersion, version, bundleVersion, buildNumber] of [
   ['tibotattle-production-electron-update-intake-v3', '0.1.28', '1036', '2026100901'],
   ['tibotattle-production-electron-update-intake-v4', '0.1.29', '1037', '2026102601'],
   ['tibotattle-production-electron-update-intake-v5', '0.1.30', '1038', '2026112101'],
+  ['tibotattle-production-electron-update-intake-v6', '0.1.31', '1039', '2026112701'],
 ]) test(`both production-update workflow admissions bind the closed ${schemaVersion} route`, async t => {
   const fixture = await repository({ version, bundleVersion });
   t.after(() => rm(fixture.root, { recursive: true, force: true }));
@@ -174,9 +175,13 @@ for (const [schemaVersion, version, bundleVersion, buildNumber] of [
   assert.equal(admissions.length, 2);
   for (const [index, target] of ['darwin-arm64', 'darwin-x64'].entries()) {
     const selected = { version, bundleVersion, buildNumber, sourceRevision: fixture.revision, target };
+    const publishedAsars = {
+      'darwin-arm64': 'b8c0653faa15eeaa82f6bb9c9906b9823e627456cb6de4673d2dc320da923647',
+      'darwin-x64': '16500b99ee4fe665cc7a972d8ef3de5ee4d7a3beeacf81f92063cdbc0f14f028',
+    };
     const intake = { ...selected, schemaVersion,
       dmgSha256: 'b'.repeat(64), asarSha256: 'c'.repeat(64), zipSha256: 'd'.repeat(64),
-      feedSha256: 'e'.repeat(64), predecessorAsarSha256: 'f'.repeat(64) };
+      feedSha256: 'e'.repeat(64), predecessorAsarSha256: version === '0.1.31' ? publishedAsars[target] : 'f'.repeat(64) };
     const output = join(fixture.root, target + '-v2-admission.txt');
     const run = (patch = {}, sourceCandidate = receipt(selected)) => execFileSync(process.execPath,
       ['--input-type=module', '-'], { cwd: fixture.root, input: admissions[index][1].replace(/^          /gmu, ''),
@@ -191,6 +196,10 @@ for (const [schemaVersion, version, bundleVersion, buildNumber] of [
       { buildNumber: '2026092701' }, { sourceRevision: 'f'.repeat(40) }, { predecessorVersion: '0.1.20' },
       { predecessorUrl: 'https://example.invalid/old.dmg' }, { feedUrl: 'https://example.invalid/feed.yml' },
       { predecessorAsarSha256: 'private-value' }, { predecessorAsarSha256: undefined }]) assert.throws(() => run(patch));
+    if (version === '0.1.31') {
+      assert.throws(() => run({ predecessorAsarSha256: 'f'.repeat(64) }));
+      assert.throws(() => run({ predecessorAsarSha256: Object.values(publishedAsars)[1 - index] }));
+    }
     assert.throws(() => run({}, receipt({ ...selected, sourceRevision: 'f'.repeat(40) })));
     assert.throws(() => run({}, receipt({ ...selected, target: target === 'darwin-arm64' ? 'darwin-x64' : 'darwin-arm64' })));
     assert.equal(await readFile(output, 'utf8'), `identity=${JSON.stringify(intake)}\n`, 'refusals do not emit intake');

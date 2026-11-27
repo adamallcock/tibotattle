@@ -21,7 +21,7 @@ on:
         type: string
         required: true
       identity_json:
-        description: Closed intake v1 (020 predecessor), v2 (026 to 027), v3 (026 to 028), v4 (028 to 029) or v5 (029 to 030), exact candidate/source/feed and predecessor ASAR hashes, plus unchanged sourceCandidate receipt; directory is supplied by the workflow
+        description: Closed intake v1 (020 predecessor), v2 (026 to 027), v3 (026 to 028), v4 (028 to 029), v5 (029 to 030) or v6 (030 to 031), exact candidate/source/feed and predecessor ASAR hashes, plus unchanged sourceCandidate receipt; directory is supplied by the workflow
         type: string
         required: true
       confirmation:

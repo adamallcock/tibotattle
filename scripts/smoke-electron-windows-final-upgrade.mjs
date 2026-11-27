@@ -65,21 +65,33 @@ export const WINDOWS_FINAL_UPGRADE_PREDECESSOR_V3 = Object.freeze({
   installerSha256: 'd8b38010237f0a603c7d3980e8435f16b0c0ab84c71b73371eaf56f393417cb7',
   installerBytes: 105911200,
 });
+export const WINDOWS_FINAL_UPGRADE_PREDECESSOR_V4 = Object.freeze({
+  schemaVersion: 'tibotattle-windows-final-upgrade-predecessor-v4',
+  version: '0.1.30',
+  target: 'win32-x64',
+  sourceRevision: '0bb1fa31932a56adeb54d8abbb17118d2e1d434f',
+  manifestSha256: '55e976ef04b8193530d6a33580b16ae0cf1f35ac12bb643054dfbbe9965d6cfe',
+  installerSha256: 'c25e5796167ca752ed1ac1efdab0984022302c7539ae8fee61cfe616d4fa6ffa',
+  installerBytes: 105919896,
+});
 const PREDECESSORS = Object.freeze({
   [WINDOWS_FINAL_UPGRADE_PREDECESSOR.schemaVersion]: WINDOWS_FINAL_UPGRADE_PREDECESSOR,
   [WINDOWS_FINAL_UPGRADE_PREDECESSOR_V2.schemaVersion]: WINDOWS_FINAL_UPGRADE_PREDECESSOR_V2,
   [WINDOWS_FINAL_UPGRADE_PREDECESSOR_V3.schemaVersion]: WINDOWS_FINAL_UPGRADE_PREDECESSOR_V3,
+  [WINDOWS_FINAL_UPGRADE_PREDECESSOR_V4.schemaVersion]: WINDOWS_FINAL_UPGRADE_PREDECESSOR_V4,
 });
 const PREDECESSOR_MANIFEST_BYTES = Object.freeze({
   '0.1.26': 5866,
   '0.1.28': 5429,
   '0.1.29': 5819,
+  '0.1.30': 5819,
 });
 const SUCCESSOR_PREDECESSORS = Object.freeze({
   '0.1.27': WINDOWS_FINAL_UPGRADE_PREDECESSOR,
   '0.1.28': WINDOWS_FINAL_UPGRADE_PREDECESSOR,
   '0.1.29': WINDOWS_FINAL_UPGRADE_PREDECESSOR_V2,
   '0.1.30': WINDOWS_FINAL_UPGRADE_PREDECESSOR_V3,
+  '0.1.31': WINDOWS_FINAL_UPGRADE_PREDECESSOR_V4,
 });
 const FINAL_SUCCESSORS = Object.freeze({
   '0.1.27': Object.freeze({ version: '0.1.27', buildNumber: '2026100301',
@@ -90,6 +102,8 @@ const FINAL_SUCCESSORS = Object.freeze({
     receiptSchema: 'tibotattle-windows-final-upgrade-v3' }),
   '0.1.30': Object.freeze({ version: '0.1.30', buildNumber: '2026112101',
     receiptSchema: 'tibotattle-windows-final-upgrade-v4' }),
+  '0.1.31': Object.freeze({ version: '0.1.31', buildNumber: '2026112701',
+    receiptSchema: 'tibotattle-windows-final-upgrade-v5' }),
 });
 // Select the response grammar from authenticated release identity, never from
 // whatever the running application happens to return. New releases need review.
@@ -99,6 +113,7 @@ const PERFORMANCE_CONTRACTS = Object.freeze({
   '0.1.28': WINDOWS_NORMAL_CANDIDATE_PERFORMANCE_CONTRACTS.historical,
   '0.1.29': WINDOWS_NORMAL_CANDIDATE_PERFORMANCE_CONTRACTS.current,
   '0.1.30': WINDOWS_NORMAL_CANDIDATE_PERFORMANCE_CONTRACTS.current,
+  '0.1.31': WINDOWS_NORMAL_CANDIDATE_PERFORMANCE_CONTRACTS.current,
 });
 export function resolveWindowsFinalUpgradeSuccessor({ version, buildNumber } = {}) {
   const successor = typeof version === 'string' && Object.hasOwn(FINAL_SUCCESSORS, version)

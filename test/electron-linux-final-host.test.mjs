@@ -101,6 +101,7 @@ test('028 lifecycle v2 requires its exact route and cannot consume or relabel a 
 for (const [route, version, buildNumber, predecessorVersion] of [
   ['v3', '0.1.29', '2026102601', '0.1.28'],
   ['v4', '0.1.30', '2026112101', '0.1.29'],
+  ['v5', '0.1.31', '2026112701', '0.1.30'],
 ]) test(`${version} lifecycle ${route} requires its exact route and rejects reused 027 proof`, () => {
   const selected = structuredClone(pair);
   Object.assign(selected.intake, { schemaVersion: `tibotattle-linux-final-lifecycle-intake-${route}`, version, buildNumber });
