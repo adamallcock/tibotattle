@@ -131,3 +131,11 @@ selected for November 21, 2026 in America/New_York. Read-only checks on that
 date found no GitHub `v0.1.30` tag or release and no earlier `1038` entry
 in the source allocation plan. Signing, installed qualification, and
 publication each require evidence for the exact new artifacts.
+
+## 2026-11-26 amendment for the 0.1.31 candidate
+
+Allocate stable macOS bundle version `1039` to both 0.1.31 architectures,
+following published 0.1.30 bundle `1038`. The separate provenance build is
+`2026112701`. On November 26, 2026, the public GitHub repository had no
+`v0.1.31` tag and the source plan had no earlier `1039` entry. The signed,
+installed, updater and published artifacts each require their own evidence.

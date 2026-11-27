@@ -286,6 +286,8 @@ TiboTattle publishes desktop installers for macOS, Windows x64 and Linux x64,
 with an operational optional hosted service. The current published version and
 user-facing history are listed in the [changelog](CHANGELOG.md) and on the
 [GitHub Releases page](https://github.com/adamallcock/tibotattle/releases).
+The 0.1.31 source candidate can resume saved progress after an interrupted
+incremental local usage refresh. [0.1.31 candidate notes](release-notes/0.1.31.md)
 TiboTattle is not a provider-authoritative billing dashboard: quota estimates
 carry explicit uncertainty, and unknown models or tiers remain explicit rather
 than silently defaulted. The maintained [current status matrix](docs/current-status.md)

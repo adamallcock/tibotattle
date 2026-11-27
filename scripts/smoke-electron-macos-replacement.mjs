@@ -116,16 +116,34 @@ export async function seedSignedReplacementNativeState(nativeRoot, codexHome, in
   return readSignedReplacementState(nativeRoot, index);
 }
 
-export async function readSignedReplacementState(root, index = { openLocalUnifiedIndex }) {
+function replacementRecordDigest(value) {
+  return digest(JSON.stringify(value, (_key, value) => typeof value === 'bigint' ? value.toString() : value));
+}
+
+function summarizeReplacementRows(usage, quota) {
+  return { usageRows: usage.length, quotaRows: quota.length,
+    tokensInUncached: usage.reduce((sum, row) => sum + Number(row.tokens_in_uncached), 0),
+    recordDigest: replacementRecordDigest({ usage, quota }) };
+}
+
+export async function readSignedReplacementState(root, index = { openLocalUnifiedIndex }, { partitionAt } = {}) {
   const database = index.openLocalUnifiedIndex(join(root, INDEX), { readOnly: true });
   let rows;
   try {
     if (database.prepare('PRAGMA quick_check').get().quick_check !== 'ok') fail('database_integrity');
     const usage = database.prepare('SELECT * FROM usage_event ORDER BY event_key').all();
     const quota = database.prepare('SELECT * FROM quota_observation ORDER BY id').all();
-    rows = { usageRows: usage.length, quotaRows: quota.length,
-      tokensInUncached: usage.reduce((sum, row) => sum + Number(row.tokens_in_uncached), 0),
-      recordDigest: digest(JSON.stringify({ usage, quota }, (_key, value) => typeof value === 'bigint' ? value.toString() : value)) };
+    if (partitionAt === undefined) rows = summarizeReplacementRows(usage, quota);
+    else {
+      const occurrences = database.prepare('SELECT * FROM quota_occurrence ORDER BY id').all();
+      const summarizePartition = select => {
+        const selectedOccurrences = occurrences.filter(select);
+        return { ...summarizeReplacementRows(usage.filter(select), quota.filter(select)),
+          quotaOccurrences: selectedOccurrences.length, quotaOccurrenceDigest: replacementRecordDigest(selectedOccurrences) };
+      };
+      rows = { ...summarizePartition(row => row.observed_at_ms < partitionAt),
+        additional: summarizePartition(row => row.observed_at_ms >= partitionAt) };
+    }
   } finally { database.close(); }
   return { ...rows, saltDigest: await fileHash(join(root, SALT)),
     optOutDigest: await fileHash(join(root, 'private', 'automatic-contribution-v0.1.json')) };

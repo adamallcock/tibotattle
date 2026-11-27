@@ -6,7 +6,8 @@ import { join, win32 } from 'node:path';
 import { createHash } from 'node:crypto';
 import {
   WINDOWS_FINAL_UPGRADE_PREDECESSOR as predecessor, WINDOWS_FINAL_UPGRADE_PREDECESSOR_V2 as currentPredecessor,
-  WINDOWS_FINAL_UPGRADE_PREDECESSOR_V3 as predecessor029, windowsFinalUpgradePredecessorFile, validateWindowsFinalUpgradePair,
+  WINDOWS_FINAL_UPGRADE_PREDECESSOR_V3 as predecessor029, WINDOWS_FINAL_UPGRADE_PREDECESSOR_V4 as predecessor030,
+  windowsFinalUpgradePredecessorFile, validateWindowsFinalUpgradePair,
   validateWindowsFinalUpgradePredecessor, parseWindowsFinalUpgradeMode, resolveWindowsFinalUpgradeSuccessor,
   validateWindowsFinalUpgradePredecessorManifest, snapshotWindowsFinalUpgradeProfile,
   runWindowsFinalUpgradeContinuity, runWindowsFinalUpgrade,
@@ -170,6 +171,43 @@ test('030 accepts only the immutable 029 manifest and its exact successor build'
   assert.throws(() => validateWindowsFinalUpgradePredecessor({ ...predecessor029, url: 'https://example.invalid/' }), /PREDECESSOR_INTAKE_INVALID/u);
 });
 
+test('031 accepts only the immutable 030 manifest and its exact successor build', async () => {
+  const successor = { version: '0.1.31', buildNumber: '2026112701' };
+  assert.deepEqual(validateWindowsFinalUpgradePair(predecessor030, successor), {
+    ...successor, receiptSchema: 'tibotattle-windows-final-upgrade-v5',
+  });
+  assert.equal(parseWindowsFinalUpgradeMode({ qualifyInstalled: 'true', qualifyUpgrade: 'true',
+    predecessorIntake: JSON.stringify(predecessor030) }), predecessor030);
+  assert.equal(windowsFinalUpgradePredecessorFile(predecessor030), 'TiboTattle-0.1.30-Windows-x64.exe');
+
+  const manifest = await readFile(new URL('./fixtures/releases/v0.1.30/release-manifest.json', import.meta.url));
+  const historical = await readFile(new URL('./fixtures/releases/v0.1.29/release-manifest.json', import.meta.url));
+  assert.equal(sha(manifest), predecessor030.manifestSha256);
+  assert.equal(validateWindowsFinalUpgradePredecessorManifest(manifest, { ...predecessor030 }).version, '0.1.30');
+  const altered = Buffer.from(manifest);
+  altered[100] ^= 1;
+  for (const bytes of [historical, altered, manifest.subarray(0, -1)]) {
+    assert.throws(() => validateWindowsFinalUpgradePredecessorManifest(bytes, predecessor030), /PREDECESSOR_MANIFEST_INVALID/u);
+  }
+  for (const key of Object.keys(predecessor030)) {
+    const missing = { ...predecessor030 };
+    delete missing[key];
+    assert.throws(() => validateWindowsFinalUpgradePredecessor(missing), /PREDECESSOR_INTAKE_INVALID/u);
+    assert.throws(() => validateWindowsFinalUpgradePredecessor({ ...predecessor030, [key]: 'changed' }), /PREDECESSOR_INTAKE_INVALID/u);
+  }
+  assert.throws(() => validateWindowsFinalUpgradePredecessor({ ...predecessor030, url: 'https://example.invalid/' }),
+    /PREDECESSOR_INTAKE_INVALID/u);
+  for (const prior of [predecessor, currentPredecessor, predecessor029]) {
+    assert.throws(() => validateWindowsFinalUpgradePair(prior, successor), /PAIR_INVALID/u);
+  }
+  assert.throws(() => validateWindowsFinalUpgradePair(predecessor030, { version: '0.1.30', buildNumber: '2026112101' }),
+    /PAIR_INVALID/u);
+  for (const buildNumber of [undefined, '2026112101', '2026112702', 2026112701]) {
+    assert.throws(() => validateWindowsFinalUpgradePair(predecessor030, { ...successor, buildNumber }),
+      /SUCCESSOR_INTAKE_INVALID/u);
+  }
+});
+
 test('one profile spans old rendered state, exact replacement and two new runtime launches', async () => {
   const f = fixture(); const receipt = await runWindowsFinalUpgradeContinuity(f.input, f.deps);
   assert.deepEqual(f.calls, ['verify:old', 'launch:seed', 'absence', 'optout', 'verify:old', 'snapshot',
@@ -192,6 +230,7 @@ test('authenticated release pairs select historical and current timing contracts
     [predecessor, '0.1.28', '2026100901', performanceContracts.historical, performanceContracts.historical],
     [currentPredecessor, '0.1.29', '2026102601', performanceContracts.historical, performanceContracts.current],
     [predecessor029, '0.1.30', '2026112101', performanceContracts.current, performanceContracts.current],
+    [predecessor030, '0.1.31', '2026112701', performanceContracts.current, performanceContracts.current],
   ]) {
     const f = fixture({}, { selectedPredecessor, version, buildNumber });
     await runWindowsFinalUpgradeContinuity(f.input, f.deps);

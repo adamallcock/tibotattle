@@ -30,7 +30,7 @@ test('ZIP extraction refuses unexpected, duplicate and symlink entries before wr
 });
 
 for (const [route, version, buildNumber] of [['v1', '0.1.27', '2026100301'], ['v2', '0.1.28', '2026100901'],
-  ['v3', '0.1.29', '2026102601'], ['v4', '0.1.30', '2026112101']])
+  ['v3', '0.1.29', '2026102601'], ['v4', '0.1.30', '2026112101'], ['v5', '0.1.31', '2026112701']])
   test(`${version} runner admission proves ancestry and same-version source without implying execution`, async t => {
   const { preflightLinuxFinalIntake, LINUX_FINAL_CONFIRMATION } = await import('../scripts/lib/linux-final-artifact-intake.mjs');
   const { productionElectronCandidatePlan } = await import('../scripts/package-electron-production.mjs');

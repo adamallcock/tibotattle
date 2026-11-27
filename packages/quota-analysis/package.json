@@ -1,6 +1,6 @@
 {
   "name": "@app-usagemonitor/quota-analysis",
-  "version": "0.1.30",
+  "version": "0.1.31",
   "private": true,
   "type": "module",
   "description": "Runtime-neutral quota track, calibration, and rolling comparison kernel.",

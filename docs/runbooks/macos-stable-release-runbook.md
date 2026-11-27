@@ -83,49 +83,49 @@ compatibility value; it does not run a second updater.
 
 ## Current Electron production-update acceptance
 
-After the exact 0.1.30 GitHub artifacts and ordinary Electron stable feeds are
+After the exact 0.1.31 GitHub artifacts and ordinary Electron stable feeds are
 published, run `electron-macos-production-update.yml` in `plan` then `execute`
-mode for **both** `darwin-arm64` and `darwin-x64`. Use
-`tibotattle-production-electron-update-intake-v5` in `identity_json`, together
-with the unchanged candidate `sourceCandidate` receipt. Its closed fields are
+mode for both `darwin-arm64` and `darwin-x64`. Use
+`tibotattle-production-electron-update-intake-v6` in `identity_json` together
+with the unchanged candidate `sourceCandidate` receipt. The closed fields are
 `schemaVersion`, `target`, `sourceRevision`, `buildNumber`, `version`,
 `bundleVersion`, `dmgSha256`, `asarSha256`, `zipSha256`, `feedSha256`, and
-`predecessorAsarSha256`. The workflow supplies `directory` and uses fixed
-predecessor and feed URLs. V5 admits only 0.1.29 → 0.1.30 (bundle 1037 → 1038),
-with provenance build `2026112101`. The unchanged source receipt independently
-binds the 0.1.30 source and build. Execute requires
-`RUN_DISPOSABLE_PRODUCTION_ELECTRON_UPDATE`. Historical routes keep their closed
-pairs. V2 uses 0.1.26 → 0.1.27, v3 uses 0.1.26 → 0.1.28, and v4 uses
-0.1.28 → 0.1.29.
+`predecessorAsarSha256`. The workflow supplies `directory` and uses the
+fixed predecessor and feed URLs. V6 admits only 0.1.30 → 0.1.31 (bundle 1038 → 1039)
+with provenance build `2026112701`. The unchanged source receipt independently
+binds the successor source and build. Execute requires
+`RUN_DISPOSABLE_PRODUCTION_ELECTRON_UPDATE`. Historical routes retain their
+original pairs, including v2 0.1.26 → 0.1.27, v3 0.1.26 → 0.1.28,
+v4 0.1.28 → 0.1.29, and v5 0.1.29 → 0.1.30.
 
-The immutable 0.1.29 manifest binds source
-`905d9f9682ef472671eb87281fb35ead38711561` and the predecessor DMG digests
-below. Its SHA-256 is
-`731b1ffe5d1c5fa9a8e38c23c439d2f77327fa045b25cf31da955a6834da446c`.
-[Published 0.1.29 manifest](https://github.com/adamallcock/tibotattle/releases/download/v0.1.29/release-manifest.json)
+The published 0.1.30 manifest binds source
+`0bb1fa31932a56adeb54d8abbb17118d2e1d434f` and the DMG digests. Its SHA-256 is
+`55e976ef04b8193530d6a33580b16ae0cf1f35ac12bb643054dfbbe9965d6cfe`. The
+installed 0.1.30 production-update receipts bind the ASAR hashes to those
+DMGs. [Published manifest](https://github.com/adamallcock/tibotattle/releases/download/v0.1.30/release-manifest.json) ·
+[Apple silicon run](https://github.com/adamallcock/tibotattle/actions/runs/44948563976) ·
+[Intel run](https://github.com/adamallcock/tibotattle/actions/runs/44948682354)
 
-| Architecture | DMG SHA-256 |
-| --- | --- |
-| Apple silicon | `4a4696bd297e31ad8a7ecce5e08b0fb6c639518c7199d6d69c05de8048e5af52` |
-| Intel | `462561a50ce102cf8d808fe540c7a0950261acf5b91e47c3b18f40696ceb1991` |
+| Architecture | DMG SHA-256 | ASAR SHA-256 |
+| --- | --- | --- |
+| Apple silicon | `4fe4c2fef9739d37ea9f8c842808595bdf50db8bcd9ecaae059d5511e19bc05f` | `b8c0653faa15eeaa82f6bb9c9906b9823e627456cb6de4673d2dc320da923647` |
+| Intel | `42354eddb492c69af9f3ce577e0cc1d8aff51d14e84e6c16cb3ee7cdbfe773bc` | `16500b99ee4fe665cc7a972d8ef3de5ee4d7a3beeacf81f92063cdbc0f14f028` |
 
-The runner verifies those downloaded bytes, signed bundle, architecture,
-0.1.29 package/source, provenance build `2026102601`, and bundle version `1037`
-before launching the predecessor. The public manifest does not publish an ASAR
-hash: derive `predecessorAsarSha256` from the exact pinned DMG and retain that
-inspection; the runner compares the installed archive with it. A supplied hash
-or planned receipt alone is not artifact verification.
+Admission requires the pinned predecessor ASAR hash for the selected
+architecture. Execute verifies the downloaded DMG, installed ASAR, signed
+bundle, architecture, 0.1.30 package and source, provenance build
+`2026112101`, and bundle version `1038` before launching the predecessor.
 
 Before launching the predecessor, the runner snapshots that verified archive
 into private scratch and uses its public local-index API to create synthetic
-retained state and read the baseline. V4 and v5 seed from their respective
+retained state and read the baseline. V4 through v6 seed from their respective
 published format-12 predecessors. Historical v3 keeps 0.1.26 at format 11 until
 the installed successor performs its real forward migration to format 12.
 Post-update continuity reads use the current API; neither database version labels nor the
 signed application are modified to make the predecessor accept newer state.
 The scratch snapshot is removed after baseline inspection, including on failure.
 
-For v3, v4, and v5, the verified predecessor's normal ingestion API builds the retained
+For v3 through v6, the verified predecessor's normal ingestion API builds the retained
 index from a synthetic usage source. The fixture then retires only that owned
 source and keeps a separate metadata-only rollout discoverable. This makes
 ordinary startup refresh eligible without adding usage or quota observations.
@@ -134,7 +134,7 @@ refreshes, including retained rows and the explicit partial-provenance state. Th
 qualifies an upgrade with a discoverable source; profiles with no surviving
 source files require separate qualification.
 
-V4 and v5 require intact format-12 metadata and read-only continuity reads, checking
+V4 through v6 require intact format-12 metadata and read-only continuity reads, checking
 the same updater-created process identity before and after each read. It does
 not accept another format or a current-format integrity failure. The same fixed
 readiness deadline and owned cleanup rules apply.
@@ -149,7 +149,7 @@ app to manufacture first-launch readiness.
 
 The ordinary Settings check/download/install/restart path must replace the
 app with the exact published candidate and preserve rows, settings, salt and
-recorded opt-out. V2 through v5 require every captured predecessor process identity,
+recorded opt-out. V2 through v6 require every captured predecessor process identity,
 including an orphaned companion, to exit before accepting the updater-created
 successor; later cleanup cannot satisfy that observation. Capture binds each
 process command and start time from one bounded inventory sample. The complete
@@ -167,10 +167,23 @@ reuse. Cleanup succeeds only after a fresh inventory proves absence and the
 final application/helper absence checks pass. Persistent uncertainty at the
 deadline, unavailable inventory, and initial or pre-signal identity failures
 remain fatal.
-Retain the separate
-`tibotattle-signed-macos-production-update-v5` receipt for each architecture.
+V6 checks retained history on the updater-created launch and after a controlled
+restart. It waits for startup refresh to finish before adding one synthetic
+usage-and-quota observation to the disposable Codex home. For each of two ordinary detailed Refresh actions,
+the runner binds the accepted POST from the dashboard click to its terminal
+refresh ID. The first refresh must index the observation once. The replay must
+report zero inserts and the same generation, with three usage events and three
+source-scoped quota occurrences. Read-only SQLite checks bind the counts and
+digests of the original and added usage, canonical quota and source-scoped
+quota occurrence rows. This installed journey covers continuity
+and repeated refresh. Checkpoint interruption and recovery have their own
+[source tests](../../test/local-unified-index-checkpoint-batches.test.js).
+
+Retain the separate `tibotattle-signed-macos-production-update-v6` receipt for
+each architecture. In an executed pass, both `postRestartActivityIndexed`
+and `postRestartRefreshNoDuplicates` must be true.
 The receipt records `existingCredentialFixture: false` because the signed
-credential fixture runs separately. Historical v1 through v4 receipts remain
+credential fixture runs separately. Historical v1 through v5 receipts remain
 bound to their original predecessors and artifacts.
 
 This is post-activation acceptance of the real production feed. It does not
@@ -188,7 +201,7 @@ and `electron-macos-credentials.yml` exercise existing credentials on a signed
 installed Electron replacement. A passing synthetic journey does not prove all
 failure paths or every user Keychain state. Unexpected Keychain prompts block
 release. Keep the existing key access and owner approval requirements. The
-0.1.30 credential lane uses its established disposable 0.1.20 predecessor and
+0.1.31 credential lane uses its established disposable 0.1.20 predecessor and
 requires a new receipt for the exact replacement bytes. The runner enables the
 additional historical GPT-6.1 Sol fixture only for 0.1.27 and 0.1.28. Any
 retained historical repair receipt applies to its own build and parser.

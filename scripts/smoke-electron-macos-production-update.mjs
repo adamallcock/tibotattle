@@ -26,11 +26,13 @@ export const ELECTRON_PRODUCTION_UPDATE_SCHEMA_V2 = 'tibotattle-signed-macos-pro
 export const ELECTRON_PRODUCTION_UPDATE_SCHEMA_V3 = 'tibotattle-signed-macos-production-update-v3';
 export const ELECTRON_PRODUCTION_UPDATE_SCHEMA_V4 = 'tibotattle-signed-macos-production-update-v4';
 export const ELECTRON_PRODUCTION_UPDATE_SCHEMA_V5 = 'tibotattle-signed-macos-production-update-v5';
+export const ELECTRON_PRODUCTION_UPDATE_SCHEMA_V6 = 'tibotattle-signed-macos-production-update-v6';
 const PRODUCTION_UPDATE_ROUTES = Object.freeze({
   'tibotattle-production-electron-update-intake-v2': Object.freeze({ receiptSchema: ELECTRON_PRODUCTION_UPDATE_SCHEMA_V2 }),
   'tibotattle-production-electron-update-intake-v3': Object.freeze({ receiptSchema: ELECTRON_PRODUCTION_UPDATE_SCHEMA_V3, predecessorUserVersion: 11 }),
   'tibotattle-production-electron-update-intake-v4': Object.freeze({ receiptSchema: ELECTRON_PRODUCTION_UPDATE_SCHEMA_V4, predecessorUserVersion: 12 }),
   'tibotattle-production-electron-update-intake-v5': Object.freeze({ receiptSchema: ELECTRON_PRODUCTION_UPDATE_SCHEMA_V5, predecessorUserVersion: 12 }),
+  'tibotattle-production-electron-update-intake-v6': Object.freeze({ receiptSchema: ELECTRON_PRODUCTION_UPDATE_SCHEMA_V6, predecessorUserVersion: 12, checkPostRestartActivity: true }),
 });
 const retainedProductionUpdateRoute = input => PRODUCTION_UPDATE_ROUTES[input.schemaVersion]?.predecessorUserVersion !== undefined;
 const ELECTRON_020 = resolveMacOSProductionUpdatePredecessor({ schemaVersion: 'tibotattle-production-electron-update-intake-v1' });
@@ -118,17 +120,22 @@ async function bytes(path, limit = 1024 ** 3) {
   if (!s.isFile() || s.nlink !== 1 || s.uid !== process.getuid() || s.size < 1 || s.size > limit) fail('unsafe_file');
   return readFile(path);
 }
+async function productionUpdateFixtureSessions(codexHome, failureStage) {
+  const sessions = join(codexHome, 'sessions');
+  await safePath(sessions);
+  for (const path of [codexHome, sessions]) {
+    const stat = await lstat(path);
+    if (!stat.isDirectory() || stat.uid !== process.getuid() || (stat.mode & 0o077)) fail(failureStage);
+  }
+  return sessions;
+}
+
 // Routes with an explicit index format seed ingestion provenance before any app launch. The
 // retired usage source exercises retained history; the metadata-only source
 // keeps ordinary local analysis available without adding usage or quota facts.
 export async function seedProductionUpdateRetainedNativeState(nativeRoot, codexHome, index, ingest) {
   if (typeof ingest !== 'function') fail('predecessor_fixture_api');
-  const sessions = join(codexHome, 'sessions');
-  await safePath(sessions);
-  for (const path of [codexHome, sessions]) {
-    const stat = await lstat(path);
-    if (!stat.isDirectory() || stat.uid !== process.getuid() || (stat.mode & 0o077)) fail('predecessor_fixture_location');
-  }
+  const sessions = await productionUpdateFixtureSessions(codexHome, 'predecessor_fixture_location');
   const preliminary = await seedSignedReplacementNativeState(nativeRoot, codexHome, index);
   const stamp = offset => new Date(Date.parse('2026-08-01T00:00:00Z') + offset * 1000).toISOString();
   const metadata = id => ({ timestamp: stamp(0), type: 'session_meta', payload: { id } });
@@ -173,6 +180,162 @@ export async function seedProductionUpdateRetainedNativeState(nativeRoot, codexH
   if (Object.keys(before).some(key => retained[key] !== before[key])) fail('predecessor_fixture_state');
   return retained;
 }
+const POST_RESTART_ACTIVITY_TIME = Date.parse('2026-08-02T00:00:01Z');
+const POST_RESTART_UNCACHED_TOKENS = 105;
+
+export async function writeProductionUpdatePostRestartActivity(codexHome) {
+  const sessions = await productionUpdateFixtureSessions(codexHome, 'restart_fixture_location');
+  const id = '33333333-3333-4333-8333-333333333333';
+  const contextTime = new Date(POST_RESTART_ACTIVITY_TIME - 1000).toISOString();
+  const usage = { input_tokens: POST_RESTART_UNCACHED_TOKENS + 200, cached_input_tokens: 200,
+    cache_write_input_tokens: 0, output_tokens: 7, reasoning_output_tokens: 2,
+    total_tokens: POST_RESTART_UNCACHED_TOKENS + 207 };
+  const rows = [
+    { timestamp: contextTime, type: 'session_meta', payload: { id } },
+    { timestamp: contextTime, type: 'turn_context', payload: { model: 'gpt-5.6-sol', effort: 'medium' } },
+    { timestamp: new Date(POST_RESTART_ACTIVITY_TIME).toISOString(), type: 'event_msg', payload: { type: 'token_count',
+      info: { total_token_usage: usage, last_token_usage: usage },
+      rate_limits: { limit_id: 'codex', plan_type: 'plus', primary: { used_percent: 43,
+        window_minutes: 300, resets_at: Date.parse('2026-08-03T00:00:00Z') / 1000 } } } },
+  ];
+  await writeFile(join(sessions, `rollout-2026-08-02T00-00-00-${id}.jsonl`), rows.map(row => JSON.stringify(row)).join('\n') + '\n',
+    { flag: 'wx', mode: 0o600 });
+}
+
+export function readProductionUpdateHistoryPartition(stateRoot, index) {
+  return readSignedReplacementState(stateRoot, index, { partitionAt: POST_RESTART_ACTIVITY_TIME });
+}
+
+export async function readProductionUpdatePostRestartActivity({ stateRoot, before, settings, sharing, priorAdditional } = {}) {
+  const state = await readProductionUpdateHistoryPartition(stateRoot);
+  assertSignedReplacementContinuity(before, state, settings, sharing);
+  const { additional } = state;
+  if (before.quotaOccurrences !== 2 || state.quotaOccurrences !== before.quotaOccurrences
+    || state.quotaOccurrenceDigest !== before.quotaOccurrenceDigest
+    || additional.usageRows !== 1 || additional.quotaRows !== 1 || additional.quotaOccurrences !== 1
+    || additional.tokensInUncached !== POST_RESTART_UNCACHED_TOKENS
+    || (priorAdditional && (additional.recordDigest !== priorAdditional.recordDigest
+      || additional.quotaOccurrenceDigest !== priorAdditional.quotaOccurrenceDigest))) fail('restart_activity_continuity');
+  return additional;
+}
+
+const REFRESH_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const REFRESH_RECEIPT_LIMIT = 64 * 1024;
+const REFRESH_GENERATION_FINGERPRINT = /^generation-v2-[0-9a-f]{64}$/u;
+
+async function acceptProductionUpdateDetailedRefresh(dashboard, clock) {
+  const { frameTree } = await dashboard.request('Page.getFrameTree');
+  const frame = frameTree?.frame;
+  const page = URL.parse(frame?.url ?? '');
+  if (page?.protocol !== 'http:' || page.hostname !== '127.0.0.1' || !page.port
+    || typeof frame.id !== 'string' || !frame.id || typeof frame.loaderId !== 'string' || !frame.loaderId) {
+    fail('restart_refresh_frame');
+  }
+  const endpoint = new URL('/api/local/refresh', page).href;
+  let requestId = null, responseStatus = null, finished = false, invalid = false;
+  const listeners = [
+    dashboard.on('Network.requestWillBeSent', event => {
+      if (requestId !== null && event.requestId === requestId) { invalid = true; return; }
+      // The dashboard invokes fetch synchronously from its click handler.
+      // Distinguish that call from timers and other refresh sources on the same page.
+      const calls = event.initiator?.stack?.callFrames;
+      if (event.request?.method !== 'POST' || event.request.url !== endpoint
+        || event.frameId !== frame.id || event.loaderId !== frame.loaderId
+        || !Array.isArray(calls) || !calls.some(call => call?.functionName === 'productionUpdateRefreshClick')) return;
+      if (requestId !== null || typeof event.requestId !== 'string' || !event.requestId
+        || event.redirectResponse) { invalid = true; return; }
+      requestId = event.requestId;
+    }),
+    dashboard.on('Network.responseReceived', event => {
+      if (requestId === null || event.requestId !== requestId) return;
+      if (event.response?.url !== endpoint || responseStatus !== null) invalid = true;
+      responseStatus = event.response?.status;
+    }),
+    dashboard.on('Network.loadingFinished', event => {
+      if (requestId === null || event.requestId !== requestId) return;
+      if (!Number.isFinite(event.encodedDataLength) || event.encodedDataLength > REFRESH_RECEIPT_LIMIT) invalid = true;
+      finished = true;
+    }),
+    dashboard.on('Network.loadingFailed', event => {
+      if (requestId !== null && event.requestId === requestId) invalid = true;
+    }),
+  ];
+  try {
+    // Chromium's default reports only the leaf fetch call.
+    await dashboard.request('Runtime.enable');
+    await dashboard.request('Runtime.setMaxCallStackSizeToCapture', { size: 20 });
+    await dashboard.request('Network.enable', { maxResourceBufferSize: REFRESH_RECEIPT_LIMIT });
+    await until(() => dashboard.evaluate(`(function productionUpdateRefreshClick(){
+      const button=document.querySelector('#refresh-button');
+      if (!button || button.disabled) return false;
+      button.click();
+      return true;
+    })()`), 60000, 'restart_refresh_button', clock);
+    await until(() => {
+      if (invalid || (responseStatus !== null && responseStatus !== 202)) fail('restart_refresh_acceptance');
+      return finished && responseStatus === 202;
+    }, 60000, 'restart_refresh_acceptance', clock);
+    const response = await dashboard.request('Network.getResponseBody', { requestId });
+    if (invalid || typeof response?.body !== 'string' || response.body.length > REFRESH_RECEIPT_LIMIT) fail('restart_refresh_acceptance');
+    let refresh;
+    try {
+      const body = response.base64Encoded ? Buffer.from(response.body, 'base64').toString('utf8') : response.body;
+      refresh = JSON.parse(body)?.refresh;
+    } catch { fail('restart_refresh_acceptance'); }
+    if (refresh?.mode !== 'detailed' || refresh.status !== 'running'
+      || typeof refresh.refreshId !== 'string' || !REFRESH_ID.test(refresh.refreshId)) fail('restart_refresh_acceptance');
+    return refresh.refreshId;
+  } finally {
+    for (const unsubscribe of listeners) unsubscribe();
+  }
+}
+
+const REFRESH_FAILURE_STATUSES = ['failed', 'cancelled', 'degraded'];
+
+function readProductionUpdateRefresh(dashboard) {
+  return dashboard.evaluate(`(async()=>{
+    const r=await fetch('/api/local/refresh',{cache:'no-store'});
+    const v=r.ok?(await r.json()).refresh:null;
+    if (!v) return null;
+    const button=document.querySelector('#refresh-button');
+    const index=v.result?.unifiedIndex, generation=index?.generation;
+    return { id:v.refreshId, status:v.status, mode:v.mode, buttonReady:!!button && !button.disabled,
+      indexStatus:index?.status, unchanged:index?.unchanged, insertedUsageEvents:index?.insertedUsageEvents,
+      usageEvents:generation?.usageEvents, quotaOccurrences:generation?.quotaOccurrences,
+      generationId:generation?.id, generationFingerprint:generation?.fingerprint };
+  })()`);
+}
+
+export async function waitForProductionUpdateStartupRefresh(dashboard, clock) {
+  await until(async () => {
+    const refresh = await readProductionUpdateRefresh(dashboard);
+    if (REFRESH_FAILURE_STATUSES.includes(refresh?.status)) fail('restart_startup_refresh_failed');
+    return refresh?.buttonReady === true && refresh.status === 'succeeded'
+      && ['quick', 'detailed'].includes(refresh.mode) && typeof refresh.id === 'string' && REFRESH_ID.test(refresh.id);
+  }, 60000, 'restart_startup_refresh_completion', clock);
+}
+
+export async function runProductionUpdateDetailedRefresh(dashboard, { previousGeneration = null, ...clock } = {}) {
+  const refreshId = await acceptProductionUpdateDetailedRefresh(dashboard, clock);
+  return until(async () => {
+    const refresh = await readProductionUpdateRefresh(dashboard);
+    if (refresh === null) return null;
+    // The installed API exposes only the latest receipt. A later attempt
+    // cannot establish terminal evidence for the accepted request.
+    if (refresh?.id !== refreshId || refresh.mode !== 'detailed') fail('restart_refresh_attempt_replaced');
+    if (REFRESH_FAILURE_STATUSES.includes(refresh.status)) fail('restart_refresh_failed');
+    if (refresh.status !== 'succeeded') return null;
+    const replay = previousGeneration !== null;
+    if (refresh.indexStatus !== 'ingested' || refresh.unchanged !== replay
+      || refresh.insertedUsageEvents !== (replay ? 0 : 1) || refresh.usageEvents !== 3 || refresh.quotaOccurrences !== 3
+      || !Number.isSafeInteger(refresh.generationId) || refresh.generationId < 1
+      || typeof refresh.generationFingerprint !== 'string' || !REFRESH_GENERATION_FINGERPRINT.test(refresh.generationFingerprint)
+      || (replay && (refresh.generationId !== previousGeneration.id
+        || refresh.generationFingerprint !== previousGeneration.fingerprint))) fail('restart_refresh_index_result');
+    return { id: refresh.generationId, fingerprint: refresh.generationFingerprint };
+  }, 60000, 'restart_refresh_completion', clock);
+}
+
 async function fetchBytes(url, limit, github = false) {
   let selected = new URL(url);
   for (let redirect = 0; redirect < 4; redirect++) {
@@ -250,7 +413,7 @@ export async function waitForProductionUpdateSuccessor({ appPath, predecessorPid
   }, 180000, 'updater_relaunch', { now, sleep });
 }
 // v3's verified 026 reader admits live v11 while the successor migrates a
-// staging clone. The v4 and v5 readers already use format 12. Each route
+// staging clone. The v4 through v6 readers already use format 12. Each route
 // requires its exact format and intact metadata, through read-only handles.
 export async function readProductionUpdateSuccessorState(stateRoot, predecessorIndex, predecessorUserVersion = 11) {
   if (![11, 12].includes(predecessorUserVersion)) fail('successor_state_schema');
@@ -429,6 +592,7 @@ export async function runProductionUpdate(options) {
         predecessorBundleVersion: predecessorIdentity.bundleVersion, predecessorBuildNumber: predecessorIdentity.buildNumber,
         predecessorSourceRevision: predecessorIdentity.sourceRevision, predecessorProcessesExitedNaturally: false });
     }
+    if (route?.checkPostRestartActivity) Object.assign(proof, { postRestartActivityIndexed: false, postRestartRefreshNoDuplicates: false });
     for (const key of ['target', 'sourceRevision', 'version', 'buildNumber', 'bundleVersion', 'dmgSha256', 'asarSha256',
       'zipSha256', 'feedSha256', 'predecessorAsarSha256', 'predecessorDmgSha256']) proof[key] = input[key];
     if (!options.execute) return { ...proof, status: 'planned' };
@@ -481,8 +645,12 @@ export async function runProductionUpdate(options) {
       await until(async () => (await inspectNativeElectronHandoverCompletion({ userDataRoot: profile })).status === 'completed', 120000, 'predecessor_migration');
       const stateRoot = join(profile, 'companion-state'), settingsFile = join(profile, 'desktop-settings', 'desktop-settings-v1.json');
       const sharing = await until(async () => { const value = await active.readSharing(); return value?.available && value?.current ? value : null; }, 30000, 'sharing');
-      const before = await readSignedReplacementState(stateRoot, index);
+      const before = route?.checkPostRestartActivity
+        ? await readProductionUpdateHistoryPartition(stateRoot, index) : await readSignedReplacementState(stateRoot, index);
       assertSignedReplacementContinuity(seeded, before, JSON.parse(await readFile(settingsFile)), sharing);
+      if (route?.checkPostRestartActivity && (before.quotaOccurrences !== 2 || before.additional.quotaOccurrences !== 0)) {
+        fail('predecessor_fixture_state');
+      }
       await absent(join(stateRoot, 'accountless-device-binding-v1.json'));
       // The namespace's static dependencies remain loaded after owned scratch
       // removal; the readiness probe uses only its read-only public API.
@@ -556,6 +724,22 @@ export async function runProductionUpdate(options) {
     const afterSharing = await until(async () => { const value = await active.readSharing(); return value?.available && value?.current ? value : null; }, 30000, 'sharing_after');
     assertSignedReplacementContinuity(before, await readSignedReplacementState(stateRoot), JSON.parse(await readFile(settingsFile)), afterSharing);
     await absent(join(stateRoot, 'accountless-device-binding-v1.json'));
+    if (route?.checkPostRestartActivity) {
+      stage = 'post_restart_startup_refresh';
+      await waitForProductionUpdateStartupRefresh(active.dashboard);
+      stage = 'post_restart_activity';
+      await writeProductionUpdatePostRestartActivity(codex);
+      const generation = await runProductionUpdateDetailedRefresh(active.dashboard);
+      const readContinuity = async priorAdditional => readProductionUpdatePostRestartActivity({ stateRoot, before,
+        settings: JSON.parse(await readFile(settingsFile)), sharing: await active.readSharing(), priorAdditional });
+      const additional = await readContinuity();
+      proof.postRestartActivityIndexed = true;
+      stage = 'post_restart_refresh_replay';
+      await runProductionUpdateDetailedRefresh(active.dashboard, { previousGeneration: generation });
+      await readContinuity(additional);
+      await absent(join(stateRoot, 'accountless-device-binding-v1.json'));
+      proof.postRestartRefreshNoDuplicates = true;
+    }
     await stopOwnedMacSharingApp(active); active = null;
     Object.assign(proof, { retainedRowsPreserved: true, saltPreserved: true, preferencesPreserved: true,
       optOutPreserved: true, restartNoDuplicates: true, status: 'passed' });

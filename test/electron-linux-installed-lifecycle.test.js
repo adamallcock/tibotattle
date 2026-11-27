@@ -3,8 +3,8 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { productionElectronCandidatePlan } from '../scripts/package-electron-production.mjs';
-import { LINUX_FINAL_SCHEMA, LINUX_FINAL_SCHEMA_V2, LINUX_FINAL_SCHEMA_V3, LINUX_FINAL_SCHEMA_V4,
-  LINUX_FINAL_PREDECESSOR, LINUX_FINAL_PREDECESSOR_V2, LINUX_FINAL_PREDECESSOR_V3,
+import { LINUX_FINAL_SCHEMA, LINUX_FINAL_SCHEMA_V2, LINUX_FINAL_SCHEMA_V3, LINUX_FINAL_SCHEMA_V4, LINUX_FINAL_SCHEMA_V5,
+  LINUX_FINAL_PREDECESSOR, LINUX_FINAL_PREDECESSOR_V2, LINUX_FINAL_PREDECESSOR_V3, LINUX_FINAL_PREDECESSOR_V4,
   resolveLinuxFinalPredecessor, validateLinuxFinalIntake, parseLinuxFinalIntake, validateLinuxFinalPackageRun,
   validateLinuxFinalPackageReceipt, validateLinuxFinalPair, linuxFinalArtifactName } from '../scripts/lib/linux-final-artifact-intake.mjs';
 import { selectLinuxFinalFuseMount, linuxFinalSandboxStatus, linuxFinalFeedRequestPath, assertLinuxFinalProcessTreeGone, assertLinuxFinalChecksumRejection,
@@ -131,6 +131,38 @@ test('030 intake v4 binds immutable 029 AppImage evidence and rejects 029 lifecy
   assert.throws(() => validateLinuxFinalPair({ ...next.pair, predecessorManifestSha256: prior.pair.predecessorManifestSha256,
     images: { ...next.pair.images, current: prior.pair.images.current } }, runner));
   assert.equal(resolveLinuxFinalPredecessor(prior.intake), LINUX_FINAL_PREDECESSOR_V2);
+  validateLinuxFinalPair(prior.pair, runner);
+});
+
+test('031 intake v5 binds immutable 030 AppImage evidence and rejects 030 lifecycle inputs', async () => {
+  const manifestBytes = await readFile(new URL('./fixtures/releases/v0.1.30/release-manifest.json', import.meta.url));
+  const predecessor = LINUX_FINAL_PREDECESSOR_V4;
+  assert.equal(hash(manifestBytes), predecessor.manifestSha256);
+  const manifest = JSON.parse(manifestBytes);
+  const artifact = manifest.artifacts.find(row => row.platform === 'linux' && row.architecture === 'x64' && row.format === 'appimage');
+  assert.equal(manifest.commit, predecessor.sourceRevision);
+  assert.equal(artifact.source.commit, predecessor.sourceRevision);
+  assert.deepEqual([artifact.fileName, artifact.version, artifact.sha256, artifact.bytes],
+    [predecessor.file, predecessor.version, predecessor.sha256, predecessor.bytes]);
+
+  const next = fixture({ schemaVersion: LINUX_FINAL_SCHEMA_V5, version: '0.1.31', buildNumber: '2026112701' });
+  const prior = fixture({ schemaVersion: LINUX_FINAL_SCHEMA_V4, version: '0.1.30', buildNumber: '2026112101' });
+  assert.equal(validateLinuxFinalIntake(next.intake), next.intake);
+  assert.equal(resolveLinuxFinalPredecessor(next.intake), predecessor);
+  validateLinuxFinalPackageReceipt(next.receipt, next.intake, next.sourceBytes);
+  validateLinuxFinalPair(next.pair, runner);
+  for (const patch of [{ schemaVersion: LINUX_FINAL_SCHEMA_V4 }, { schemaVersion: 'toString' },
+    { version: '0.1.30' }, { buildNumber: '2026112101' }, { buildNumber: '2026112702' },
+    { buildNumber: 2026112701 }, { sourceCandidate: prior.intake.sourceCandidate }]) {
+    assert.throws(() => validateLinuxFinalIntake({ ...next.intake, ...patch }));
+  }
+  assert.throws(() => validateLinuxFinalPackageReceipt(prior.receipt, next.intake, prior.sourceBytes));
+  assert.throws(() => validateLinuxFinalPair({ ...next.pair, predecessorManifestSha256: prior.pair.predecessorManifestSha256 }, runner));
+  assert.throws(() => validateLinuxFinalPair({ ...next.pair,
+    images: { ...next.pair.images, current: prior.pair.images.current } }, runner));
+  assert.throws(() => validateLinuxFinalPair({ ...next.pair,
+    images: { ...next.pair.images, next: prior.pair.images.next } }, runner));
+  assert.equal(resolveLinuxFinalPredecessor(prior.intake), LINUX_FINAL_PREDECESSOR_V3);
   validateLinuxFinalPair(prior.pair, runner);
 });
 

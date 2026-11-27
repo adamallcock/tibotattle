@@ -21,6 +21,11 @@ const fail = reason => { throw Object.assign(new Error('MACOS_QUALIFICATION_IDEN
 // v5 admits only published 0.1.29 -> 0.1.30. Its predecessor manifest SHA-256 is
 // 731b1ffe5d1c5fa9a8e38c23c439d2f77327fa045b25cf31da955a6834da446c:
 // https://github.com/adamallcock/tibotattle/releases/download/v0.1.29/release-manifest.json
+// v6 admits only published 0.1.30 -> 0.1.31. Its predecessor manifest SHA-256 is
+// 55e976ef04b8193530d6a33580b16ae0cf1f35ac12bb643054dfbbe9965d6cfe:
+// https://github.com/adamallcock/tibotattle/releases/download/v0.1.30/release-manifest.json
+// The v5 installed receipts for runs 44948563976 and 44948682354 verified the
+// signed 0.1.30 bundles and bind their ASAR digests to those exact DMGs.
 // 0.1.26 DMGs/source are pinned by the immutable published manifest:
 // https://github.com/adamallcock/tibotattle/releases/download/v0.1.26/release-manifest.json
 // SHA-256 be65a83f8c1f060b7c5cf6141b6332c02df730dc1a2aac696442e4e433c123cc.
@@ -72,14 +77,30 @@ const PRODUCTION_UPDATE_PREDECESSORS = Object.freeze({
       'darwin-x64': '462561a50ce102cf8d808fe540c7a0950261acf5b91e47c3b18f40696ceb1991',
     }),
   }),
+  'tibotattle-production-electron-update-intake-v6': Object.freeze({
+    version: '0.1.30', sourceRevision: '0bb1fa31932a56adeb54d8abbb17118d2e1d434f',
+    buildNumber: '2026112101', bundleVersion: '1038', successorVersion: '0.1.31',
+    successorBuildNumber: '2026112701',
+    dmgSha256: Object.freeze({
+      'darwin-arm64': '4fe4c2fef9739d37ea9f8c842808595bdf50db8bcd9ecaae059d5511e19bc05f',
+      'darwin-x64': '42354eddb492c69af9f3ce577e0cc1d8aff51d14e84e6c16cb3ee7cdbfe773bc',
+    }),
+    asarSha256: Object.freeze({
+      'darwin-arm64': 'b8c0653faa15eeaa82f6bb9c9906b9823e627456cb6de4673d2dc320da923647',
+      'darwin-x64': '16500b99ee4fe665cc7a972d8ef3de5ee4d7a3beeacf81f92063cdbc0f14f028',
+    }),
+  }),
 });
 
-export function resolveMacOSProductionUpdatePredecessor({ schemaVersion, version, buildNumber } = {}) {
+export function resolveMacOSProductionUpdatePredecessor({ schemaVersion, version, buildNumber,
+  target, predecessorAsarSha256 } = {}) {
   if (typeof schemaVersion !== 'string' || !Object.hasOwn(PRODUCTION_UPDATE_PREDECESSORS, schemaVersion)) fail('update_profile');
   const predecessor = PRODUCTION_UPDATE_PREDECESSORS[schemaVersion];
   if (predecessor.successorVersion && version !== predecessor.successorVersion) fail('update_profile');
   if (!predecessor.successorVersion && version !== undefined && !LEGACY_UPDATE_SUCCESSORS.includes(version)) fail('update_profile');
   if (predecessor.successorBuildNumber && buildNumber !== predecessor.successorBuildNumber) fail('update_profile');
+  if (predecessor.asarSha256 && (!Object.hasOwn(predecessor.asarSha256, target)
+    || predecessorAsarSha256 !== predecessor.asarSha256[target])) fail('update_predecessor_asar');
   return predecessor;
 }
 

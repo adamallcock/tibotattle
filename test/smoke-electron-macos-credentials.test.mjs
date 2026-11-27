@@ -138,7 +138,7 @@ test('plan and compilation plan remain inert and every physical qualification st
 
 for (const [version, bundleVersion, buildNumber] of [['0.1.27', '1035', '2026100301'],
   ['0.1.28', '1036', '2026100901'], ['0.1.29', '1037', '2026102601'],
-  ['0.1.30', '1038', '2026112101']]) test(`${version} credential planning cannot claim historical Sol repair or native execution`, async () => {
+  ['0.1.30', '1038', '2026112101'], ['0.1.31', '1039', '2026112701']]) test(`${version} credential planning cannot claim historical Sol repair or native execution`, async () => {
   const successor = { ...intake, version, bundleVersion, buildNumber };
   const plan = await runMacCredentialQualification({ intake: successor });
   assert.equal(plan.status, 'planned');

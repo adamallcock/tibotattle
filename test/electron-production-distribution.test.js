@@ -191,7 +191,7 @@ test("027 allocation advances released 026 on both Mac architectures independent
         }), /reviewed production allocation/u);
       }
       assert.throws(() => POLICY.productionElectronBuildVersionForTarget({
-        ...input, version: "0.1.31",
+        ...input, version: "0.1.32",
       }), /explicit signed bundle version allocation/u);
     }
   }
@@ -213,7 +213,7 @@ test("028 has a new reviewed Mac allocation while provenance and frozen 027 rema
     assert.throws(() => POLICY.assertProductionElectronMacOSBundleMetadata({ ...input,
       bundleVersion: "1036", bundleShortVersion: "0.1.27" }), /reviewed production allocation/u);
   }
-  assert.equal(resolveSignedMacOSBundleVersion("0.1.31", "stable"), null);
+  assert.equal(resolveSignedMacOSBundleVersion("0.1.32", "stable"), null);
 });
 
 test("029 has a new reviewed Mac allocation while provenance and frozen 028 remain independent", () => {
@@ -232,7 +232,7 @@ test("029 has a new reviewed Mac allocation while provenance and frozen 028 rema
     assert.throws(() => POLICY.assertProductionElectronMacOSBundleMetadata({ ...input,
       bundleVersion: "1037", bundleShortVersion: "0.1.28" }), /reviewed production allocation/u);
   }
-  assert.equal(resolveSignedMacOSBundleVersion("0.1.31", "stable"), null);
+  assert.equal(resolveSignedMacOSBundleVersion("0.1.32", "stable"), null);
 });
 
 test("030 advances both production Mac bundles while keeping build provenance independent", () => {
@@ -251,6 +251,24 @@ test("030 advances both production Mac bundles while keeping build provenance in
     assert.throws(() => POLICY.assertProductionElectronMacOSBundleMetadata({ ...input,
       bundleVersion: "1038", bundleShortVersion: "0.1.29" }), /reviewed production allocation/u);
   }
+});
+
+test("031 advances both production Mac bundles with independent provenance", () => {
+  assert.equal(resolveSignedMacOSBundleVersion("0.1.30", "stable"), "1038");
+  assert.equal(compareAppleMacOSBundleVersions("1038", "1039"), -1);
+  for (const target of ["darwin-arm64", "darwin-x64"]) {
+    const input = { target, version: "0.1.31", buildNumber: "2026112701" };
+    assert.equal(POLICY.productionElectronBuildVersionForTarget(input), "1039");
+    assert.deepEqual(POLICY.assertProductionElectronMacOSBundleMetadata({ ...input,
+      bundleVersion: "1039", bundleShortVersion: "0.1.31" }), { bundleVersion: "1039", bundleShortVersion: "0.1.31" });
+    for (const bundleVersion of ["1038", "1039.0", input.buildNumber, undefined]) {
+      assert.throws(() => POLICY.assertProductionElectronMacOSBundleMetadata({ ...input,
+        bundleVersion, bundleShortVersion: "0.1.31" }), /reviewed production allocation/u);
+    }
+    assert.throws(() => POLICY.assertProductionElectronMacOSBundleMetadata({ ...input,
+      bundleVersion: "1039", bundleShortVersion: "0.1.30" }), /reviewed production allocation/u);
+  }
+  assert.equal(resolveSignedMacOSBundleVersion("0.1.32", "stable"), null);
 });
 
 test("historical Electron receipts keep their frozen bundle ordering without allocating future stable releases", () => {

@@ -1,6 +1,6 @@
 ---
 title: Platform support and qualification
-date: 2026-11-21
+date: 2026-11-27
 type: reference
 status: maintained
 ---
@@ -13,6 +13,13 @@ Linux x86_64. [Current status](../current-status.md) ·
 [0.1.30 artifact hashes and assurances](https://github.com/adamallcock/tibotattle/releases/download/v0.1.30/release-manifest.json)
 
 ## Status matrix
+
+### 0.1.31 source candidate
+
+Candidate 0.1.31 targets macOS 14+ on Apple silicon and Intel, Windows x64,
+and Linux x86_64. The packaging build is `2026112701`, and both Mac
+architectures share bundle version `1039`. Final artifact and installed
+qualification for these targets are pending. [Candidate notes](../../release-notes/0.1.31.md)
 
 ### 0.1.30 artifact qualification
 
