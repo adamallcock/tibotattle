@@ -59,12 +59,21 @@ async function resolveCodexBinary({
   statFile = stat,
   platform = process.platform,
   applicationsDir = "/Applications",
+  readWindowsPackageBinaries = null,
 } = {}) {
-  const candidates = [{
-    binary: environment.CODEX_BIN,
-    source: "environment_override",
-    location: "explicit_override",
-  }];
+  const override = environment.CODEX_BIN;
+  if (typeof override === "string" && override.length > 0
+      && await isExecutable(override, accessFile, statFile)) {
+    return { binary: override, source: "environment_override", location: "explicit_override" };
+  }
+  if (platform === "win32" && readWindowsPackageBinaries !== null) {
+    for (const binary of await readWindowsPackageBinaries({ environment })) {
+      if (await isExecutable(binary, accessFile, statFile)) {
+        return { binary, source: "codex_bundled", location: "windows_registered_package" };
+      }
+    }
+  }
+  const candidates = [];
   if (platform === "darwin") {
     const installations = [{ directory: applicationsDir, location: "system" }];
     if (typeof environment.HOME === "string" && isAbsolute(environment.HOME)) {
@@ -88,9 +97,7 @@ async function resolveCodexBinary({
       }
     }
   }
-  for (const candidate of candidates.filter((candidate) => (
-    typeof candidate.binary === "string" && candidate.binary.length > 0
-  ))) {
+  for (const candidate of candidates) {
     if (await isExecutable(candidate.binary, accessFile, statFile)) return candidate;
   }
   return { binary: "codex", source: "path", location: "path" };
@@ -137,10 +144,11 @@ export async function inspectCodexBinary({
   statFile = stat,
   platform = process.platform,
   applicationsDir = "/Applications",
+  readWindowsPackageBinaries = null,
   readVersion = readCodexBinaryVersion,
 } = {}) {
   const selected = await resolveCodexBinary({
-    environment, accessFile, statFile, platform, applicationsDir,
+    environment, accessFile, statFile, platform, applicationsDir, readWindowsPackageBinaries,
   });
   let version = null;
   try {
@@ -177,10 +185,15 @@ function classifyAppServerFailure(error, stderr = "") {
 }
 
 export class CodexAppServerClient extends EventEmitter {
-  constructor({ timeoutMs = DEFAULT_TIMEOUT_MS, spawnProcess = spawn } = {}) {
+  constructor({
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    spawnProcess = spawn,
+    resolveBinary = findCodexBinary,
+  } = {}) {
     super();
     this.timeoutMs = timeoutMs;
     this.spawnProcess = spawnProcess;
+    this.resolveBinary = resolveBinary;
     this.child = null;
     this.lines = null;
     this.pending = new Map();
@@ -193,7 +206,7 @@ export class CodexAppServerClient extends EventEmitter {
 
   async start() {
     if (this.child) return this;
-    const binary = await findCodexBinary();
+    const binary = await this.resolveBinary();
     try {
       this.child = this.spawnProcess(binary, ["app-server"], {
         stdio: ["pipe", "pipe", "pipe"],
@@ -326,9 +339,12 @@ export class CodexAppServerClient extends EventEmitter {
   }
 }
 
-export async function readCodexAccountSnapshot({ timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
-  const binary = await findCodexBinary();
-  const client = new CodexAppServerClient({ timeoutMs });
+export async function readCodexAccountSnapshot({
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  resolveBinary = findCodexBinary,
+} = {}) {
+  const binary = await resolveBinary();
+  const client = new CodexAppServerClient({ timeoutMs, resolveBinary: () => binary });
   try {
     await client.start();
     const [account, rateLimits, accountUsage] = await Promise.all([

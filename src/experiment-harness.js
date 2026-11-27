@@ -3,13 +3,9 @@ import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-  findCodexBinary,
-  readCodexAccountSnapshot,
-  sanitizeCodexAccountSnapshot,
-} from "./providers/codex/account.js";
+import { sanitizeCodexAccountSnapshot } from "./providers/codex/account.js";
 import { scanAndPriceCodexLogs } from "./codex-local-usage-analysis.js";
-import { localCodexLogScanner } from "./local-node-runtime.js";
+import { localCodexAccount, localCodexLogScanner } from "./local-node-runtime.js";
 import { stableJson } from "./export/index.js";
 import { subscriptionSpeedSensitivity } from "./application/index.js";
 import { validateTierDeclaration } from "./providers/codex/logs.js";
@@ -217,7 +213,7 @@ export function environmentForWorkload(environment = process.env) {
 }
 
 async function spawnWorkload(manifest, { timeoutMs, spawnProcess = spawn }) {
-  const binary = await findCodexBinary();
+  const binary = await localCodexAccount.findBinary();
   const workingDirectory = await mkdtemp(join(tmpdir(), "app-usagemonitor-pilot-"));
   const workload = WORKLOADS[manifest.workloadId];
   try {
@@ -267,7 +263,7 @@ export async function runExperiment({
   offline = false,
   priceCards = null,
   clock = () => Date.now(),
-  readSnapshot = () => readCodexAccountSnapshot(),
+  readSnapshot = localCodexAccount.readSnapshot,
   executeWorkload = spawnWorkload,
   scanUsage = (options) => scanAndPriceCodexLogs(options),
   controllerSessionId = process.env.CODEX_THREAD_ID ?? null,

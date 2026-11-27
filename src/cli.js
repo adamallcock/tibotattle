@@ -4,11 +4,7 @@ import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { pathToFileURL } from "node:url";
 import { captureCodexObservation } from "./capture.js";
-import {
-  inspectCodexBinary,
-  readCodexAccountSnapshot,
-  sanitizeCodexAccountSnapshotWithSecretLoader,
-} from "./providers/codex/account.js";
+import { sanitizeCodexAccountSnapshotWithSecretLoader } from "./providers/codex/account.js";
 import { selectProductionAccountObservationSecret } from "./account-observation-production.js";
 import { analyzeObservations } from "./analyze.js";
 import { mineCodexTransitions, renderTransitionAudit } from "./codex-transition-miner.js";
@@ -47,6 +43,7 @@ import {
   selectProductionParticipantIdentity,
 } from "./export-identity-production.js";
 import {
+  localCodexAccount,
   localCodexLogScanner,
   localContributionSyncQueue,
   localExportDeletion,
@@ -580,8 +577,8 @@ export async function run(
     rotateIdentity = rotateParticipantSecret,
     withIdentityLease = withParticipantSecretLease,
     selectAccountObservationSecret = selectProductionAccountObservationSecret,
-    inspectCodexBinaryDiagnostic = inspectCodexBinary,
-    readAccountSnapshot = readCodexAccountSnapshot,
+    inspectCodexBinaryDiagnostic = localCodexAccount.inspectBinary,
+    readAccountSnapshot = localCodexAccount.readSnapshot,
     sanitizeAccountSnapshot = sanitizeCodexAccountSnapshotWithSecretLoader,
     captureObservation = captureCodexObservation,
     runCollectorOnceCommand = runCollectorOnce,
@@ -1199,6 +1196,7 @@ export async function run(
       system_legacy_resource: "system app legacy layout",
       user_bundled_cli: "user app CLI layout",
       user_legacy_resource: "user app legacy layout",
+      windows_registered_package: "Windows registered package",
     }[binary.location];
     const binaryDescription = binaryLocation ? `${binarySource}, ${binaryLocation}` : binarySource;
     console.log(`Codex binary: ${binaryDescription} (${binary.versionStatus === "available" ? binary.version : "version unavailable"})`);

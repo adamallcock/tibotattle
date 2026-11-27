@@ -16,6 +16,12 @@ records are processed locally; prompt and response text is never retained in
 the companion's derived state. See the maintained
 [local data and privacy reference](../../docs/reference/local-data-and-privacy.md).
 
+On Windows, the local companion looks up the Codex desktop package registered
+for the current user each time it starts a Codex subprocess. This follows a
+Codex update to its new installation directory. An executable `CODEX_BIN`
+override takes priority, and the CLI on `PATH` remains the fallback when
+Windows does not provide a usable package.
+
 `GET /api/local/cache-drop-thread-links` independently resolves those recent
 rows against the same published index generation, then reads explicit display
 names from the selected Codex home's `session_index.jsonl` and bounded

@@ -67,10 +67,17 @@ import {
   readBoundedJsonLines,
   readExportCompatibilityArtifactSet,
   readOwnerOnlyLocalMetadataBundlePair,
+  readWindowsCodexPackageBinaries,
   sha256Hex,
 } from "./platform/index.js";
 import { validateClaudeStatusSnapshot } from
   "./providers/claude/statusline.js";
+import {
+  CodexAppServerClient,
+  findCodexBinary,
+  inspectCodexBinary,
+  readCodexAccountSnapshot,
+} from "./providers/codex/account.js";
 import {
   loadVerifiedPreparedContribution,
   verifyPreparedContributionSet,
@@ -89,6 +96,16 @@ import {
 export const localCodexLogScanner = createLocalCodexLogScanner(
   createLocalCodexLogPorts(),
 );
+
+const codexBinaryOptions = { readWindowsPackageBinaries: readWindowsCodexPackageBinaries };
+const resolveLocalCodexBinary = () => findCodexBinary(codexBinaryOptions);
+
+export const localCodexAccount = Object.freeze({
+  createAppServerClient: () => new CodexAppServerClient({ resolveBinary: resolveLocalCodexBinary }),
+  findBinary: resolveLocalCodexBinary,
+  inspectBinary: () => inspectCodexBinary(codexBinaryOptions),
+  readSnapshot: () => readCodexAccountSnapshot({ resolveBinary: resolveLocalCodexBinary }),
+});
 
 export const localCodexCheckpointState =
   createCodexCheckpointStateContext({ createHash, isProxy });

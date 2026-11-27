@@ -75,6 +75,12 @@ match the new policy before a build that sends automatically is distributed.
 | Codex configuration | `~/.codex/config.toml` | Only the top-level `service_tier` baseline used when a rollout has not yet recorded an observed speed. | Timestamped declared speed-baseline windows. An observed rollout value always wins. | Local filesystem only. | Local erase removes the derived baseline ledger; it never edits Codex config. |
 | Codex selected-rollout store | `~/.codex/state_5.sqlite` | Read-only `threads.id` and `threads.rollout_path`, after owner/file/path validation, to select the physical head of a logical thread. | Only the validated selected rollout filename mapping needed during ingest. | Local filesystem only. | Local erase removes derived selection state; it never edits Codex SQLite. |
 | Codex account/quota service | Local `codex app-server` subprocess using `account/read`, `account/rateLimits/read`, `account/usage/read`, and bounded update notifications | Current plan/account scope, quota windows, resets, credits-presence flags, and provider usage projection. | Sanitized quota/account observations and Keychain-HMAC account scope. No Codex authentication token is copied. | TiboTattle talks to a local subprocess. If Codex itself cannot refresh its account evidence offline, TiboTattle records the source as unavailable/stale rather than inventing continuity. | Local erase removes observations; identity reset separately rotates the Keychain pseudonym. |
+
+On Windows, TiboTattle queries local package registration to locate the current
+Codex desktop executable when it starts a subprocess. The installation path is
+used locally for that launch. Diagnostics report the discovery source without
+printing its path. The selected Codex home still determines where history is read.
+
 The normal installed refresh does **not** read Claude Desktop quota history,
 Claude prompt transcripts, Claude project files, or Gemini artifacts. Claude
 prototype and benchmark readers remain in the source tree for development
