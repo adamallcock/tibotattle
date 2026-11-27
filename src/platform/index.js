@@ -30,6 +30,7 @@ export {
   readCodexConfigServiceTier,
 } from "./codex-config-service-tier.js";
 export { createLocalCodexLogPorts } from "./local-codex-log-ports.js";
+export { readWindowsCodexPackageBinaries } from "./windows-codex-package.js";
 export { readCodexLocalThreadMetadata, readCodexLocalThreadAncestry, readCodexLocalRepositoryOrigins } from "./local-codex-thread-store.js";
 export {
   createLocalExportSourcePorts,

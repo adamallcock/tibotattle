@@ -1,10 +1,8 @@
 import { randomUUID } from "node:crypto";
-import {
-  readCodexAccountSnapshot,
-  sanitizeCodexAccountSnapshot,
-} from "./providers/codex/account.js";
+import { sanitizeCodexAccountSnapshot } from "./providers/codex/account.js";
 import { runCcusageCodexDaily, summarizeCcusage } from "./ccusage.js";
 import { scanAndPriceCodexLogs } from "./codex-local-usage-analysis.js";
+import { localCodexAccount } from "./local-node-runtime.js";
 
 function isoDate(epochMs) {
   return new Date(epochMs).toISOString().slice(0, 10);
@@ -65,7 +63,7 @@ export async function captureCodexObservation({
   offline = false,
   clock = () => Date.now(),
   createObservationId = randomUUID,
-  readSnapshot = readCodexAccountSnapshot,
+  readSnapshot = localCodexAccount.readSnapshot,
   sanitizeSnapshot = sanitizeCodexAccountSnapshot,
   runCcusage = runCcusageCodexDaily,
   summarizeCcusageReport = summarizeCcusage,

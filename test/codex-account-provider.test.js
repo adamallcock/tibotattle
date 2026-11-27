@@ -9,6 +9,7 @@ import { PassThrough, Writable } from "node:stream";
 import * as accountFacade from "../src/providers/codex/account.js";
 import * as accountScope from "../src/providers/codex/account-scope.js";
 import * as appServer from "../src/providers/codex/app-server.js";
+import { readWindowsCodexPackageBinaries } from "../src/platform/index.js";
 import {
   sanitizeProviderQuotaLimitDisplayName,
   sanitizeProviderQuotaLimitId,
@@ -194,6 +195,149 @@ test("Codex binary diagnostic names the bundle layout without revealing the user
     version: "0.158.0-alpha.2.1",
   });
   assert.equal(JSON.stringify(diagnostic).includes(privateHome), false);
+});
+
+test("Windows binary discovery follows package rotation and honors an executable override", async () => {
+  const override = "C:\\Synthetic\\override\\codex.exe";
+  const firstLocation = "D:\\WindowsApps\\Codex-fixture-1";
+  const secondLocation = "D:\\WindowsApps\\Codex-fixture-2";
+  const firstBinary = firstLocation + "\\app\\resources\\codex.exe";
+  const secondBinary = secondLocation + "\\app\\resources\\codex.exe";
+  const available = new Set([override, firstBinary, secondBinary]);
+  let locations = [firstLocation];
+  let queries = 0;
+  const options = {
+    platform: "win32",
+    environment: { CODEX_BIN: override, SystemRoot: "C:\\Windows" },
+    statFile: async (candidate) => ({ isFile: () => available.has(candidate) }),
+    accessFile: async () => {},
+    readWindowsPackageBinaries: ({ environment }) => readWindowsCodexPackageBinaries({
+      environment,
+      runFile: async () => {
+        queries++;
+        return { stdout: JSON.stringify(locations) };
+      },
+    }),
+  };
+
+  assert.equal(await accountFacade.findCodexBinary(options), override);
+  assert.equal(queries, 0);
+  available.delete(override);
+  assert.equal(await accountFacade.findCodexBinary(options), firstBinary);
+
+  available.delete(firstBinary);
+  locations = [secondLocation];
+  const diagnostic = await accountFacade.inspectCodexBinary({
+    ...options,
+    readVersion: async (candidate) => {
+      assert.equal(candidate, secondBinary);
+      return "codex-cli 0.170.0\n";
+    },
+  });
+  assert.deepEqual(diagnostic, {
+    schemaVersion: "codex-binary-diagnostic-v0.2",
+    source: "codex_bundled",
+    location: "windows_registered_package",
+    versionStatus: "available",
+    version: "0.170.0",
+  });
+  assert.equal(JSON.stringify(diagnostic).includes(secondLocation), false);
+
+  available.delete(secondBinary);
+  assert.equal(await accountFacade.findCodexBinary(options), "codex");
+  assert.equal(queries, 3);
+  assert.equal(await accountFacade.findCodexBinary({ ...options, platform: "linux" }), "codex");
+  assert.equal(queries, 3);
+});
+
+test("Closing the Codex client aborts binary discovery and prevents a late spawn", async () => {
+  const lookup = Promise.withResolvers();
+  let lookupSignal;
+  let lookups = 0;
+  let spawns = 0;
+  const client = new accountFacade.CodexAppServerClient({
+    resolveBinary({ signal }) {
+      lookups += 1;
+      lookupSignal = signal;
+      return lookup.promise;
+    },
+    spawnProcess() {
+      spawns += 1;
+      assert.fail("A closed client must not start a process");
+    },
+  });
+  const starting = client.start();
+  client.close();
+  assert.equal(lookupSignal.aborted, true);
+  lookup.resolve("codex");
+  const closed = { name: "CodexAppServerError", code: "temporary_disconnect" };
+  await assert.rejects(starting, closed);
+  await assert.rejects(client.start(), closed);
+  assert.equal(lookups, 1);
+  assert.equal(spawns, 0);
+});
+
+test("Windows package lookup uses the system shell with a bounded, isolated environment", async () => {
+  const location = "D:\\Apps\\Codex fixture 汉";
+  let invocation;
+  const { signal } = new AbortController();
+  const binaries = await readWindowsCodexPackageBinaries({
+    signal,
+    environment: {
+      SystemRoot: "C:\\Windows",
+      PATH: "C:\\Synthetic\\untrusted",
+      PSModulePath: "C:\\Synthetic\\modules",
+      OPENAI_API_KEY: "synthetic-not-for-child",
+    },
+    runFile: async (command, args, options) => {
+      invocation = { command, args, options };
+      return { stdout: JSON.stringify([
+        "D:drive-relative", "\\root-relative", "\\\\server\\share", "D:\\Apps\\..\\invalid", location,
+      ]) };
+    },
+  });
+  assert.deepEqual(binaries, [location + "\\app\\resources\\codex.exe"]);
+  const powerShell = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0";
+  assert.equal(invocation.command, powerShell + "\\powershell.exe");
+  assert.deepEqual(invocation.args.slice(0, 4), [
+    "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+  ]);
+  const script = Buffer.from(invocation.args[4], "base64").toString("utf16le");
+  assert.ok(script.includes("Appx\\Get-AppxPackage -Name 'OpenAI.Codex' -PackageTypeFilter Main"));
+  assert.ok(script.includes("OpenAI.Codex_2p2nqsd0c76g0"));
+  assert.deepEqual(invocation.options, {
+    cwd: powerShell,
+    env: {
+      SystemRoot: "C:\\Windows",
+      WINDIR: "C:\\Windows",
+      PATH: "C:\\Windows\\System32;C:\\Windows",
+      PSModulePath: powerShell + "\\Modules",
+    },
+    encoding: "utf8",
+    maxBuffer: 16 * 1024,
+    timeout: 5_000,
+    windowsHide: true,
+    signal,
+  });
+});
+
+test("missing or invalid Windows package data produces no candidate", async () => {
+  for (const stdout of ["", "not json", "\"C:\\\\WindowsApps\"", JSON.stringify(Array(9).fill(null))]) {
+    assert.deepEqual(await readWindowsCodexPackageBinaries({
+      environment: { SystemRoot: "C:\\Windows" },
+      runFile: async () => ({ stdout }),
+    }), []);
+  }
+  assert.deepEqual(await readWindowsCodexPackageBinaries({
+    environment: { SystemRoot: "C:\\Windows" },
+    runFile: async () => { throw new Error("synthetic package lookup failure"); },
+  }), []);
+  let invoked = false;
+  assert.deepEqual(await readWindowsCodexPackageBinaries({
+    environment: { SystemRoot: "\\\\server\\share" },
+    runFile: async () => { invoked = true; },
+  }), []);
+  assert.equal(invoked, false);
 });
 
 test("rate-limit sanitation retains provider duration and fails closed on plan evidence", () => {

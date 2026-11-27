@@ -4,7 +4,6 @@ import { mkdir, open, opendir, stat, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import {
-  CodexAppServerClient,
   CodexAppServerError,
   sanitizeBracketedCodexAccountSnapshotWithSecretLoader,
   sanitizeRateLimit,
@@ -24,7 +23,7 @@ import {
   normalizeTokenUsage,
   tokenComponentPresence,
 } from "./providers/codex/logs.js";
-import { localCodexLogScanner } from "./local-node-runtime.js";
+import { localCodexAccount, localCodexLogScanner } from "./local-node-runtime.js";
 import {
   codexTierObservation,
   normalizeProviderTier,
@@ -1792,7 +1791,7 @@ export async function runCollectorOnce({
   maximumDiscoveryDirectoryEntries = MAX_DISCOVERY_DIRECTORY_ENTRIES,
   maximumDiscoveryRolloutFiles = MAX_DISCOVERY_ROLLOUT_FILES,
   clock = () => Date.now(),
-  appServerFactory = () => new CodexAppServerClient(),
+  appServerFactory = localCodexAccount.createAppServerClient,
   loadAccountObservationSecret = null,
   readAccountAttributionBinding = null,
   resetEventClassifier = null,
@@ -2283,7 +2282,7 @@ export async function runCollectorForeground({
   reconnectBaseMs = 1_000,
   signal,
   clock = () => Date.now(),
-  appServerFactory = () => new CodexAppServerClient(),
+  appServerFactory = localCodexAccount.createAppServerClient,
   watchRoot = watch,
   loadAccountObservationSecret = null,
   readAccountAttributionBinding = null,
