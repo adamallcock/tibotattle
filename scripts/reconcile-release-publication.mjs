@@ -15,9 +15,12 @@ import { deployWebRelease } from "./deploy-web-release.js";
 import { verifyWebReleaseReceipt } from "./web-release-lane.js";
 import { isElectronSparkleTransition } from "./electron-sparkle-transition.js";
 import { buildSha256Sums, validateReleaseEvidenceManifest } from "./release-evidence.js";
-import { PRODUCTION_DEPLOY_CONFIRMATION, recheckProductionHealth } from "../apps/worker/scripts/production-deploy.mjs";
+import { PRODUCTION_DEPLOY_CONFIRMATION, recheckProductionEdgeHealth, recheckProductionHealth, releasedSiteOfOperation } from "../apps/worker/scripts/production-deploy.mjs";
 import { createProductionDeploymentLock } from "../apps/worker/scripts/production-deployment-lock.mjs";
-import { identityDigest, openOperation, operationError } from "./lib/release-operation.mjs";
+import { createProductionLiveConfigSnapshot } from "../apps/worker/scripts/production-live-config.mjs";
+import { createProductionLiveProvider } from "../apps/worker/scripts/production-live-provider.mjs";
+import { readPrivateProductionInventory } from "../apps/worker/scripts/production-reconcile.mjs";
+import { identityDigest, openOperation, operationError, readOperation } from "./lib/release-operation.mjs";
 
 const ROOT = fileURLToPath(new URL("../", import.meta.url));
 const REPOSITORY = "adamallcock/tibotattle";
@@ -30,6 +33,8 @@ const MAX_SMALL = 1024 ** 2;
 export const PUBLICATION_CONFIRMATION = "RECONCILE_EXACT_RELEASE_PUBLICATION";
 const fail = (code) => { throw operationError(code); };
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
+// Retain the legacy runtime graph unless a v2 edge contract is requested.
+const loadEdgeMode = () => import("../apps/worker/scripts/production-edge-mode.mjs");
 function exact(value, keys) {
   return value && typeof value === "object" && !Array.isArray(value)
     && Object.keys(value).sort().join() === [...keys].sort().join();
@@ -43,7 +48,7 @@ function fileSpec(value, extra = []) {
 
 export function validatePublicationPlan(plan) {
   if (!exact(plan, ["schemaVersion", "source", "channel", "version", "build", "assets", "notes", "targets", "tap", "website"])
-      || plan.schemaVersion !== 1 || plan.channel !== "stable"
+      || ![1, 2].includes(plan.schemaVersion) || plan.channel !== "stable"
       || !/^\d+\.\d+\.\d+$/.test(plan.version) || !isAppleMacOSBundleVersion(plan.build)
       || !exact(plan.source, ["commit", "tag", "tagObject", "repository"])
       || plan.source.repository !== `https://github.com/${REPOSITORY}`
@@ -56,12 +61,22 @@ export function validatePublicationPlan(plan) {
       || !Array.isArray(plan.targets) || plan.targets.length !== 2
       || plan.targets.map((target) => target?.architecture).sort().join() !== "arm64,x64"
       || !fileSpec(plan.tap, ["workflowSha256"]) || !SHA.test(plan.tap.workflowSha256) || plan.tap.bytes > MAX_SMALL
-      || !exact(plan.website, ["repositoryRoot", "receipt", "manifest"])
+      || !exact(plan.website, ["repositoryRoot", "receipt", "manifest", ...(plan.schemaVersion === 2 ? ["runtime"] : [])])
       || typeof plan.website.repositoryRoot !== "string" || !plan.website.repositoryRoot
       || plan.website.repositoryRoot.length > 4096 || /[\0\r\n]/.test(plan.website.repositoryRoot)
       || !fileSpec(plan.website.receipt) || !fileSpec(plan.website.manifest)
       || plan.website.receipt.bytes > MAX_SMALL || plan.website.manifest.bytes > MAX_SMALL) {
     fail("RELEASE_PUBLICATION_PLAN_INVALID");
+  }
+  if (plan.schemaVersion === 2) {
+    const runtime = plan.website.runtime;
+    if (!exact(runtime, ["mode", "originCommit", "operationDirectory", "inventory", "edgePlan"])
+        || runtime.mode !== "gcp" || !COMMIT.test(runtime.originCommit)
+        || typeof runtime.operationDirectory !== "string" || !runtime.operationDirectory
+        || runtime.operationDirectory.length > 4096 || /[\0\r\n]/.test(runtime.operationDirectory)
+        || resolve(runtime.operationDirectory) !== runtime.operationDirectory
+        || !fileSpec(runtime.inventory) || runtime.inventory.bytes > MAX_SMALL
+        || !fileSpec(runtime.edgePlan) || runtime.edgePlan.bytes > 64 * 1024) fail("RELEASE_PUBLICATION_RUNTIME_INVALID");
   }
   for (const target of plan.targets) {
     if (!exact(target, ["architecture", "feedManifest", "dmgName", "appcastName", "sparklePublicEdKey", "previousManifest", ...(target.sparkleDmg === undefined ? [] : ["sparkleDmg"])])
@@ -106,7 +121,8 @@ async function jsonFile(spec) {
   try { return JSON.parse(bytes); } catch { fail("RELEASE_PUBLICATION_METADATA_INVALID"); }
 }
 
-export async function preparePublication(plan, { repositoryRoot = ROOT, publishFeed = publishSparkleUpdate, verifySite = verifyWebReleaseReceipt, verifySource = verifyReleaseManifestSourceProvenance } = {}) {
+export async function preparePublication(plan, { repositoryRoot = ROOT, publishFeed = publishSparkleUpdate, verifySite = verifyWebReleaseReceipt,
+  verifySource = verifyReleaseManifestSourceProvenance, runtimeExecFile } = {}) {
   plan = validatePublicationPlan(plan);
   for (const spec of [...plan.assets, plan.notes, plan.tap, ...plan.targets.map((target) => target.previousManifest)]) await verifyFile(spec);
   const source = verifySource({ repository: plan.source.repository, commit: plan.source.commit, tag: plan.source.tag }, { channel: plan.channel, expectedVersion: plan.version, repositoryRoot });
@@ -228,7 +244,71 @@ export async function preparePublication(plan, { repositoryRoot = ROOT, publishF
       || !cask.includes('  depends_on macos: :sonoma\n')
       || !cask.includes(`  sha256 arm:   "${arm.sha256}",\n         intel: "${intel.sha256}"\n`)
       || !cask.includes(`  url "https://github.com/adamallcock/tibotattle/releases/download/v#{version}/TiboTattle-#{version}-${electron ? 'mac' : 'macOS'}-#{arch}.dmg"\n`)) fail("RELEASE_PUBLICATION_CASK_IDENTITY_MISMATCH");
-  return { plan, feeds, siteFiles, websiteSourceCommit: receipt.sourceCommit };
+  if (plan.schemaVersion === 2) await readWebsiteRuntimeInputs(plan.website, receipt.baseCommit, receipt.sourceCommit, runtimeExecFile);
+  return { plan, feeds, siteFiles, websiteSourceCommit: receipt.sourceCommit,
+    ...(plan.schemaVersion === 2 ? { websiteBaseCommit: receipt.baseCommit } : {}) };
+}
+
+async function readWebsiteRuntimeInputs(website, baseCommit, sourceCommit, runtimeExecFile) {
+  const { runtime } = website;
+  const { readEdgeModePlan, readEdgeModeSourceConfig, resolveEdgeModeRequest, verifyEdgeModeDeployedSnapshot } = await loadEdgeMode();
+  const { applyEdgeModeSnapshotDelta } = await import("../apps/worker/scripts/edge-mode-configuration.mjs");
+  if (!COMMIT.test(baseCommit)) fail("RELEASE_PUBLICATION_RUNTIME_PREDECESSOR_MISMATCH");
+  await verifyFile(runtime.inventory); await verifyFile(runtime.edgePlan);
+  const baseline = createProductionLiveConfigSnapshot(await readPrivateProductionInventory(runtime.inventory.path, runtime.inventory.sha256));
+  if (baseline.sourceCommit !== baseCommit) fail("RELEASE_PUBLICATION_RUNTIME_PREDECESSOR_MISMATCH");
+  if (!verifyEdgeModeDeployedSnapshot({ snapshot: baseline, mode: "gcp", sourceCommit: baseCommit }).ok) fail("RELEASE_PUBLICATION_RUNTIME_SNAPSHOT_MISMATCH");
+  const edgePlan = await readEdgeModePlan(runtime.edgePlan.path);
+  resolveEdgeModeRequest({ edgeMode: runtime.mode, edgePlan });
+  const trackedConfig = readEdgeModeSourceConfig({ repositoryDirectory: website.repositoryRoot, commit: sourceCommit, execFile: runtimeExecFile });
+  const expected = applyEdgeModeSnapshotDelta({ snapshot: baseline, mode: runtime.mode, plan: edgePlan, trackedConfig });
+  // Recheck after parsing: these private inputs remain bound throughout a
+  // possibly long publication, rather than only at initial admission.
+  await verifyFile(runtime.inventory); await verifyFile(runtime.edgePlan);
+  return { baseline, edgePlan, expected };
+}
+
+async function websiteRuntimeRecord(directory) {
+  try { await lstat(directory); }
+  catch (error) { if (error.code === "ENOENT") return null; throw error; }
+  // readOperation enforces owner-only, canonical paths and no-follow files.
+  // Never open a writable operation/mutex or reconcile a typed deployment here.
+  return readOperation(directory);
+}
+
+async function observeWebsiteRuntime(prepared, createLiveProvider, readRuntimeBlob, runtimeExecFile) {
+  const { assertPinnedEdgeContract, defaultEdgeModeBlobReader, resolvePinnedEdgeMode, verifyEdgeModeDeployedSnapshot } = await loadEdgeMode();
+  const { runtime } = prepared.plan.website;
+  const { baseline, edgePlan, expected } = await readWebsiteRuntimeInputs(prepared.plan.website, prepared.websiteBaseCommit, prepared.websiteSourceCommit, runtimeExecFile);
+  const record = await websiteRuntimeRecord(runtime.operationDirectory);
+  if (record === null) return null;
+  const state = record.state;
+  if (record.kind !== "production") fail("RELEASE_PUBLICATION_RUNTIME_OPERATION_INVALID");
+  if (state.stage !== "verified" || state.outcome !== "verified" || state.lock !== "released") return null;
+  const site = releasedSiteOfOperation(record);
+  if (!site || site.sourceCommit !== prepared.websiteSourceCommit || site.deploySourceCommit !== prepared.websiteSourceCommit
+      || site.manifestSha256 !== prepared.plan.website.manifest.sha256 || !COMMIT.test(state.owner)
+      || state.previousSourceCommit !== prepared.websiteBaseCommit || state.typed.predecessorSourceCommit !== prepared.websiteBaseCommit
+      || state.typed.liveConfigurationFingerprint !== baseline.fingerprint) fail("RELEASE_PUBLICATION_RUNTIME_OPERATION_MISMATCH");
+  const edge = resolvePinnedEdgeMode({ pin: state.typed, edgePlan });
+  if (edge?.mode !== runtime.mode || edge.liveMode !== "gcp" || edge.originCommit !== runtime.originCommit) fail("RELEASE_PUBLICATION_RUNTIME_IDENTITY_MISMATCH");
+  if (edge.expectedLiveConfigurationFingerprint !== expected.fingerprint) fail("RELEASE_PUBLICATION_RUNTIME_CONFIGURATION_MISMATCH");
+  assertPinnedEdgeContract({ edge, sourceCommit: prepared.websiteSourceCommit,
+    readBlob: readRuntimeBlob ?? defaultEdgeModeBlobReader(join(prepared.plan.website.repositoryRoot, "apps", "worker")) });
+  const provider = createLiveProvider({ accountId: baseline.accountId, workerName: baseline.workerName });
+  const capture = async () => {
+    const snapshot = createProductionLiveConfigSnapshot(await provider.capture());
+    if (!verifyEdgeModeDeployedSnapshot({ snapshot, mode: edge.mode, sourceCommit: prepared.websiteSourceCommit }).ok) fail("RELEASE_PUBLICATION_RUNTIME_SNAPSHOT_MISMATCH");
+    if (snapshot.fingerprint !== expected.fingerprint) fail("RELEASE_PUBLICATION_RUNTIME_CONFIGURATION_MISMATCH");
+    return snapshot;
+  };
+  const before = await capture();
+  return async () => {
+    const after = await capture();
+    if (after.versionId !== before.versionId
+        || identityDigest(await readOperation(runtime.operationDirectory)) !== identityDigest(record)) fail("RELEASE_PUBLICATION_RUNTIME_CHANGED");
+    await verifyFile(runtime.inventory); await verifyFile(runtime.edgePlan);
+  };
 }
 
 function command(spawn, commandName, args, options = {}) {
@@ -241,7 +321,8 @@ function command(spawn, commandName, args, options = {}) {
   return result.stdout ?? "";
 }
 
-export function createPublicationAdapters({ repositoryRoot = ROOT, spawn = spawnSync, fetchImpl = fetch, publishFeed = publishSparkleUpdate, deploySite = deployWebRelease } = {}) {
+export function createPublicationAdapters({ repositoryRoot = ROOT, spawn = spawnSync, fetchImpl = fetch, publishFeed = publishSparkleUpdate, deploySite = deployWebRelease,
+  createLiveProvider = createProductionLiveProvider, readRuntimeBlob, runtimeExecFile } = {}) {
   const downloaded = new Map();
   const attested = new Set();
   let appcastGuard;
@@ -457,6 +538,9 @@ export function createPublicationAdapters({ repositoryRoot = ROOT, spawn = spawn
       api(`repos/${TAP}/actions/workflows/update-tibotattle.yml/dispatches`, { method: "POST", body: { ref: "main" } });
     },
     async website(prepared) {
+      const runtime = prepared.plan.website.runtime;
+      const finishRuntime = runtime ? await observeWebsiteRuntime(prepared, createLiveProvider, readRuntimeBlob, runtimeExecFile) : null;
+      if (runtime && finishRuntime === null) return { status: "pending" };
       const matches = async (file) => {
         const actual = await publicBytes(file.url);
         return actual && actual.sha256 === file.sha256 && actual.bytes === file.bytes;
@@ -466,8 +550,14 @@ export function createPublicationAdapters({ repositoryRoot = ROOT, spawn = spawn
       for (let start = 0; start < prepared.siteFiles.length; start += 4) {
         if (!(await Promise.all(prepared.siteFiles.slice(start, start + 4).map(matches))).every(Boolean)) return { status: "pending" };
       }
-      const health = await recheckProductionHealth({ fetchImpl });
-      if (!health.ok || health.sourceCommit !== prepared.websiteSourceCommit) return { status: "pending" };
+      if (runtime) {
+        const health = await recheckProductionEdgeHealth({ fetchImpl, mode: runtime.mode, expectedSourceCommit: runtime.originCommit });
+        if (!health.ok) return { status: "pending" };
+        await finishRuntime();
+      } else {
+        const health = await recheckProductionHealth({ fetchImpl });
+        if (!health.ok || health.sourceCommit !== prepared.websiteSourceCommit) return { status: "pending" };
+      }
       return { status: "matches" };
     },
     async publishWebsite(prepared) {
@@ -519,6 +609,7 @@ export async function reconcilePublication({ plan, repositoryRoot = ROOT, apply 
   if (!apply) return result({ mode: "inspect", writesAttempted: false });
   if (confirmation !== PUBLICATION_CONFIRMATION || expectedPlanDigest !== planDigest || !operationDirectory) fail("RELEASE_PUBLICATION_EXPLICIT_AUTHORIZATION_REQUIRED");
   if (resume && !executorStopped) fail("RELEASE_PUBLICATION_EXECUTOR_STOP_CONFIRMATION_REQUIRED");
+  if (prepared.plan.website.runtime && resolve(operationDirectory) === prepared.plan.website.runtime.operationDirectory) fail("RELEASE_PUBLICATION_OPERATION_COLLISION");
   if (Object.values(surfaces).some((surface) => surface.status === "blocked")) return result({ mode: "apply", writesAttempted: false, code: "RELEASE_PUBLICATION_PREFLIGHT_BLOCKED" });
   // An already matching release is a pure read even when --apply was supplied.
   if (!resume && Object.values(surfaces).every((surface) => surface.status === "matches")) return result({ mode: "apply", writesAttempted: false });

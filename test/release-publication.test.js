@@ -1,13 +1,19 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { writeSync } from "node:fs";
-import { lstat, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createPublicationAdapters, hashPublicationFile, parsePublicationArguments, preparePublication, PUBLICATION_CONFIRMATION, reconcilePublication, validatePublicationPlan } from "../scripts/reconcile-release-publication.mjs";
-import { identityDigest, readOperation } from "../scripts/lib/release-operation.mjs";
+import { identityDigest, openOperation, readOperation } from "../scripts/lib/release-operation.mjs";
 import { buildSha256Sums, stableStringify } from "../scripts/release-evidence.js";
+import { createTypedProductionOperationPin } from "../apps/worker/scripts/production-deploy.mjs";
+import { EDGE_ORIGIN_CONTRACT_PATH, PRODUCTION_EDGE_MODE_PIN_SCHEMA, readEdgeModeSourceConfig } from "../apps/worker/scripts/production-edge-mode.mjs";
+import { applyEdgeModeSnapshotDelta, edgeModeOverlaySha256 } from "../apps/worker/scripts/edge-mode-configuration.mjs";
+import { createProductionLiveConfigSnapshot } from "../apps/worker/scripts/production-live-config.mjs";
+import { createProductionLiveProvider } from "../apps/worker/scripts/production-live-provider.mjs";
 
 const sha = (value) => createHash("sha256").update(value).digest("hex");
 const source = { repository: "https://github.com/adamallcock/tibotattle", commit: "a".repeat(40), tag: "v1.2.3", tagObject: "b".repeat(40) };
@@ -540,6 +546,279 @@ test("website readback checks every prepared file and current healthy deployment
   healthySource = prepared.websiteSourceCommit;
   await writeFile(join(f.root, "docs.html"), "Different published documentation");
   assert.equal((await adapter.website(prepared)).status, "pending");
+});
+
+function inventoryOf(snapshot) {
+  const bindings = snapshot.bindings.map(binding => binding.type === "d1" ? { ...binding, id: binding.database_id } : binding);
+  return { accountId: snapshot.accountId, workerName: snapshot.workerName,
+    version: { id: snapshot.versionId, resources: { script_runtime: snapshot.runtime, bindings } },
+    settings: { ...snapshot.settings, ...snapshot.runtime, bindings },
+    schedules: { schedules: snapshot.crons.map(cron => ({ cron })) },
+    subdomain: snapshot.subdomain, routes: snapshot.routes, domains: snapshot.domains, namespaces: snapshot.namespaces };
+}
+
+async function runtimeFixture(t) {
+  const f = await fixture(t), baseCommit = "e".repeat(40), originCommit = "f".repeat(40), edgeCommit = "c".repeat(40);
+  const trackedConfig = { env: { production: {} } };
+  const runtimeExecFile = (command, args, options) => {
+    assert.equal(command, "/usr/bin/git");
+    assert.deepEqual(args, ["-C", f.root, "show", `${edgeCommit}:apps/worker/wrangler.jsonc`]);
+    assert.equal(options.maxBuffer, 1024 * 1024); assert.equal(options.timeout, 10_000);
+    return JSON.stringify(trackedConfig);
+  };
+  f.prepareOptions.runtimeExecFile = runtimeExecFile;
+  const contractBlob = "1".repeat(40);
+  const edgePlan = { upstreamOrigin: "https://tibotattle-origin-synthetic.a.run.app",
+    originAudience: "https://synthetic-origin-audience.example",
+    invokerServiceAccount: "edge-invoker@synthetic-project.iam.gserviceaccount.com",
+    releaseGuardDatabase: { id: "77777777-7777-4777-8777-777777777777", name: "synthetic-release-guard" } };
+  let snapshot = JSON.parse(await readFile(new URL("../apps/worker/scripts/fixtures/edge-mode-live-snapshot.synthetic.json", import.meta.url), "utf8"));
+  snapshot.bindings.push(...["EDGE_CLIENT_KEY_SECRET", "EDGE_INVOKER_KEY_JSON"].map(name => ({ name, type: "secret_text" })));
+  snapshot = createProductionLiveConfigSnapshot(inventoryOf(snapshot));
+  // Exercise the real overlay/normalization path with a wholly synthetic
+  // configuration; no deployed inventory or private identifiers enter fixtures.
+  for (const mode of ["worker", "fenced", "gcp"]) snapshot = applyEdgeModeSnapshotDelta({ snapshot, mode,
+    plan: mode === "gcp" ? edgePlan : undefined, trackedConfig });
+  const deployed = (sourceCommit, suffix) => createProductionLiveConfigSnapshot(inventoryOf({ ...snapshot,
+    versionId: `0e000000-0000-4000-8000-000000000${suffix}`,
+    bindings: snapshot.bindings.map(binding => binding.name === "DEPLOYMENT_SOURCE_COMMIT" ? { ...binding, text: sourceCommit } : binding) }));
+  const baseline = deployed(baseCommit, "155"), current = deployed(edgeCommit, "156");
+  const privateFile = async (name, value) => {
+    const spec = await f.file(name, JSON.stringify(value)); await chmod(spec.path, 0o600); return spec;
+  };
+  f.plan.schemaVersion = 2;
+  f.plan.website.receipt = await f.file("web-release-receipt.json", JSON.stringify({ sourceCommit: edgeCommit, baseCommit,
+    site: { manifestSha256: f.plan.website.manifest.sha256 } }));
+  f.plan.website.runtime = { mode: "gcp", originCommit, operationDirectory: join(f.root, "typed-production"),
+    inventory: await privateFile("inventory.json", inventoryOf(baseline)), edgePlan: await privateFile("edge-plan.json", edgePlan) };
+  const schemas = { schema: "production-typed-schema-v1", operatorSchemaSourceSha256: sha("synthetic operator"), inputSha256: {}, expectedSchemas: {} };
+  for (const role of ["primary", "analytics", "ledger"]) {
+    schemas.inputSha256[role] = sha(role); schemas.expectedSchemas[role] = { schemaSha256: sha(`schema ${role}`) };
+  }
+  const typed = await createTypedProductionOperationPin({ inventory: inventoryOf(baseline), expectedPreviousSourceCommit: baseCommit,
+    retainedPublicSourceCommit: baseCommit, expectedLiveManifestSha256: sha("previous synthetic site"),
+    candidatePublicManifestSha256: f.plan.website.manifest.sha256, candidatePublicSourceCommit: edgeCommit,
+    buildSchemas: async () => schemas });
+  assert.equal(typed.ok, true);
+  typed.pin.edge = { schema: PRODUCTION_EDGE_MODE_PIN_SCHEMA, mode: "gcp", liveMode: "gcp", originCommit,
+    overlaySha256: edgeModeOverlaySha256({ mode: "gcp", plan: edgePlan }), contractBlobSha: contractBlob,
+    expectedLiveConfigurationFingerprint: current.fingerprint };
+  const state = { sourceCommit: edgeCommit, previousSourceCommit: baseCommit, confirmedMigrations: null, typed: typed.pin,
+    owner: "d".repeat(40), stage: "verified", outcome: "verified", code: "PRODUCTION_DEPLOYED", lock: "released" };
+  const binding = () => ({ sourceCommit: state.sourceCommit, previousSourceCommit: state.previousSourceCommit,
+    confirmedMigrations: state.confirmedMigrations, typed: state.typed });
+  const writeOperation = async (mutate = () => {}, { rebind = true } = {}) => {
+    const path = join(f.plan.website.runtime.operationDirectory, "operation.json");
+    let record;
+    try { record = await readOperation(f.plan.website.runtime.operationDirectory); }
+    catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      const op = await openOperation({ directory: f.plan.website.runtime.operationDirectory, kind: "production", binding: binding() });
+      try { await op.save(state); record = op.record; } finally { op.close(); }
+    }
+    mutate(record);
+    if (rebind) record.binding = identityDigest({ sourceCommit: record.state.sourceCommit, previousSourceCommit: record.state.previousSourceCommit,
+      confirmedMigrations: record.state.confirmedMigrations, typed: record.state.typed });
+    await writeFile(path, JSON.stringify(record), { mode: 0o600 });
+  };
+  const live = { inventory: inventoryOf(current), healthSource: originCommit, split: false, apiReads: 0, publicReads: 0, contractBlob };
+  const apiFetch = async (input, options) => {
+    live.apiReads += 1;
+    assert.equal(options.method, "GET"); // No SQL, provider mutations or secret-value reads.
+    assert.equal(options.redirect, "error");
+    const url = new URL(input); assert.equal(url.origin, "https://api.cloudflare.com");
+    assert.ok(url.pathname.startsWith(`/client/v4/accounts/${baseline.accountId}/`));
+    let result;
+    if (url.pathname.endsWith("/deployments")) {
+      const versions = [{ version_id: live.inventory.version.id, percentage: live.split ? 50 : 100 }];
+      if (live.split) versions.push({ version_id: baseline.versionId, percentage: 50 });
+      result = [{ versions }];
+    } else if (url.pathname.endsWith(`/versions/${live.inventory.version.id}`)) result = live.inventory.version;
+    else if (url.pathname.endsWith("/settings")) result = live.inventory.settings;
+    else if (url.pathname.endsWith("/schedules")) result = live.inventory.schedules;
+    else if (url.pathname.endsWith("/subdomain")) result = live.inventory.subdomain;
+    else if (url.pathname.endsWith("/routes")) result = live.inventory.routes;
+    else if (url.pathname.endsWith("/domains/records")) result = live.inventory.domains;
+    else if (url.pathname.endsWith("/durable_objects/namespaces")) result = live.inventory.namespaces;
+    else assert.fail("unexpected provider read");
+    return Response.json({ success: true, result });
+  };
+  const adapterOptions = {
+    runtimeExecFile,
+    createLiveProvider: args => {
+      assert.deepEqual(args, { accountId: baseline.accountId, workerName: baseline.workerName });
+      return createProductionLiveProvider({ ...args, environment: { CLOUDFLARE_API_TOKEN: "synthetic-token-only-no-secret" }, fetchImpl: apiFetch });
+    },
+    readRuntimeBlob: (commit, path) => { assert.ok([edgeCommit, originCommit].includes(commit)); assert.equal(path, EDGE_ORIGIN_CONTRACT_PATH); return live.contractBlob; },
+    fetchImpl: async (input, options) => {
+      live.publicReads += 1;
+      const url = new URL(input); assert.equal(url.origin, "https://tibotattle.com"); assert.equal(options.redirect, "error");
+      if (url.pathname === "/api/health") {
+        await live.onHealth?.();
+        const headers = { "content-type": "application/json", "cache-control": "no-store", "referrer-policy": "no-referrer", "x-content-type-options": "nosniff" };
+        if (live.insecureHealth) delete headers["cache-control"];
+        const response = Response.json({ status: live.unhealthy ? "unhealthy" : "ok", deployment: { sourceCommit: live.healthSource } }, { headers });
+        Object.defineProperty(response, "url", { value: live.redirectedHealth ? `${url.origin}/elsewhere` : String(input) }); return response;
+      }
+      const path = url.pathname === "/" ? "index.html" : url.pathname.slice(1);
+      return new Response(live.changedFile === path ? "changed public bytes" : await readFile(join(f.root, path)));
+    },
+  };
+  return { ...f, baseline, current, live, state, privateFile, writeOperation, adapterOptions,
+    adapter: createPublicationAdapters(adapterOptions) };
+}
+
+test("edge source configuration reads exact committed JSONC and refuses unavailable or malformed source", async (t) => {
+  const root = await mkdtemp(join(await realpath(tmpdir()), "publication-source-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const git = (...args) => execFileSync("/usr/bin/git", ["-C", root, "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null",
+    "-c", "user.name=Synthetic", "-c", "user.email=synthetic@example.invalid", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  git("init", "--quiet", "--template=");
+  await mkdir(join(root, "apps", "worker"), { recursive: true });
+  const path = join(root, "apps", "worker", "wrangler.jsonc");
+  await writeFile(path, '{ // synthetic committed config\n"env":{"production":{}}\n}\n');
+  git("add", "apps/worker/wrangler.jsonc"); git("commit", "--quiet", "-m", "Synthetic source fixture");
+  const commit = git("rev-parse", "HEAD");
+  await writeFile(path, "malformed mutable checkout");
+  assert.deepEqual(readEdgeModeSourceConfig({ repositoryDirectory: root, commit }), { env: { production: {} } });
+  assert.throws(() => readEdgeModeSourceConfig({ repositoryDirectory: root, commit: "f".repeat(40) }), /EDGE_MODE_CONFIG_INVALID/);
+  git("add", "apps/worker/wrangler.jsonc"); git("commit", "--quiet", "-m", "Synthetic invalid fixture");
+  assert.throws(() => readEdgeModeSourceConfig({ repositoryDirectory: root, commit: git("rev-parse", "HEAD") }), /EDGE_MODE_CONFIG_INVALID/);
+  assert.throws(() => readEdgeModeSourceConfig({ repositoryDirectory: root, commit: "HEAD", execFile: () => assert.fail("no ambiguous ref read") }), /EDGE_MODE_CONFIG_INVALID/);
+});
+
+test("v2 runtime is closed and binds reviewed predecessor evidence before publication", async (t) => {
+  const f = await runtimeFixture(t);
+  assert.deepEqual(validatePublicationPlan(f.plan), f.plan);
+  for (const mutate of [
+    p => { p.schemaVersion = 3; }, p => { p.schemaVersion = 1; }, p => { delete p.website.runtime; },
+    p => { p.website.runtime.mode = "worker"; }, p => { p.website.runtime.extra = true; },
+    p => { p.website.runtime.originCommit = "latest"; }, p => { p.website.runtime.operationDirectory = "relative"; },
+    p => { p.website.runtime.operationDirectory += "/../elsewhere"; }, p => { p.website.runtime.inventory.bytes = 2 ** 21; },
+    p => { p.website.runtime.edgePlan.bytes = 65537; },
+  ]) { const value = structuredClone(f.plan); mutate(value); assert.throws(() => validatePublicationPlan(value), /RELEASE_PUBLICATION_/); }
+  const prepared = await preparePublication(f.plan, f.prepareOptions);
+  assert.equal(prepared.websiteBaseCommit, f.state.previousSourceCommit);
+  const receipt = JSON.parse(await readFile(f.plan.website.receipt.path));
+  receipt.baseCommit = "9".repeat(40);
+  f.plan.website.receipt = await f.file("web-release-receipt.json", JSON.stringify(receipt));
+  await assert.rejects(preparePublication(f.plan, f.prepareOptions), /RUNTIME_PREDECESSOR_MISMATCH/);
+});
+
+test("v2 missing future typed operation stays pending without creating a journal or reading providers", async (t) => {
+  const f = await runtimeFixture(t), prepared = await preparePublication(f.plan, f.prepareOptions);
+  assert.deepEqual(await f.adapter.website(prepared), { status: "pending" });
+  await assert.rejects(lstat(f.plan.website.runtime.operationDirectory), { code: "ENOENT" });
+  assert.equal(f.live.apiReads, 0); assert.equal(f.live.publicReads, 0);
+  await f.writeOperation(record => { record.state.stage = "deploying"; record.state.outcome = "outcome_unknown"; record.state.lock = "held"; });
+  assert.deepEqual(await f.adapter.website(prepared), { status: "pending" });
+  assert.equal(f.live.apiReads, 0);
+});
+
+test("v2 verifies distinct edge and origin with real typed pins, immutable journals and metadata-only capture", async (t) => {
+  const f = await runtimeFixture(t), prepared = await preparePublication(f.plan, f.prepareOptions);
+  await f.writeOperation();
+  const directory = f.plan.website.runtime.operationDirectory, names = await readdir(directory);
+  const before = await Promise.all(names.map(async name => [name, await readFile(join(directory, name)), (await lstat(join(directory, name))).mtimeMs]));
+  assert.deepEqual(await f.adapter.website(prepared), { status: "matches" });
+  assert.equal(f.live.apiReads, 18); assert.equal(f.live.publicReads, 3);
+  assert.notEqual(prepared.websiteSourceCommit, f.plan.website.runtime.originCommit);
+  assert.deepEqual(await readdir(directory), names);
+  for (const [name, bytes, mtimeMs] of before) {
+    assert.deepEqual(await readFile(join(directory, name)), bytes); assert.equal((await lstat(join(directory, name))).mtimeMs, mtimeMs);
+  }
+  const legacy = { ...prepared, plan: { ...prepared.plan, schemaVersion: 1, website: { ...prepared.plan.website } } };
+  delete legacy.plan.website.runtime;
+  assert.deepEqual(await f.adapter.website(legacy), { status: "pending" }); // Same origin health cannot prove the legacy edge-source predicate.
+});
+
+test("v2 refuses stale or contradictory typed journal, overlay, contract and private inputs", async (t) => {
+  for (const [name, mutate, rebind, error] of [
+    ["edge source", r => { r.state.sourceCommit = "9".repeat(40); }, true, /OPERATION_MISMATCH/],
+    ["predecessor", r => { r.state.previousSourceCommit = "9".repeat(40); }, true, /OPERATION_MISMATCH/],
+    ["site source", r => { r.state.typed.candidatePublicSourceCommit = "9".repeat(40); }, true, /OPERATION_MISMATCH/],
+    ["site hash", r => { r.state.typed.candidatePublicManifestSha256 = "9".repeat(64); }, true, /OPERATION_MISMATCH/],
+    ["binding", r => { r.state.typed.retainedPublicSourceCommit = "9".repeat(40); }, false, /OPERATION_MISMATCH/],
+    ["baseline", r => { r.state.typed.liveConfigurationFingerprint = "9".repeat(64); }, true, /OPERATION_MISMATCH/],
+    ["origin", r => { r.state.typed.edge.originCommit = "9".repeat(40); }, true, /IDENTITY_MISMATCH/],
+    ["overlay", r => { r.state.typed.edge.overlaySha256 = "9".repeat(64); }, true, /EDGE_MODE_PLAN_MISMATCH/],
+    ["closed pin", r => { r.state.typed.edge.extra = true; }, true, /EDGE_MODE_PIN_INVALID/],
+    ["owner", r => { r.state.owner = null; }, true, /OPERATION_MISMATCH/],
+  ]) await t.test(name, async t => {
+    const f = await runtimeFixture(t), prepared = await preparePublication(f.plan, f.prepareOptions);
+    await f.writeOperation(mutate, { rebind });
+    await assert.rejects(f.adapter.website(prepared), error); assert.equal(f.live.apiReads, 0);
+  });
+  const f = await runtimeFixture(t), prepared = await preparePublication(f.plan, f.prepareOptions);
+  await f.writeOperation(); f.live.contractBlob = "9".repeat(40);
+  await assert.rejects(f.adapter.website(prepared), /EDGE_CONTRACT_DRIFT/); assert.equal(f.live.apiReads, 0);
+  f.live.contractBlob = f.state.typed.edge.contractBlobSha;
+  await chmod(f.plan.website.runtime.inventory.path, 0o644);
+  await assert.rejects(f.adapter.website(prepared), /INVENTORY_UNSAFE/);
+  await chmod(f.plan.website.runtime.inventory.path, 0o600);
+  await writeFile(f.plan.website.runtime.edgePlan.path, "{}");
+  await assert.rejects(f.adapter.website(prepared), /LOCAL_BYTES_MISMATCH/);
+});
+
+test("v2 refuses stale live source, split deployments, configuration drift and changes during public readback", async (t) => {
+  for (const [name, mutate, error] of [
+    ["stale edge", f => { f.live.inventory = inventoryOf(f.baseline); }, /SNAPSHOT_MISMATCH/],
+    ["split", f => { f.live.split = true; }, /DEPLOYMENT_AMBIGUOUS/],
+    ["mode", f => { f.live.inventory.version.resources.bindings.find(b => b.name === "EDGE_UPSTREAM_MODE").text = "fenced"; }, /SNAPSHOT_MISMATCH/],
+    ["configuration", f => { f.live.inventory.version.resources.bindings.find(b => b.name === "EDGE_ORIGIN_AUDIENCE").text = "https://changed.example"; }, /CONFIGURATION_MISMATCH/],
+    ["version race", f => { f.live.onHealth = () => { f.live.inventory.version.id = f.baseline.versionId; }; }, /RUNTIME_CHANGED/],
+    ["source race", f => { f.live.onHealth = () => { f.live.inventory = inventoryOf(f.baseline); }; }, /SNAPSHOT_MISMATCH/],
+    ["journal race", f => { f.live.onHealth = () => f.writeOperation(r => { r.updatedAt = "2026-01-01T00:00:00.000Z"; }); }, /RUNTIME_CHANGED/],
+  ]) await t.test(name, async t => {
+    const f = await runtimeFixture(t), prepared = await preparePublication(f.plan, f.prepareOptions);
+    await f.writeOperation(); mutate(f);
+    await assert.rejects(f.adapter.website(prepared), error);
+  });
+});
+
+test("v2 retains public byte, canonical URL, secure health and pinned origin refusals", async (t) => {
+  for (const change of [{ healthSource: "c".repeat(40) }, { unhealthy: true }, { insecureHealth: true }, { redirectedHealth: true },
+    { changedFile: "index.html" }, { changedFile: "release-site-manifest.json" }]) {
+    const f = await runtimeFixture(t), prepared = await preparePublication(f.plan, f.prepareOptions);
+    await f.writeOperation(); Object.assign(f.live, change);
+    assert.deepEqual(await f.adapter.website(prepared), { status: "pending" });
+  }
+});
+
+test("v2 derives expected configuration from approved inputs before trusting a rebound journal", async (t) => {
+  for (const jointDrift of [false, true]) await t.test(jointDrift ? "joint journal and live drift" : "journal fingerprint alone", async t => {
+    const f = await runtimeFixture(t), prepared = await preparePublication(f.plan, f.prepareOptions);
+    const approved = [f.plan.website.runtime.inventory, f.plan.website.runtime.edgePlan];
+    await f.writeOperation(record => {
+      if (jointDrift) {
+        f.live.inventory.version.resources.bindings.find(b => b.name === "EDGE_ORIGIN_AUDIENCE").text = "https://unapproved.example";
+        record.state.typed.edge.expectedLiveConfigurationFingerprint = createProductionLiveConfigSnapshot(f.live.inventory).fingerprint;
+      } else record.state.typed.edge.expectedLiveConfigurationFingerprint = "9".repeat(64);
+    });
+    await assert.rejects(f.adapter.website(prepared), /RUNTIME_CONFIGURATION_MISMATCH/);
+    assert.equal(f.live.apiReads, 0); assert.equal(f.live.publicReads, 0);
+    for (const input of approved) assert.deepEqual(await hashPublicationFile(input.path), { sha256: input.sha256, bytes: input.bytes });
+  });
+});
+
+test("v2 completes the saved untyped website refusal only after separate typed deployment, without replaying writes", async (t) => {
+  const f = await runtimeFixture(t), prepared = await preparePublication(f.plan, f.prepareOptions), server = remote(f.plan);
+  const actual = f.adapter;
+  server.adapters.website = actual.website;
+  server.adapters.publishWebsite = async value => { server.writes.push("website-refusal"); return actual.publishWebsite(value); };
+  const request = { ...options(f, server), prepare: async () => prepared };
+  await assert.rejects(reconcilePublication({ ...request, operationDirectory: f.plan.website.runtime.operationDirectory }), /OPERATION_COLLISION/);
+  await assert.rejects(lstat(f.plan.website.runtime.operationDirectory), { code: "ENOENT" });
+  const first = await reconcilePublication(request);
+  assert.equal(first.complete, false); assert.equal(first.coordination, "released");
+  assert.deepEqual(first.mutationFailure, { step: "website", code: "PRODUCTION_UNTYPED_DEPLOY_REFUSED" });
+  assert.equal((await readOperation(f.operationDirectory)).state.steps.website, "intent");
+  const writes = [...server.writes];
+  await f.writeOperation();
+  const resumed = await reconcilePublication({ ...request, resume: true, executorStopped: true });
+  assert.equal(resumed.complete, true); assert.equal(resumed.coordination, "released");
+  assert.deepEqual(server.writes, writes); assert.equal(server.state.owner, null);
+  assert.equal((await readOperation(f.operationDirectory)).state.steps.website, "verified");
 });
 
 test("website admission refuses canonical route collisions and transformed dot paths", async (t) => {

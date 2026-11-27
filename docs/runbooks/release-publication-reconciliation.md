@@ -52,7 +52,7 @@ The JSON plan accepts exactly these fields; unknown fields are rejected:
 
 | Field | Required value |
 | --- | --- |
-| `schemaVersion` | `1` |
+| `schemaVersion` | `1` for the legacy source/health contract; `2` for a typed GCP edge deployment |
 | `source` | `{repository, commit, tag, tagObject}`; canonical public repository, full 40-character source and annotated tag object, exact `v<version>` |
 | `channel` | `stable`; other channels are not admitted by this public-release coordinator |
 | `version`, `build` | Three-part release version and Apple-compatible bundle version |
@@ -60,7 +60,7 @@ The JSON plan accepts exactly these fields; unknown fields are rejected:
 | `notes` | `{path, sha256, bytes}` for exact GitHub release notes; title is `TiboTattle <version>` |
 | `targets` | Exactly one ARM and one Intel target, described below |
 | `tap` | `{path, sha256, bytes, workflowSha256}` for the prepared canonical cask and reviewed updater workflow |
-| `website` | `{repositoryRoot, receipt, manifest}`; receipt and manifest each use `{path, sha256, bytes}` |
+| `website` | v1: `{repositoryRoot, receipt, manifest}`; v2 adds the required `runtime` below. Receipt and manifest each use `{path, sha256, bytes}` |
 
 Each target has exactly:
 
@@ -79,6 +79,55 @@ Use `x64` for Intel. The `1234` sizes and placeholder hashes above are illustrat
 not valid evidence. Public keys are not signing keys; never put secret values or
 credential-store contents in this plan. Local regular files and canonical parent
 directories are required; symlink aliases and hardlinked release inputs fail.
+
+### Typed GCP website runtime (v2)
+
+Use v2 when the public website runs on a GCP-backed edge. The edge's deployment
+source and the origin's `/api/health` source are distinct identities. Approve and
+freeze the following closed `website.runtime` object before inspecting the plan
+digest or opening the publication journal:
+
+```json
+{
+  "mode": "gcp",
+  "originCommit": "<approved 40-character origin source commit>",
+  "operationDirectory": "/absolute/private/typed-website-operation",
+  "inventory": {"path": "/absolute/private/predecessor-inventory.json", "sha256": "<64 lowercase hexadecimal characters>", "bytes": 1234},
+  "edgePlan": {"path": "/absolute/private/edge-plan.json", "sha256": "<64 lowercase hexadecimal characters>", "bytes": 1234}
+}
+```
+
+The website receipt pins the candidate edge source (`sourceCommit`) and its
+approved predecessor (`baseCommit`). The inventory must be the reviewed private
+GCP predecessor inventory at that base commit; the edge plan is the same private
+plan supplied to typed deployment. Both files remain owner-only, regular,
+single-link inputs with exact bytes and hashes. The typed website operation path
+must be absolute and canonical, and separate from the publication operation.
+It can be absent when the plan is prepared: no future successful journal or
+journal digest is fabricated. Missing or unfinished typed deployment evidence
+keeps the website pending.
+
+To report a match, the reader requires a verified, released typed operation
+whose binding digest, candidate site hash, edge source, predecessor, baseline
+configuration fingerprint and edge pin agree with the reviewed plan. The expected
+configuration is derived with the canonical edge overlay from the approved
+baseline, edge plan and `apps/worker/wrangler.jsonc` read at the exact candidate
+Git commit. Both the journal's expected fingerprint and current live configuration
+must equal that independently derived value; rebinding a changed journal cannot
+approve configuration drift. It checks the edge/origin contract blobs at those
+exact commits. Fresh Cloudflare metadata
+must show one 100% active version with the candidate edge source, GCP mode and
+the typed pin's expected configuration fingerprint. Captures before and after
+public file and origin-health readback must retain that same version. A saved
+journal alone cannot qualify a later deployment.
+
+This reader uses only the typed operation's read-only validators and the live
+provider's metadata capture. It never opens its mutex, saves its journal,
+acquires its owner, queries SQL, deploys or reconciles that typed operation.
+Authenticated metadata reads require the existing `CLOUDFLARE_API_TOKEN`
+mechanism; its presence does not establish feed-write authorization. Keep the
+inventory, edge plan, credentials and operation paths private. No provider
+payloads or private runtime fields are included in the reconciler's output.
 
 ## Inspect before authorizing changes
 
@@ -116,8 +165,10 @@ provides the read-only enabled-state check.
 
 The tap is read through GitHub's contents API, not a potentially stale raw-content
 URL. Website readback fetches the exact manifest and every generated public file
-with a cache-busting query, then requires healthy production at the receipt's
-exact source commit. A successful HTTP response alone does not pass these gates.
+with a cache-busting query. v1 requires healthy production at the receipt's exact
+source commit. v2 verifies the typed edge identity separately and requires healthy
+production at the plan's exact origin commit, with the same canonical URL and
+secure response-header checks. A successful HTTP response alone does not pass.
 
 ## Explicit publication invocation
 
@@ -158,6 +209,15 @@ the website through the typed
 [web-only release](./2026-08-17-web-only-release.md#4-deploy-only-after-explicit-production-authorization)
 path instead.
 
+For v2, retain that explicit boundary: the publication operation first verifies
+GitHub, both native feeds and the tap, releases its owner, and records the refused
+untyped website intent. Deploy the candidate website last through its separate
+typed operation at the exact predeclared path, using the same receipt,
+predecessor inventory, edge plan and origin commit. After its own qualification
+and owner release, resume the original publication operation below. Fresh v2
+readback closes the saved website intent without repeating any website write.
+No bounded feed/tap-only flag or website-validator override is provided.
+
 Final reconciliation reads every surface again. A complete fresh rerun performs
 no uploads, dispatches, deployments, lock changes or journal writes. During a
 single invocation, already checked GitHub asset IDs are reused only within the
@@ -186,9 +246,10 @@ operation. Do not delete the journal, release an unverifiable owner, or create a
 new plan merely to replay the request.
 
 For an asynchronous tap operation, wait for the already dispatched workflow and
-inspect again. For a failed or uncertain website deployment, reconcile its
+inspect again. For a failed or uncertain typed website deployment, reconcile its
 separate production operation using the agent release runbook before resuming
-publication. For an unresolved feed/GitHub operation, inspect that provider's
+publication. A v2 publication resume only observes that operation; it cannot
+finish its deployment or release its owner. For an unresolved feed/GitHub operation, inspect that provider's
 existing publisher/operation evidence and obtain an explicit recovery decision;
 this tool deliberately provides no blind retry override.
 
@@ -202,8 +263,9 @@ the exact observed state, not installed-app or physical-hardware qualification.
 ## Validation boundary
 
 Run `node --test test/release-publication.test.js` for local/synthetic admission,
-adapter-contract, lost-response, ownership, stale-cache, partial publication and
-zero-write rerun coverage. Tests never contact Apple, upload assets, dispatch a
+adapter-contract, lost-response, ownership, stale-cache, partial publication,
+v1/v2 website identity, stale typed-journal/live-version refusal and zero-write
+rerun coverage. Tests never contact Apple, upload assets, dispatch a
 workflow, or deploy a Worker. Live GitHub permissions, a real signed candidate,
 Cloudflare guard credentials, native hardware and actual publication remain
 separate owner-authorized gates.
