@@ -37,7 +37,11 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [Unreleased]
 
-**Candidate notes:** [0.1.31](./release-notes/0.1.31.md)
+## [0.1.31](./release-notes/0.1.31.md) - 2026-11-27
+
+**Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.31) ·
+[annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.31) ·
+[changes since 0.1.30](https://github.com/adamallcock/tibotattle/compare/v0.1.30...v0.1.31)
 
 - Resume saved progress when an incremental local usage refresh is interrupted.
   The dashboard keeps showing the last completed history while the refresh
