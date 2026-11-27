@@ -163,7 +163,11 @@ presented as a crash.
 
 A user can cancel through the same-origin loopback API at any time. Cancellation
 preserves the last verified dashboard, safe quick result, and durable
-checkpoint. A later **Update local usage** resumes from that checkpoint. Raw
+checkpoint. **Update local usage** can resume completed groups of related logs.
+A newly discovered log can be added on retry when it leaves the saved groups'
+source order and parent selection intact. If a saved group's inputs changed,
+the update restarts from the last published index.
+The dashboard keeps showing the last published results throughout the update. Raw
 prompts, responses, commands, source paths, repository names, and local files
 are not served to the browser or sent to a hosted service.
 

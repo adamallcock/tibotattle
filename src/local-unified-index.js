@@ -4,7 +4,7 @@ import {
   createSecretKey,
   randomBytes,
 } from "node:crypto";
-import { closeSync, constants, lstatSync, openSync } from "node:fs";
+import { closeSync, constants, lstatSync, openSync, unlinkSync } from "node:fs";
 import {
   chmod,
   copyFile,
@@ -234,6 +234,8 @@ const COMPATIBILITY_META_KEYS = Object.freeze({
 const SECRET_BYTES = 32;
 const MAX_SECRET_BYTES = 256;
 const DEFAULT_COMMIT_ROWS = 10_000;
+const CHECKPOINT_COMMIT_GROUPS = 64;
+const CHECKPOINT_COMMIT_MS = 250;
 const LOCAL_DIGEST_KEYS = new WeakMap();
 const DIAGNOSTIC_CODES = new Set([
   "relevantLines",
@@ -887,6 +889,14 @@ function sameLocalUnifiedIndexTarget(left, right) {
     && left.ino === right.ino;
 }
 
+function sameLocalUnifiedIndexFileState(left, right) {
+  if (left === null || right === null) return left === right;
+  return sameLocalUnifiedIndexTarget(left, right)
+    && left.size === right.size
+    && left.mtimeMs === right.mtimeMs
+    && left.ctimeMs === right.ctimeMs;
+}
+
 function reserveNewLocalUnifiedIndexTarget(indexFile, expectedDirectoryChain) {
   recheckLocalUnifiedIndexDirectoryChain(indexFile, expectedDirectoryChain);
   let descriptor;
@@ -936,6 +946,139 @@ export async function assertSafeLocalUnifiedIndexTarget(
   }
   recheckLocalUnifiedIndexDirectoryChain(indexFile, directoryChain);
   return metadata;
+}
+
+function assertLocalUnifiedIndexCheckpointSidecars(indexFile) {
+  for (const suffix of ["-wal", "-shm"]) {
+    if (safeLocalUnifiedIndexTargetSync(indexFile + suffix, { allowMissing: true }) !== null) {
+      throw fixedError("local_unified_index_checkpoint_sidecar_invalid");
+    }
+  }
+  return safeLocalUnifiedIndexTargetSync(indexFile + "-journal", { allowMissing: true });
+}
+
+export function assertVacantLocalUnifiedIndexAttemptStage(indexFile, { allowMain = false } = {}) {
+  const chain = captureSafeLocalUnifiedIndexDirectoryChain(indexFile);
+  const paths = ["-journal", "-wal", "-shm"].map((suffix) => indexFile + suffix);
+  if (!allowMain) paths.push(indexFile);
+  for (const path of paths) {
+    if (safeLocalUnifiedIndexTargetSync(path, { allowMissing: true }) !== null) {
+      throw fixedError("local_unified_index_attempt_stage_exists");
+    }
+  }
+  recheckLocalUnifiedIndexDirectoryChain(indexFile, chain);
+}
+
+/** Remove only the checked checkpoint and its owned journal, under the checkpoint lock. */
+export async function removeLocalUnifiedIndexCheckpoint(indexFile, expected, {
+  removeJournal = true,
+} = {}) {
+  const chain = captureSafeLocalUnifiedIndexDirectoryChain(indexFile);
+  const journal = removeJournal ? assertLocalUnifiedIndexCheckpointSidecars(indexFile) : null;
+  const current = safeLocalUnifiedIndexTargetSync(indexFile, { allowMissing: true });
+  if (expected === null ? current !== null
+    : current === null || !sameLocalUnifiedIndexTarget(expected, current)) {
+    throw fixedError("local_unified_index_checkpoint_changed");
+  }
+  recheckLocalUnifiedIndexDirectoryChain(indexFile, chain);
+  // Never leave a main database that depends on a deliberately removed hot journal.
+  if (current !== null) unlinkSync(indexFile);
+  if (journal !== null) unlinkSync(indexFile + "-journal");
+  if (current !== null || journal !== null) await syncDirectory(dirname(indexFile));
+}
+
+function isSqliteCorruption(error) {
+  // Node exposes SQLite result codes, including the extended result code.
+  return Number.isInteger(error?.errcode) && [11, 26].includes(error.errcode & 0xff);
+}
+
+/** Open an existing checkpoint without recovering a newer writer's journal in place. */
+export async function openLocalUnifiedIndexCheckpoint(indexFile, probeFile) {
+  try {
+    return openLocalUnifiedIndex(indexFile, { checkpoint: true });
+  } catch (error) {
+    if (error?.code !== "local_unified_index_checkpoint_recovery_required") throw error;
+  }
+  const chain = captureSafeLocalUnifiedIndexDirectoryChain(indexFile);
+  const source = safeLocalUnifiedIndexTargetSync(indexFile);
+  const journal = assertLocalUnifiedIndexCheckpointSidecars(indexFile);
+  if (journal === null || resolve(indexFile) === resolve(probeFile)
+      || dirname(resolve(indexFile)) !== dirname(resolve(probeFile))) {
+    throw fixedError("local_unified_index_checkpoint_changed");
+  }
+  const flags = constants.COPYFILE_EXCL | (constants.COPYFILE_FICLONE ?? 0);
+  let probe;
+  let copied = null;
+  let copiedJournal = false;
+  assertVacantLocalUnifiedIndexAttemptStage(probeFile);
+  try {
+    await copyFile(indexFile, probeFile, flags);
+    copied = await assertSafeLocalUnifiedIndexTarget(probeFile, { allowMissing: false });
+    assertVacantLocalUnifiedIndexAttemptStage(probeFile, { allowMain: true });
+    await copyFile(indexFile + "-journal", probeFile + "-journal", flags);
+    copiedJournal = true;
+    probe = openLocalUnifiedIndex(probeFile, {
+      checkpoint: true,
+      recoverCheckpointJournal: true,
+    });
+  } catch (error) {
+    if (error?.code === "local_unified_index_checkpoint_corrupt") {
+      // The original still has recovery evidence. A failed private probe is
+      // not permission to discard either file.
+      throw fixedError("local_unified_index_checkpoint_recovery_failed");
+    }
+    if (error?.code?.startsWith("local_unified_index_")) throw error;
+    if (["ENOSPC", "EDQUOT"].includes(error?.code)) {
+      throw fixedError("local_unified_index_space_unavailable");
+    }
+    throw fixedError("local_unified_index_unavailable");
+  } finally {
+    if (probe?.isOpen) probe.close();
+    if (copied !== null) {
+      await removeLocalUnifiedIndexCheckpoint(probeFile, copied, { removeJournal: copiedJournal });
+    }
+  }
+  recheckLocalUnifiedIndexDirectoryChain(indexFile, chain);
+  if (!sameLocalUnifiedIndexFileState(source, safeLocalUnifiedIndexTargetSync(indexFile))
+      || !sameLocalUnifiedIndexFileState(journal, assertLocalUnifiedIndexCheckpointSidecars(indexFile))) {
+    throw fixedError("local_unified_index_checkpoint_changed");
+  }
+  return openLocalUnifiedIndex(indexFile, {
+    checkpoint: true,
+    recoverCheckpointJournal: true,
+  });
+}
+
+// A separate SQLite write lock serializes checkpoint owners. SQLite releases
+// it when a worker exits, including after a crash. Keep the inode in place so
+// another process cannot acquire a lock on a replacement file.
+export function acquireLocalUnifiedIndexCheckpointLock(indexFile) {
+  const lockFile = `${indexFile}.checkpoint-lock.sqlite`;
+  const chain = captureSafeLocalUnifiedIndexDirectoryChain(lockFile);
+  if (safeLocalUnifiedIndexTargetSync(lockFile, { allowMissing: true }) === null) {
+    try {
+      reserveNewLocalUnifiedIndexTarget(lockFile, chain);
+    } catch (error) {
+      if (safeLocalUnifiedIndexTargetSync(lockFile, { allowMissing: true }) === null) {
+        throw error;
+      }
+    }
+  }
+  const target = safeLocalUnifiedIndexTargetSync(lockFile);
+  recheckLocalUnifiedIndexDirectoryChain(lockFile, chain);
+  const lock = new DatabaseSync(lockFile);
+  try {
+    recheckLocalUnifiedIndexDirectoryChain(lockFile, chain);
+    if (!sameLocalUnifiedIndexTarget(target, safeLocalUnifiedIndexTargetSync(lockFile))) {
+      throw fixedError("local_unified_index_file_invalid");
+    }
+    lock.exec("BEGIN IMMEDIATE");
+    return () => lock.close();
+  } catch (error) {
+    lock.close();
+    if (error?.errcode === 5) throw fixedError("local_unified_index_checkpoint_busy");
+    throw error;
+  }
 }
 
 /**
@@ -1632,6 +1775,8 @@ export function openLocalUnifiedIndex(indexFile, {
   readOnly = false,
   create = false,
   staging = false,
+  checkpoint = false,
+  recoverCheckpointJournal = false,
   deferSecondaryIndexes = false,
   allowRecoveryLock = false,
 } = {}) {
@@ -1670,6 +1815,8 @@ export function openLocalUnifiedIndex(indexFile, {
       directoryChain,
     );
     existedBeforeOpen = targetMetadata !== null;
+    const journal = checkpoint
+      ? assertLocalUnifiedIndexCheckpointSidecars(resolvedIndexFile) : null;
     if (deferSecondaryIndexes && existedBeforeOpen) {
       throw fixedError("local_unified_index_deferred_indexes_requires_new_stage");
     }
@@ -1697,7 +1844,20 @@ export function openLocalUnifiedIndex(indexFile, {
         if (!sameLocalUnifiedIndexTarget(targetMetadata, preflightMetadata)) {
           throw fixedError("local_unified_index_file_invalid");
         }
-        assertWritableLocalUnifiedIndexPreflight(preflight);
+        try {
+          assertWritableLocalUnifiedIndexPreflight(preflight);
+        } catch (error) {
+          // A hot journal can hide the committed writer compatibility. The
+          // checkpoint opener validates it on a private clone before allowing
+          // recovery of the original.
+          if (journal === null || error?.errcode !== 776) throw error;
+          if (!recoverCheckpointJournal) {
+            throw fixedError("local_unified_index_checkpoint_recovery_required");
+          }
+          preflight.close();
+          preflight = new DatabaseSync(resolvedIndexFile, { timeout: 5_000 });
+          assertWritableLocalUnifiedIndexPreflight(preflight);
+        }
         const validatedMetadata = safeLocalUnifiedIndexTargetSync(
           resolvedIndexFile,
         );
@@ -1754,6 +1914,9 @@ export function openLocalUnifiedIndex(indexFile, {
     if (preflight?.isOpen) preflight.close();
     if (database?.isOpen) database.close();
     if (error?.code?.startsWith("local_unified_index_")) throw error;
+    if (checkpoint && isSqliteCorruption(error)) {
+      throw fixedError("local_unified_index_checkpoint_corrupt");
+    }
     throw fixedError("local_unified_index_unavailable");
   }
 }
@@ -1826,6 +1989,51 @@ export function beginUnifiedIndexGeneration(database, {
       database.exec("ROLLBACK");
     } catch {
       // Preserve original failure.
+    }
+    throw error;
+  }
+}
+
+/** Start a new writer run against an already durable in-progress checkpoint. */
+export function beginUnifiedIndexCheckpointRun(database, {
+  generationId,
+  parserVersion,
+  contractVersion,
+  receivedAtMs = Date.now(),
+} = {}) {
+  if (!Number.isSafeInteger(generationId) || generationId < 1
+      || typeof parserVersion !== "string" || parserVersion.length < 1
+      || typeof contractVersion !== "string" || contractVersion.length < 1
+      || !Number.isSafeInteger(receivedAtMs) || receivedAtMs < 0) {
+    throw fixedError("local_unified_index_generation_invalid");
+  }
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    const parserVersionId = Number(database.prepare(`
+      SELECT id FROM parser_version
+      WHERE parser_version = ? AND contract_version = ?
+    `).get(parserVersion, contractVersion)?.id);
+    const generation = database.prepare(`
+      SELECT status, parser_version_id, contract_version
+      FROM index_generation WHERE id = ?
+    `).get(generationId);
+    if (!Number.isSafeInteger(parserVersionId) || parserVersionId < 1
+        || generation?.status !== "in_progress"
+        || Number(generation.parser_version_id) !== parserVersionId
+        || generation.contract_version !== contractVersion) {
+      throw fixedError("local_unified_index_checkpoint_invalid");
+    }
+    const ingestRunId = Number(database.prepare(`
+      INSERT INTO ingest_run(received_at_ms, parser_version_id)
+      VALUES (?, ?)
+    `).run(receivedAtMs, parserVersionId).lastInsertRowid);
+    database.exec("COMMIT");
+    return { generationId, parserVersionId, ingestRunId };
+  } catch (error) {
+    try {
+      database.exec("ROLLBACK");
+    } catch {
+      // Preserve the original failure.
     }
     throw error;
   }
@@ -2059,6 +2267,7 @@ async function syncFile(path) {
  * to 36.3s with 10,000-row batches and this persistent connection.
  */
 export function createUnifiedIndexWriter(database, {
+  manualCommit = false,
   commitRows = DEFAULT_COMMIT_ROWS,
   receivedAtMs = Date.now(),
   parserVersion = LOCAL_UNIFIED_INDEX_PARSER_VERSION,
@@ -2319,6 +2528,11 @@ export function createUnifiedIndexWriter(database, {
       VALUES (?, ?, ?, ?)
       ON CONFLICT(generation_id, source_local, code)
       DO UPDATE SET count = excluded.count`),
+    selectSourceDiagnostics: database.prepare(`
+      SELECT code, count FROM source_diagnostic
+      WHERE generation_id = ? AND source_local = ?`),
+    deleteSourceDiagnostics: database.prepare(`
+      DELETE FROM source_diagnostic WHERE generation_id = ? AND source_local = ?`),
     generationIssue: database.prepare(`
       INSERT INTO generation_issue(
         generation_id, code, thread_count, source_count, source_bytes)
@@ -2348,6 +2562,8 @@ export function createUnifiedIndexWriter(database, {
     generation: database.prepare(`
       UPDATE index_generation SET
         completed_at_ms = ?, status = ?, block_reason = ?,
+        discovered_source_count = COALESCE(?, discovered_source_count),
+        discovered_source_bytes = COALESCE(?, discovered_source_bytes),
         indexed_source_count = ?, indexed_source_bytes = ?,
         skipped_source_count = ?, skipped_source_bytes = ?,
         skipped_thread_count = ?,
@@ -2361,6 +2577,7 @@ export function createUnifiedIndexWriter(database, {
     meta: database.prepare(`
       INSERT INTO meta(key, value) VALUES (?, ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value`),
+    deleteMeta: database.prepare("DELETE FROM meta WHERE key = ?"),
   };
 
   // Interning caches. Every dimension in this schema has at most a few
@@ -2382,6 +2599,11 @@ export function createUnifiedIndexWriter(database, {
   let toolRows = 0;
   let quotaOccurrenceRows = 0;
   let batches = 0;
+  let checkpointGroup = null;
+  let checkpointBatchHasCompleteGroup = false;
+  let checkpointChangedGroups = 0;
+  let checkpointBatchStartedAt = null;
+  let checkpointHasChangedGroup = false;
 
   function begin() {
     if (open) return;
@@ -2391,15 +2613,73 @@ export function createUnifiedIndexWriter(database, {
 
   function commit() {
     if (!open) return;
+    if (checkpointGroup !== null) {
+      throw fixedError("local_unified_index_checkpoint_group_open");
+    }
     database.exec("COMMIT");
     open = false;
     pending = 0;
+    checkpointBatchHasCompleteGroup = false;
+    checkpointChangedGroups = 0;
+    checkpointBatchStartedAt = null;
     batches += 1;
+  }
+
+  function checkpointBatchExpired() {
+    return checkpointBatchStartedAt !== null
+      && performance.now() - checkpointBatchStartedAt >= CHECKPOINT_COMMIT_MS;
+  }
+
+  function beginCheckpointGroup() {
+    if (!manualCommit || checkpointGroup !== null) {
+      throw fixedError("local_unified_index_checkpoint_group_invalid");
+    }
+    if (checkpointBatchHasCompleteGroup && checkpointBatchExpired()) commit();
+    begin();
+    database.exec("SAVEPOINT checkpoint_group");
+    checkpointBatchStartedAt ??= performance.now();
+    checkpointGroup = { pending, usageRows, boundaryRows, toolRows, quotaOccurrenceRows };
+  }
+
+  function completeCheckpointGroup({ changed }) {
+    if (checkpointGroup === null) {
+      throw fixedError("local_unified_index_checkpoint_group_invalid");
+    }
+    database.exec("RELEASE checkpoint_group");
+    checkpointGroup = null;
+    checkpointBatchHasCompleteGroup = true;
+    const firstChangedGroup = changed && !checkpointHasChangedGroup;
+    if (changed) {
+      checkpointHasChangedGroup = true;
+      checkpointChangedGroups += 1;
+    }
+    // Releasing a savepoint only completes the component within this batch.
+    // The first changed component is immediately recoverable after a crash.
+    // All later limits apply at component boundaries, keeping forks atomic.
+    // Skipped groups add no redo scans and count toward the write/time limits.
+    if (firstChangedGroup || checkpointChangedGroups >= CHECKPOINT_COMMIT_GROUPS
+        || pending >= commitRows || checkpointBatchExpired()) commit();
+  }
+
+  function preserveCheckpointGroups() {
+    if (checkpointGroup !== null) {
+      database.exec("ROLLBACK TO checkpoint_group");
+      database.exec("RELEASE checkpoint_group");
+      ({ pending, usageRows, boundaryRows, toolRows, quotaOccurrenceRows } = checkpointGroup);
+      checkpointGroup = null;
+      // A rolled-back insert may have supplied an ID and a rolled-back upsert
+      // may have cached a quota reading. Re-intern after either kind of write.
+      for (const cache of [
+        parserVersionIds, modelIds, tierIds, surfaceIds, accountScopeIds,
+        sourceIds, quotaIds,
+      ]) cache.clear();
+    }
+    if (checkpointBatchHasCompleteGroup) commit();
   }
 
   function step() {
     pending += 1;
-    if (pending >= commitRows) commit();
+    if (!manualCommit && pending >= commitRows) commit();
   }
 
   function internParserVersion(version) {
@@ -2877,11 +3157,28 @@ export function createUnifiedIndexWriter(database, {
 
     writeSourceDiagnostics(sourceLocalKey, diagnostics, {
       generationId: sourceGenerationId = generationId,
+      replace = false,
+      prefixGenerationId = null,
     } = {}) {
       if (sourceGenerationId === null) {
         throw fixedError("local_unified_index_generation_required");
       }
       begin();
+      if (replace) {
+        statements.deleteSourceDiagnostics.run(sourceGenerationId, sourceLocalKey);
+      }
+      // The prefix belongs to the published generation. Reading staged totals
+      // here would count the same prefix again if work retried in this stage.
+      if (prefixGenerationId !== null) {
+        diagnostics = { ...diagnostics };
+        const prefix = statements.selectSourceDiagnostics.all(prefixGenerationId, sourceLocalKey);
+        for (const { code, count } of prefix) {
+          const tailCount = Number(diagnostics[code] ?? 0);
+          const total = count + tailCount;
+          diagnostics[code] = Number.isSafeInteger(tailCount) && tailCount >= 0
+            && Number.isSafeInteger(total) ? total : count;
+        }
+      }
       for (const [code, value] of Object.entries(diagnostics ?? {})) {
         if (!Number.isSafeInteger(Number(value)) || Number(value) < 0) continue;
         if (!DIAGNOSTIC_CODES.has(code)) continue;
@@ -2958,6 +3255,12 @@ export function createUnifiedIndexWriter(database, {
     writeMeta(key, value) {
       begin();
       statements.meta.run(key, String(value));
+      step();
+    },
+
+    deleteMeta(key) {
+      begin();
+      statements.deleteMeta.run(key);
       step();
     },
 
@@ -3141,6 +3444,8 @@ export function createUnifiedIndexWriter(database, {
         completedAtMs,
         publishedStatus,
         publishedReason,
+        discoveredSourceCount,
+        discoveredSourceBytes,
         indexedSourceCount ?? discoveredSourceCount,
         indexedSourceBytes ?? discoveredSourceBytes,
         skippedSourceCount,
@@ -3172,6 +3477,7 @@ export function createUnifiedIndexWriter(database, {
       begin();
       statements.generation.run(
         Date.now(), "failed", blockReason,
+        null, null,
         null, null, null, null, null, null, null, null, null, 0, 0, 0, 0, 0,
         null, null, 0, generationId,
       );
@@ -3182,12 +3488,17 @@ export function createUnifiedIndexWriter(database, {
       commit();
     },
 
+    begin,
+    beginCheckpointGroup,
+    completeCheckpointGroup,
+    preserveCheckpointGroups,
+
     /**
      * Settle the whole run: one optimize, one integrity check, one fsync.
      */
-    async close({ integrityCheck = true, fsyncPath = null } = {}) {
+    async close({ integrityCheck = true, optimize = true, fsyncPath = null } = {}) {
       commit();
-      database.exec("PRAGMA optimize");
+      if (optimize) database.exec("PRAGMA optimize");
       if (integrityCheck) {
         const result = database.prepare("PRAGMA quick_check").get();
         if (result?.quick_check !== "ok") {
@@ -3218,7 +3529,7 @@ export function createUnifiedIndexWriter(database, {
 export async function publishStagedUnifiedIndex(
   stageFile,
   indexFile,
-  { allowRecoveryLock = false, signal = null } = {},
+  { allowRecoveryLock = false, signal = null, expectedTarget = undefined } = {},
 ) {
   if (signal !== null
       && (typeof signal !== "object" || typeof signal.aborted !== "boolean")) {
@@ -3242,6 +3553,12 @@ export async function publishStagedUnifiedIndex(
   // lock can therefore be missed because target verification was suspended.
   if (signal?.aborted) throw fixedError("local_unified_index_aborted");
   if (!allowRecoveryLock) assertLocalUnifiedIndexRecoveryUnlocked(indexFile);
+  if (expectedTarget !== undefined) {
+    const current = safeLocalUnifiedIndexTargetSync(indexFile, { allowMissing: true });
+    if (!sameLocalUnifiedIndexFileState(expectedTarget, current)) {
+      throw fixedError("local_unified_index_checkpoint_base_changed");
+    }
+  }
   await rename(stageFile, indexFile);
   try {
     await syncDirectory(dirname(resolve(indexFile)));
@@ -3278,9 +3595,10 @@ function localUnifiedIndexStageOwner(name, indexName) {
   for (const kind of ["building", "incremental"]) {
     const prefix = `${indexName}.${kind}-`;
     if (!name.startsWith(prefix)) continue;
-    const match = /^([1-9][0-9]*)-([0-9a-z]+)$/u.exec(
-      name.slice(prefix.length),
-    );
+    const suffix = name.slice(prefix.length);
+    const match = (kind === "incremental"
+      ? /^([1-9][0-9]*)-([0-9a-z]+)(?:-journal)?$/u
+      : /^([1-9][0-9]*)-([0-9a-z]+)$/u).exec(suffix);
     if (match === null) return null;
     const pid = Number(match[1]);
     return Number.isSafeInteger(pid)
@@ -3407,8 +3725,8 @@ async function rotatingLocalUnifiedIndexStageNames(
 }
 
 /**
- * Remove only the two stage names an exact, confirmed-terminated off-main
- * attempt could own. The unguessable token, current PID, safe directory chain,
+ * Remove only the exact stage names and recovery-probe journal a confirmed
+ * terminated attempt could own. The token, current PID, safe directory chain,
  * and owner-only single-link file checks make this narrower than an abandoned
  * stage scan; anything uncertain is retained for later diagnosis.
  */
@@ -3430,8 +3748,9 @@ export async function removeExactLocalUnifiedIndexAttemptStages(
   let inspected = 0;
   let removed = 0;
   let skipped = 0;
-  for (const kind of ["building", "incremental"]) {
-    const candidate = `${resolvedIndexFile}.${kind}-${process.pid}-${attemptToken}`;
+  const buildingStage = `${resolvedIndexFile}.building-${process.pid}-${attemptToken}`;
+  const incrementalStage = `${resolvedIndexFile}.incremental-${process.pid}-${attemptToken}`;
+  for (const candidate of [buildingStage, incrementalStage, incrementalStage + "-journal"]) {
     let metadata;
     try {
       metadata = await lstat(candidate);

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import {
   mkdirSync,
@@ -11,6 +12,7 @@ import {
   access,
   appendFile,
   chmod,
+  copyFile,
   mkdir,
   mkdtemp,
   opendir,
@@ -42,48 +44,95 @@ import {
 
 const CONTRACT = "usage-event-v0.2";
 const THREAD_ID = "11111111-1111-4111-8111-111111111111";
+const SECOND_THREAD_ID = "22222222-2222-4222-8222-222222222222";
+const THIRD_THREAD_ID = "33333333-3333-4333-8333-333333333333";
+const FOURTH_THREAD_ID = "44444444-4444-4444-8444-444444444444";
 
-function rolloutFixture() {
+function rolloutFixture({
+  threadId = THREAD_ID,
+  hour = "00",
+  parentId = null,
+  paddingBytes = 0,
+  usageRows = 1,
+  inputPerEvent = 10,
+} = {}) {
+  const start = Date.parse(`2026-08-24T${hour}:00:00.000Z`);
+  const timestamp = (seconds) => new Date(start + seconds * 1_000).toISOString();
   return [
     JSON.stringify({
-      timestamp: "2026-08-24T00:00:00.000Z",
+      timestamp: timestamp(0),
       type: "session_meta",
       payload: {
-        id: THREAD_ID,
-        session_id: THREAD_ID,
-        thread_source: "user",
+        id: threadId,
+        session_id: threadId,
+        thread_source: parentId === null ? "user" : "subagent",
         originator: "codex_cli_rs",
+        ...(parentId === null ? {} : { forked_from_id: parentId }),
       },
     }),
     JSON.stringify({
-      timestamp: "2026-08-24T00:00:01.000Z",
+      timestamp: timestamp(1),
       type: "turn_context",
       payload: {
         turn_id: "turn-1",
         model: "gpt-5.6-sol",
         effort: "high",
+        ...(paddingBytes === 0 ? {} : { padding: "x".repeat(paddingBytes) }),
       },
     }),
-    JSON.stringify({
-      timestamp: "2026-08-24T00:00:02.000Z",
-      type: "event_msg",
-      payload: {
-        type: "token_count",
-        info: {
-          total_token_usage: {
-            input_tokens: 10,
-            output_tokens: 2,
-            total_tokens: 12,
-          },
-          last_token_usage: {
-            input_tokens: 10,
-            output_tokens: 2,
-            total_tokens: 12,
+    ...Array.from({ length: usageRows }, (_, index) => {
+      const count = index + 1;
+      return JSON.stringify({
+        timestamp: timestamp(index + 2),
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          info: {
+            total_token_usage: {
+              input_tokens: inputPerEvent * count,
+              cached_input_tokens: 0,
+              output_tokens: 2 * count,
+              reasoning_output_tokens: 0,
+              total_tokens: (inputPerEvent + 2) * count,
+            },
+            last_token_usage: {
+              input_tokens: inputPerEvent,
+              cached_input_tokens: 0,
+              output_tokens: 2,
+              reasoning_output_tokens: 0,
+              total_tokens: inputPerEvent + 2,
+            },
           },
         },
-      },
+      });
     }),
   ].join("\n") + "\n";
+}
+
+function writeCheckpointRollout(root, options) {
+  const { hour, threadId } = options;
+  return writeFile(join(
+    root, "sessions", "2026", "08", "24",
+    `rollout-2026-08-24T${hour}-00-00-${threadId}.jsonl`,
+  ), rolloutFixture(options));
+}
+
+function readIndexedUsage(indexFile) {
+  const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+  try {
+    return database.prepare(`
+      SELECT hex(event_key) AS event_key, source_ordinal, observed_at_ms,
+             tokens_in_uncached, tokens_out_text
+      FROM usage_event
+      ORDER BY observed_at_ms, source_ordinal, event_key
+    `).all();
+  } finally {
+    database.close();
+  }
+}
+
+async function incrementalArtifacts(root) {
+  return (await readdir(root)).filter((name) => name.startsWith("index.sqlite.incremental-"));
 }
 
 async function createRolloutRoot(prefix) {
@@ -614,50 +663,146 @@ test("abandoned cleanup preserves files after parent replacement", async () => {
   }
 });
 
-test("cooperative worker cancellation preserves the live generation and removes its stage", async () => {
+test("cooperative worker cancellation retains completed groups for retry", async () => {
   const root = await createRolloutRoot("unified-index-off-main-cancel-");
   const controller = new AbortController();
   const indexFile = join(root, "index.sqlite");
+  const cleanFile = join(root, "clean.sqlite");
+  const options = {
+    codexHome: root,
+    indexFile,
+    secretFile: join(root, "salt"),
+    contractVersion: CONTRACT,
+  };
   try {
-    await ingestLocalUnifiedIndexOffMain({
-      codexHome: root,
-      indexFile,
-      secretFile: join(root, "salt"),
-      contractVersion: CONTRACT,
-    });
+    await runLocalUnifiedIndexOffMainWorker(options);
     const before = await readFile(indexFile);
-    const secondId = "22222222-2222-4222-8222-222222222222";
-    const second = join(
-      root,
-      "sessions",
-      "2026",
-      "08",
-      "24",
-      `rollout-2026-08-24T01-00-00-${secondId}.jsonl`,
-    );
-    await writeFile(
-      second,
-      rolloutFixture().replaceAll(THREAD_ID, secondId),
-    );
+    await copyFile(indexFile, cleanFile);
+    await writeCheckpointRollout(root, {
+      hour: "01",
+      threadId: SECOND_THREAD_ID,
+      paddingBytes: 256,
+      inputPerEvent: 20,
+    });
+    await writeCheckpointRollout(root, {
+      hour: "02",
+      threadId: THIRD_THREAD_ID,
+      inputPerEvent: 30,
+    });
 
     await assert.rejects(
-      ingestLocalUnifiedIndexOffMain({
-        codexHome: root,
-        indexFile,
-        secretFile: join(root, "salt"),
-        contractVersion: CONTRACT,
+      runLocalUnifiedIndexOffMainWorker(options, {
         signal: controller.signal,
-        onProgress: () => controller.abort(),
+        onProgress: ({ sourcesScanned }) => {
+          if (sourcesScanned === 1) controller.abort();
+        },
       }),
-      (error) => error?.code === "local_unified_index_aborted",
+      { code: "local_unified_index_aborted" },
     );
     assert.deepEqual(await readFile(indexFile), before);
     assert.deepEqual(
-      (await readdir(root)).filter((name) => name.includes(".incremental-")),
-      [],
+      await incrementalArtifacts(root),
+      ["index.sqlite.incremental-checkpoint"],
     );
+    assert.deepEqual(
+      readIndexedUsage(`${indexFile}.incremental-checkpoint`)
+        .map((row) => row.tokens_in_uncached),
+      [10, 20],
+    );
+
+    const resumed = await runLocalUnifiedIndexOffMainWorker(options);
+    const clean = await runLocalUnifiedIndexOffMainWorker({
+      ...options, indexFile: cleanFile,
+    });
+    assert.equal(resumed.generation.status, "complete");
+    assert.equal(resumed.sourcesScanned, 1);
+    assert.equal(clean.sourcesScanned, 2);
+    const usage = readIndexedUsage(indexFile);
+    assert.deepEqual(usage.map((row) => row.tokens_in_uncached), [10, 20, 30]);
+    assert.deepEqual(usage, readIndexedUsage(cleanFile));
+    assert.deepEqual(await incrementalArtifacts(root), []);
   } finally {
     controller.abort();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("killed ingestion recovers a hot checkpoint journal and replays the unfinished fork group", {
+  skip: process.platform === "win32",
+}, async () => {
+  const root = await createRolloutRoot("unified-index-checkpoint-kill-");
+  const indexFile = join(root, "index.sqlite");
+  const cleanFile = join(root, "clean.sqlite");
+  const journalFile = `${indexFile}.incremental-checkpoint-journal`;
+  const options = {
+    codexHome: root,
+    indexFile,
+    secretFile: join(root, "salt"),
+    contractVersion: CONTRACT,
+  };
+  try {
+    await ingestLocalUnifiedIndexIncrement(options);
+    const before = await readFile(indexFile);
+    await copyFile(indexFile, cleanFile);
+    // Components run largest first. Finish an independent group before the
+    // process exits after writing the parent in the next group.
+    await writeCheckpointRollout(root, {
+      hour: "01",
+      threadId: SECOND_THREAD_ID,
+      paddingBytes: 150_000,
+      inputPerEvent: 20,
+    });
+    await writeCheckpointRollout(root, {
+      hour: "02",
+      threadId: THIRD_THREAD_ID,
+      usageRows: 200,
+      inputPerEvent: 30,
+    });
+    await writeCheckpointRollout(root, {
+      hour: "03",
+      threadId: FOURTH_THREAD_ID,
+      parentId: THIRD_THREAD_ID,
+      inputPerEvent: 10_000,
+    });
+
+    const ingestModule = new URL("../src/local-unified-index-ingest.js", import.meta.url);
+    const crashed = spawnSync(process.execPath, ["--input-type=module", "-e", `
+      import { DatabaseSync } from "node:sqlite";
+      const exec = DatabaseSync.prototype.exec;
+      DatabaseSync.prototype.exec = function (sql) {
+        const result = exec.call(this, sql);
+        if (sql.includes("PRAGMA cache_size=")) {
+          // Make a small fixture spill dirty pages to disk before it is killed.
+          exec.call(this, "PRAGMA cache_size=5; PRAGMA cache_spill=ON");
+        }
+        return result;
+      };
+      const { ingestLocalUnifiedIndexIncrement } = await import(process.argv[1]);
+      await ingestLocalUnifiedIndexIncrement({
+        ...JSON.parse(process.argv[2]),
+        onProgress({ sourcesScanned }) {
+          if (sourcesScanned === 2) process.kill(process.pid, "SIGKILL");
+        },
+      });
+    `, ingestModule.href, JSON.stringify(options)], { encoding: "utf8", timeout: 20_000 });
+    assert.ifError(crashed.error);
+    assert.equal(crashed.signal, "SIGKILL", crashed.stderr);
+    assert.deepEqual(await readFile(indexFile), before);
+    // SQLite writes this magic after journal sync and before spilling pages.
+    // A journal with a zeroed header would miss the recovery path under test.
+    const journal = await readFile(journalFile);
+    assert.equal(journal.subarray(0, 8).toString("hex"), "d9d505f920a163d7");
+
+    const resumed = await ingestLocalUnifiedIndexIncrement(options);
+    const clean = await ingestLocalUnifiedIndexIncrement({ ...options, indexFile: cleanFile });
+    assert.equal(resumed.generation.status, "complete");
+    assert.equal(resumed.sourcesScanned, 2);
+    assert.equal(clean.sourcesScanned, 3);
+    const usage = readIndexedUsage(indexFile);
+    assert.equal(usage.length, 203);
+    assert.deepEqual(usage, readIndexedUsage(cleanFile));
+    assert.deepEqual(await incrementalArtifacts(root), []);
+  } finally {
     await rm(root, { recursive: true, force: true });
   }
 });

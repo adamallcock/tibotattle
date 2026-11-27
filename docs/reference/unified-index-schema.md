@@ -291,6 +291,36 @@ unfinished tails, or other closed source-level issues are quarantined rather
 than guessed. A malformed quota observation is omitted with a closed diagnostic
 without discarding other valid facts from that source.
 
+Incremental refreshes keep an owner-only SQLite checkpoint beside the published
+index. A SQLite write lock serializes checkpoint writers. Each changed lineage
+group's facts, diagnostics, source cursors, and completion marker are saved
+together. The first changed group commits immediately. Subsequent small groups
+share transactions. The writer commits between groups when it reaches 64
+changed groups, the configured write limit (10,000 by default), or 250 ms.
+A cooperative cancellation saves completed groups and rolls
+back the group in progress. A process exit can also replay completed groups in
+the open transaction.
+
+After an interruption, SQLite rolls back the unfinished transaction. A later
+refresh checks the checkpoint against the published base, indexing versions,
+scan settings, discovery quarantines, and each saved group's physical sources,
+selected parent, and source ordinals. This preserves inherited model and speed
+and the order of observations with identical timestamps. A changed input that
+invalidates saved work causes a fresh incremental pass from the published
+generation. Newly discovered or unfinished groups can be read independently
+when their presence preserves the saved groups' inputs.
+
+An authoritative whole-source rescan replaces that source's diagnostics. A
+tail scan retains diagnostics for the already indexed prefix. The published
+generation records the source count and bytes from the successful discovery
+pass, including logs first seen on retry.
+
+Finalization runs on a private copy of the completed checkpoint. The client
+checks and syncs that candidate before publishing it by atomic rename. A
+cancellation during finalization retains the checkpoint for retry. Filesystems
+without copy-on-write support need temporary space for one additional index
+copy during this step. An unchanged refresh skips the copy.
+
 Historical usage plan attribution joins admitted `quota_occurrence` facts on
 source, byte offset, ordinal and observation time inside the published
 `generation_source` membership and scanned-byte boundary. The canonical

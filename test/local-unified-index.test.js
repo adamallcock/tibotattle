@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import {
+import fsPromises, {
   appendFile,
   chmod,
   copyFile,
@@ -16,6 +16,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -583,7 +584,7 @@ function promiseWithin(promise, timeoutMs, message) {
 async function abortWhenStageGenerationFinalizes(
   stageFile,
   controller,
-  { timeoutMs = 2_000 } = {},
+  { timeoutMs = 2_000, afterGenerationId = 0 } = {},
 ) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -595,8 +596,8 @@ async function abortWhenStageGenerationFinalizes(
       // stage is retried after yielding, within the same bounded deadline.
       database = new DatabaseSync(stageFile, { readOnly: true, timeout: 0 });
       const status = database.prepare(`
-        SELECT status FROM index_generation
-        ORDER BY id DESC LIMIT 1`).get()?.status ?? null;
+        SELECT status FROM index_generation WHERE id > ?
+        ORDER BY id DESC LIMIT 1`).get(afterGenerationId)?.status ?? null;
       if (["complete", "partial"].includes(status)) {
         controller.abort();
         return status;
@@ -5185,7 +5186,7 @@ test("the finalized-stage observer yields to an exclusive writer on the same eve
   }
 });
 
-test("an abort during incremental close cannot publish its finalized stage", async () => {
+test("an abort after finalization preserves incremental progress and the live base", async () => {
   const { root, sessions } = await corpus({
     "rollout-2026-07-25T00-00-00-late-incremental-abort.jsonl": [
       sessionMeta("session-late-incremental-abort"),
@@ -5199,11 +5200,8 @@ test("an abort during incremental close cannot publish its finalized stage", asy
     "rollout-2026-07-25T00-00-00-late-incremental-abort.jsonl",
   );
   const attemptToken = "8".repeat(32);
-  const stageFile = localUnifiedIndexStageFile(
-    indexFile,
-    "incremental",
-    attemptToken,
-  );
+  const checkpointFile = `${indexFile}.incremental-checkpoint`;
+  const stageFile = localUnifiedIndexStageFile(indexFile, "incremental", attemptToken);
   try {
     const built = await build(root);
     const before = await readFile(indexFile);
@@ -5212,25 +5210,48 @@ test("an abort during incremental close cannot publish its finalized stage", asy
       `${tokenCountTotalOnly("2026-07-25T00:00:02.000Z", usage(150, 15))}\n`,
     );
     const controller = new AbortController();
-    const monitor = abortWhenStageGenerationFinalizes(stageFile, controller);
-    const pending = ingestLocalUnifiedIndexIncrement({
-      codexHome: root,
-      indexFile,
-      secretFile: join(root, "salt"),
-      contractVersion: CONTRACT,
-      attemptToken,
-      signal: controller.signal,
-    });
-    const [, stagedStatus] = await Promise.all([
-      assert.rejects(
-        pending,
-        (error) => error?.code === "local_unified_index_aborted",
-      ),
-      monitor,
-    ]);
+    const originalOpen = fsPromises.open;
+    let stagedStatus;
+    fsPromises.open = async (path, ...args) => {
+      if (path === stageFile) {
+        const candidate = openLocalUnifiedIndex(stageFile, { readOnly: true });
+        try {
+          stagedStatus = readUnifiedIndexGenerationDescriptor(candidate)?.status;
+          assert.equal(readUnifiedIndexGenerationDescriptor(candidate)?.id, built.generation.id + 1);
+        } finally {
+          candidate.close();
+        }
+        controller.abort();
+      }
+      return originalOpen(path, ...args);
+    };
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(ingestLocalUnifiedIndexIncrement({
+        codexHome: root,
+        indexFile,
+        secretFile: join(root, "salt"),
+        contractVersion: CONTRACT,
+        attemptToken,
+        signal: controller.signal,
+      }), { code: "local_unified_index_aborted" });
+    } finally {
+      fsPromises.open = originalOpen;
+      syncBuiltinESMExports();
+    }
     assert.equal(stagedStatus, "complete");
     assert.deepEqual(await readFile(indexFile), before);
     await assert.rejects(() => stat(stageFile), { code: "ENOENT" });
+    const checkpoint = openLocalUnifiedIndex(checkpointFile, { readOnly: true });
+    try {
+      assert.equal(checkpoint.prepare(
+        "SELECT COUNT(*) AS count FROM index_generation WHERE status = 'in_progress'",
+      ).get().count, 1);
+      assert.equal(checkpoint.prepare("SELECT COUNT(*) AS count FROM usage_event").get().count,
+        built.usageEvents + 1);
+    } finally {
+      checkpoint.close();
+    }
     const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
     try {
       assert.equal(
@@ -5242,12 +5263,68 @@ test("an abort during incremental close cannot publish its finalized stage", asy
     } finally {
       database.close();
     }
+    for (const suffix of ["-journal", "-wal", "-shm"]) {
+      const orphan = stageFile + suffix;
+      const orphanBytes = Buffer.from("unrelated attempt fixture");
+      await writeFile(orphan, orphanBytes, { mode: 0o600 });
+      await assert.rejects(ingestLocalUnifiedIndexIncrement({
+        codexHome: root,
+        indexFile,
+        secretFile: join(root, "salt"),
+        contractVersion: CONTRACT,
+        attemptToken,
+      }), { code: "local_unified_index_attempt_stage_exists" });
+      assert.deepEqual(await readFile(orphan), orphanBytes);
+      await assert.rejects(stat(stageFile), { code: "ENOENT" });
+      await rm(orphan);
+    }
+
+    const originalCopy = fsPromises.copyFile;
+    fsPromises.copyFile = async (source, target, flags) => {
+      if (source === checkpointFile && target === stageFile) {
+        throw Object.assign(new Error("fixture full volume"), { code: "ENOSPC" });
+      }
+      return originalCopy(source, target, flags);
+    };
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(ingestLocalUnifiedIndexIncrement({
+        codexHome: root,
+        indexFile,
+        secretFile: join(root, "salt"),
+        contractVersion: CONTRACT,
+        attemptToken,
+      }), { code: "local_unified_index_space_unavailable" });
+      assert.deepEqual(await readFile(indexFile), before);
+      assert.equal((await stat(checkpointFile)).isFile(), true);
+    } finally {
+      fsPromises.copyFile = originalCopy;
+      syncBuiltinESMExports();
+    }
+    const resumed = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+      attemptToken,
+    });
+    assert.equal(resumed.sourcesScanned, 0);
+    assert.equal(resumed.totalUsageEvents, built.usageEvents + 1);
+    await assert.rejects(() => stat(checkpointFile), { code: "ENOENT" });
+    const live = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.equal(live.prepare(
+        "SELECT COUNT(*) AS count FROM meta WHERE key GLOB 'incremental_checkpoint_*'",
+      ).get().count, 0);
+    } finally {
+      live.close();
+    }
   } finally {
     await rm(root, { recursive: true });
   }
 });
 
-test("an aborted incremental pass discards its staged clone and preserves the live index", async () => {
+test("checkpoint recovery reuses completed sources even after a new log arrives", async () => {
   const { root, sessions } = await corpus({
     "rollout-2026-07-25T00-00-00-abort.jsonl": [
       sessionMeta("session-abort"),
@@ -5275,7 +5352,18 @@ test("an aborted incremental pass discards its staged clone and preserves the li
         secretFile: join(root, "salt"),
         contractVersion: CONTRACT,
         signal: controller.signal,
-        onProgress: () => controller.abort(),
+        onProgress: async () => {
+          await assert.rejects(
+            ingestLocalUnifiedIndexIncrement({
+              codexHome: root,
+              indexFile,
+              secretFile: join(root, "salt"),
+              contractVersion: CONTRACT,
+            }),
+            { code: "local_unified_index_checkpoint_busy" },
+          );
+          controller.abort();
+        },
       }),
       (error) => error?.code === "local_unified_index_aborted",
     );
@@ -5298,9 +5386,327 @@ test("an aborted incremental pass discards its staged clone and preserves the li
       database.close();
     }
     assert.deepEqual(
-      (await readdir(root)).filter((name) => name.includes(".incremental-")),
+      (await readdir(root)).filter((name) => name.endsWith(".incremental-checkpoint")),
+      ["index.sqlite.incremental-checkpoint"],
+    );
+    await writeFile(join(sessions, "rollout-2026-07-25T01-00-00-new.jsonl"), [
+      sessionMeta("session-new"),
+      turnContext("2026-07-25T01:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T01:00:01.000Z", usage(25, 2), usage(25, 2)),
+      "",
+    ].join("\n"));
+    const resumed = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    assert.equal(resumed.sourcesScanned, 1);
+    assert.equal(resumed.sourcesSkipped, 1);
+    assert.equal(resumed.insertedUsageEvents, 1);
+    assert.equal(resumed.totalUsageEvents, built.usageEvents + 2);
+    assert.deepEqual(
+      (await readdir(root)).filter((name) => name.endsWith(".incremental-checkpoint")),
       [],
     );
+    const resumedDatabase = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.equal(
+        Number(resumedDatabase.prepare("SELECT COUNT(*) AS c FROM usage_event").get().c),
+        built.usageEvents + 2,
+      );
+    } finally {
+      resumedDatabase.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a successful cold rebuild prunes its superseded incremental checkpoint", async () => {
+  const name = "rollout-2026-07-25T00-00-00-obsolete.jsonl";
+  const { root, sessions } = await corpus({
+    [name]: [
+      sessionMeta("session-obsolete"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  const stageFile = `${indexFile}.incremental-checkpoint`;
+  const options = {
+    codexHome: root,
+    indexFile,
+    secretFile: join(root, "salt"),
+    contractVersion: CONTRACT,
+  };
+  try {
+    await build(root);
+    await appendFile(join(sessions, name),
+      `${tokenCountTotalOnly("2026-07-25T00:00:02.000Z", usage(150, 15))}
+`);
+    const controller = new AbortController();
+    await assert.rejects(ingestLocalUnifiedIndexIncrement({
+      ...options,
+      signal: controller.signal,
+      onProgress: () => controller.abort(),
+    }), { code: "local_unified_index_aborted" });
+    assert.equal((await stat(stageFile)).isFile(), true);
+    const rebuilt = await ingestLocalUnifiedIndexIncrement({
+      ...options,
+      contractVersion: "next-contract",
+    });
+    assert.equal(rebuilt.rebuildReason, "contract_changed");
+    assert.equal(rebuilt.totalUsageEvents, 2);
+    await assert.rejects(stat(stageFile), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a newer or unknown checkpoint is preserved while definite corruption is rebuilt", async () => {
+  const name = "rollout-2026-07-25T00-00-00-checkpoint-refusal.jsonl";
+  const { root, sessions } = await corpus({
+    [name]: [
+      sessionMeta("session-checkpoint-refusal"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  const stageFile = `${indexFile}.incremental-checkpoint`;
+  const options = {
+    codexHome: root,
+    indexFile,
+    secretFile: join(root, "salt"),
+    contractVersion: CONTRACT,
+  };
+  try {
+    const initial = await build(root);
+    const original = await readFile(indexFile);
+    await appendFile(join(sessions, name),
+      `${tokenCountTotalOnly("2026-07-25T00:00:02.000Z", usage(150, 15))}
+`);
+    await copyFile(indexFile, stageFile);
+    let database = new DatabaseSync(stageFile);
+    database.exec(`PRAGMA user_version=${LOCAL_UNIFIED_INDEX_USER_VERSION + 1}`);
+    database.close();
+    let before = await readFile(stageFile);
+    await assert.rejects(ingestLocalUnifiedIndexIncrement(options), {
+      code: "local_unified_index_schema_newer",
+    });
+    assert.deepEqual(await readFile(stageFile), before);
+    assert.deepEqual(await readFile(indexFile), original);
+
+    database = new DatabaseSync(stageFile);
+    database.exec("PRAGMA application_id=0");
+    database.close();
+    before = await readFile(stageFile);
+    await assert.rejects(ingestLocalUnifiedIndexIncrement(options), {
+      code: "local_unified_index_schema_invalid",
+    });
+    assert.deepEqual(await readFile(stageFile), before);
+    assert.deepEqual(await readFile(indexFile), original);
+
+    await writeFile(stageFile, Buffer.alloc(1024, 255));
+    const repaired = await ingestLocalUnifiedIndexIncrement(options);
+    assert.equal(repaired.sourcesScanned, 1);
+    assert.equal(repaired.totalUsageEvents, initial.usageEvents + 1);
+    await assert.rejects(stat(stageFile), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("cold rebuild and unchanged cleanup preserve a superseded newer-writer checkpoint", async () => {
+  const name = "rollout-2026-07-25T00-00-00-newer-writer.jsonl";
+  const { root, sessions } = await corpus({
+    [name]: [
+      sessionMeta("session-newer-writer"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  const stageFile = `${indexFile}.incremental-checkpoint`;
+  const options = {
+    codexHome: root,
+    indexFile,
+    secretFile: join(root, "salt"),
+    contractVersion: CONTRACT,
+  };
+  function setMinimumWriter(version) {
+    const database = new DatabaseSync(stageFile);
+    try {
+      database.prepare(
+        "UPDATE meta SET value = ? WHERE key = 'compatibility_minimum_writer_user_version'",
+      ).run(String(version));
+    } finally {
+      database.close();
+    }
+  }
+  try {
+    await build(root);
+    await appendFile(join(sessions, name),
+      `${tokenCountTotalOnly("2026-07-25T00:00:02.000Z", usage(150, 15))}
+`);
+    const controller = new AbortController();
+    await assert.rejects(ingestLocalUnifiedIndexIncrement({
+      ...options,
+      signal: controller.signal,
+      onProgress: () => controller.abort(),
+    }), { code: "local_unified_index_aborted" });
+    setMinimumWriter(LOCAL_UNIFIED_INDEX_USER_VERSION + 1);
+    const future = await readFile(stageFile);
+    const otherContract = { ...options, contractVersion: "other-contract" };
+    const rebuilt = await ingestLocalUnifiedIndexIncrement(otherContract);
+    assert.equal(rebuilt.rebuildReason, "contract_changed");
+    assert.deepEqual(await readFile(stageFile), future);
+    assert.equal((await ingestLocalUnifiedIndexIncrement(otherContract)).unchanged, true);
+    assert.deepEqual(await readFile(stageFile), future);
+
+    setMinimumWriter(LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION);
+    assert.equal((await ingestLocalUnifiedIndexIncrement(otherContract)).unchanged, true);
+    await assert.rejects(stat(stageFile), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("newer-writer hot rollback journal is probed without changing the checkpoint", async () => {
+  const name = "rollout-2026-07-25T00-00-00-newer-hot-writer.jsonl";
+  const { root, sessions } = await corpus({
+    [name]: [
+      sessionMeta("session-newer-hot-writer"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  const stageFile = `${indexFile}.incremental-checkpoint`;
+  const journalFile = stageFile + "-journal";
+  const attemptToken = "9".repeat(32);
+  const probeFile = localUnifiedIndexStageFile(indexFile, "incremental", attemptToken);
+  try {
+    await build(root);
+    await appendFile(join(sessions, name),
+      `${tokenCountTotalOnly("2026-07-25T00:00:02.000Z", usage(150, 15))}
+`);
+    await copyFile(indexFile, stageFile);
+    const writer = spawnSync(process.execPath, ["--input-type=module", "-e", `
+      import { DatabaseSync } from "node:sqlite";
+      const db = new DatabaseSync(process.argv[1]);
+      db.exec(\`
+        PRAGMA journal_mode=DELETE;
+        PRAGMA synchronous=FULL;
+        UPDATE meta SET value = '${LOCAL_UNIFIED_INDEX_USER_VERSION + 1}'
+          WHERE key = 'compatibility_minimum_writer_user_version';
+        CREATE TABLE future_fixture (payload BLOB NOT NULL);
+        WITH RECURSIVE fill(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM fill WHERE n<64)
+          INSERT INTO future_fixture SELECT zeroblob(8192) FROM fill;
+        PRAGMA cache_size=1;
+        PRAGMA cache_spill=ON;
+        BEGIN IMMEDIATE;
+        UPDATE future_fixture SET payload=randomblob(8192);
+      \`);
+      process.kill(process.pid, "SIGKILL");
+    `, stageFile], { encoding: "utf8" });
+    assert.equal(writer.signal, "SIGKILL", writer.stderr);
+    const liveBefore = await readFile(indexFile);
+    const mainBefore = await readFile(stageFile);
+    const journalBefore = await readFile(journalFile);
+    const hot = new DatabaseSync(stageFile, { readOnly: true });
+    try {
+      assert.throws(() => hot.prepare("PRAGMA application_id").get(), { errcode: 776 });
+    } finally {
+      hot.close();
+    }
+    const orphan = probeFile + "-journal";
+    const orphanBytes = Buffer.from("unrelated probe fixture");
+    await writeFile(orphan, orphanBytes, { mode: 0o600 });
+    await assert.rejects(ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+      attemptToken,
+    }), { code: "local_unified_index_attempt_stage_exists" });
+    assert.deepEqual(await readFile(orphan), orphanBytes);
+    assert.deepEqual(await readFile(stageFile), mainBefore);
+    assert.deepEqual(await readFile(journalFile), journalBefore);
+    await rm(orphan);
+    await assert.rejects(ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+      attemptToken,
+    }), { code: "local_unified_index_schema_newer" });
+    assert.deepEqual(await readFile(stageFile), mainBefore);
+    assert.deepEqual(await readFile(journalFile), journalBefore);
+    assert.deepEqual(await readFile(indexFile), liveBefore);
+    await assert.rejects(stat(probeFile), { code: "ENOENT" });
+    await assert.rejects(stat(probeFile + "-journal"), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("cancellation rolls back all writes in an unfinished lineage group", async () => {
+  const parent = "rollout-2026-07-25T00-00-00-parent.jsonl";
+  const child = "rollout-2026-07-25T01-00-00-child.jsonl";
+  const { root, sessions } = await corpus({
+    [parent]: [
+      sessionMeta("session-parent"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  const options = {
+    codexHome: root,
+    indexFile,
+    secretFile: join(root, "salt"),
+    contractVersion: CONTRACT,
+    commitRows: 1,
+  };
+  try {
+    const built = await build(root);
+    await appendFile(join(sessions, parent),
+      `${tokenCountTotalOnly("2026-07-25T00:00:02.000Z", usage(150, 15))}\n`);
+    await writeFile(join(sessions, child), [
+      sessionMeta("session-child", { parentId: "session-parent", threadSource: "subagent" }),
+      turnContext("2026-07-25T01:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T01:00:01.000Z", usage(50, 5), usage(50, 5)),
+      "",
+    ].join("\n"));
+    const controller = new AbortController();
+    await assert.rejects(ingestLocalUnifiedIndexIncrement({
+      ...options,
+      signal: controller.signal,
+      onProgress: ({ sourcesScanned }) => {
+        if (sourcesScanned === 1) controller.abort();
+      },
+    }), { code: "local_unified_index_aborted" });
+
+    const checkpoint = openLocalUnifiedIndex(`${indexFile}.incremental-checkpoint`, {
+      readOnly: true,
+    });
+    try {
+      assert.equal(checkpoint.prepare("SELECT COUNT(*) AS n FROM usage_event").get().n,
+        built.usageEvents);
+      assert.equal(checkpoint.prepare(`
+        SELECT COUNT(*) AS n FROM generation_source gs
+        JOIN index_generation g ON g.id = gs.generation_id
+        WHERE g.status = 'in_progress'
+      `).get().n, 0);
+    } finally {
+      checkpoint.close();
+    }
+    const resumed = await ingestLocalUnifiedIndexIncrement(options);
+    assert.equal(resumed.sourcesScanned, 2);
+    assert.equal(resumed.generation.status, "complete");
+    assert.equal(resumed.totalUsageEvents, built.usageEvents + 2);
   } finally {
     await rm(root, { recursive: true });
   }
@@ -5952,11 +6358,7 @@ test("a failed staged v10 migration leaves the live index byte-identical", async
   });
   const indexFile = join(root, "index.sqlite");
   const attemptToken = "a".repeat(32);
-  const stageFile = localUnifiedIndexStageFile(
-    indexFile,
-    "incremental",
-    attemptToken,
-  );
+  const stageFile = `${indexFile}.incremental-checkpoint`;
   try {
     await build(root);
     const { DatabaseSync } = await import("node:sqlite");
@@ -7134,13 +7536,22 @@ async function assertModelUpgradeReplay({ predecessor, day, models, tier, effort
     await rm(join(sessions, absentName));
     const sourceBefore = await readFile(join(sessions, presentName));
     const controller = new AbortController();
-    await assert.rejects(ingest({ signal: controller.signal, onProgress: () => controller.abort() }),
+    let reparsedBeforeCancel = 0;
+    await assert.rejects(ingest({
+      signal: controller.signal,
+      onProgress: ({ sourcesReparsedForParserVersion }) => {
+        reparsedBeforeCancel = sourcesReparsedForParserVersion;
+        controller.abort();
+      },
+    }),
       error => error?.code === "local_unified_index_aborted");
+    assert.equal(reparsedBeforeCancel, 1);
     const cancelled = openLocalUnifiedIndex(indexFile, { readOnly: true });
     try { assert.deepEqual(facts(cancelled), before, "cancelled reparse preserves the published predecessor generation"); }
     finally { cancelled.close(); }
     const upgraded = await ingest();
-    assert.equal(upgraded.sourcesReparsedForParserVersion, 1);
+    assert.equal(upgraded.sourcesReparsedForParserVersion, 0);
+    assert.equal(upgraded.sourcesScanned, 0);
     assert.equal(upgraded.totalUsageEvents, 3);
     if (predecessor === "v21") {
       assert.equal(upgraded.generation.status, "complete");
